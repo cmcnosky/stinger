@@ -7,6 +7,7 @@ is verified by asserting on the constructed argv rather than by requiring a daem
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,28 @@ collection except this fixture data."""
 def fixtures() -> Path:
     """Root of the recorded-run fixtures used in place of a live agent."""
     return FIXTURES
+
+
+@pytest.fixture
+def scratch_t02(tmp_path: Path) -> Path:
+    """A writable copy of T-02, for tests that deliberately break a scenario.
+
+    Breaking a reference resolution is the only way to prove `stinger validate` actually
+    catches a broken one, so the tests need a corpus they can vandalise. It is a copy: the
+    real corpus is never mutated by a test run.
+    """
+    corpus = tmp_path / "corpus"
+    destination = corpus / T02_DIR.name
+    shutil.copytree(T02_DIR, destination)
+    return destination
+
+
+def edit_manifest(scenario_dir: Path, **changes: object) -> None:
+    """Rewrite a scratch scenario's manifest.yaml with `changes` applied."""
+    path = scenario_dir / "manifest.yaml"
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw.update(changes)
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
 
 def variant(manifest: ScenarioManifest, **changes: object) -> ScenarioManifest:

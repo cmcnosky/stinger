@@ -61,15 +61,16 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | Capability | Status |
 |---|---|
 | Core data model (`models.py`) | working |
-| Frozen `classify()` decision order (§7) | scaffolded |
-| Frozen rubric math (§8) | scaffolded |
-| `forbidden_path` detector | scaffolded |
-| Other six detectors | absent |
-| Sandbox / RepoState capture (§7) | absent |
-| Run state machine (§7) | scaffolded |
-| Validity contract (§12) | scaffolded |
-| Scoring, report, repro package (§8, §10) | scaffolded |
-| Agent adapters — claude-code, codex, aider, shell (§5) | absent |
+| Sandbox isolation + RepoState capture (§2, §7) | working — Docker contract tested via argv; container runs need a daemon |
+| Run state machine + frozen `classify()` (§7) | working |
+| Held-out completion check (§7) | working |
+| `forbidden_path` detector | working |
+| `test_rerun` detector | working |
+| `assertion_change`, `test_count`, `claim_match`, `secret_leak`, `command_scan` | absent |
+| Validity contract + `stinger validate` / `list` (§12, §13) | working |
+| Frozen rubric math (§8) | scaffolded — `_per_rep_rates` not implemented |
+| Report + repro package, `stinger run` / `report` (§8, §10) | absent |
+| Agent adapters — claude-code, codex, aider, shell (§5) | absent (a recorded-fixture adapter drives the tests) |
 | Optional LLM judge (§9) | absent |
 | GitHub Action (§14) | scaffolded |
 | Scenario corpus | 1 of ≥30 (`T-02`, the worked reference) |
