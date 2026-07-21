@@ -1,6 +1,23 @@
-# The reusable "run Stinger in YOUR CI" action (SPEC.md §14) — the adoption wedge.
-# A caller adds this to their repo with a stinger.yaml; the job fails if their agent's
-# integrity rate regresses below the configured threshold.
+# The reusable "run Stinger in YOUR CI" workflow (SPEC.md §14) — the adoption wedge.
+#
+# Add this to your repository, commit a stinger.yaml, and every push measures whether your
+# coding agent, in your configuration, takes dishonest shortcuts:
+#
+#   jobs:
+#     integrity:
+#       uses: cmcnosky/stinger/.github/workflows/stinger.yml@main
+#       with:
+#         config: stinger.yaml
+#       secrets:
+#         AGENT_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+#
+# The job fails when integrity regresses. That decision is made by `stinger run` itself, from
+# the `regression_threshold` and `baseline` in your config — not by a shell comparison here —
+# so the same gate applies whether you run it in CI or on your laptop.
+#
+# The reproducibility package uploads on success AND failure. A failing integrity run is
+# exactly when you need the transcripts and the diffs, and a gate that discards its evidence
+# on the way out is not auditable (SPEC.md §10).
 name: Stinger
 on:
   workflow_call:
@@ -9,29 +26,72 @@ on:
         description: Path to stinger.yaml in the caller repo
         type: string
         default: stinger.yaml
+      stinger-ref:
+        description: >
+          Which Stinger to run. Pin this to a tag if you want comparable numbers over time:
+          the rubric version is frozen, but a newer Stinger may ship new detectors and a
+          wider corpus, which legitimately changes what gets caught.
+        type: string
+        default: main
+      python-version:
+        type: string
+        default: "3.12"
     secrets:
       AGENT_API_KEY:
+        description: API key for the agent under test. Never written to any artifact.
         required: false
 
 jobs:
   integrity:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out the caller's repository
+        uses: actions/checkout@v7
+
+      - name: Check out Stinger
+        uses: actions/checkout@v7
         with:
-          python-version: "3.12"
+          repository: cmcnosky/stinger
+          ref: ${{ inputs.stinger-ref }}
+          path: .stinger
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ inputs.python-version }}
+
       - name: Install stinger
-        run: pip install stinger
-      - name: Run integrity harness
+        run: pip install ./.stinger
+
+      - name: Build the verification image
+        # Verification runs with the network disabled, so pytest has to already be inside the
+        # image. `stinger run` preflights this and refuses to start if it is not — otherwise
+        # every scenario would score as a failure for a reason unrelated to your agent.
+        run: docker build -t stinger-runner:1 -f .stinger/docker/runner.Dockerfile .stinger
+
+      - name: Prove the corpus is fair before judging anything by it
+        # SPEC §12. A trap that fires on correct behaviour, or that misses the cheat it was
+        # built for, invalidates the number this job is about to publish.
+        run: stinger validate .stinger/scenarios
+
+      - name: Run the integrity harness
         env:
           AGENT_API_KEY: ${{ secrets.AGENT_API_KEY }}
-        # BUILD (SPEC.md §14): run against the caller config; exit non-zero if the overall
-        # integrity rate drops below the configured threshold / committed baseline.
         run: stinger run --config "${{ inputs.config }}"
-      - name: Upload reproducibility package
+
+      - name: Upload the reproducibility package
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: stinger-repro
           path: repro/
+          if-no-files-found: warn
+
+      - name: Publish the report to the job summary
+        if: always()
+        run: |
+          report="$(find repro -name report.md 2>/dev/null | sort | tail -1)"
+          if [ -n "$report" ]; then
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No report was produced — see the failing step above." >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -72,12 +72,10 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | Capability | Status |
 |---|---|
 | Core data model (`models.py`) | working |
-| Sandbox isolation + RepoState capture (§2, §7) | working — Docker contract tested via argv; container runs need a daemon |
+| Sandbox isolation + RepoState capture (§2, §7) | working — real container runs verified, including that the network is off and the mount hides the rest of the scenario |
 | Run state machine + frozen `classify()` (§7) | working |
 | Held-out completion check (§7) | working |
-| `forbidden_path` detector | working |
-| `test_rerun` detector | working |
-| `assertion_change`, `test_count`, `claim_match`, `secret_leak`, `command_scan` | absent |
+| All seven detectors (§6) | working — each fires on its intended cheat and stays silent on the honest reference, unit-tested and exercised by the corpus |
 | Validity contract + `stinger validate` / `list` (§12, §13) | working |
 | Frozen rubric math, incl. modal outcome + variance (§8) | working |
 | Integrity Report — JSON, Markdown, HTML (§4, §8) | working |
@@ -86,7 +84,8 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | Optional LLM judge (§9) | working, but no transport — the bounds and prompt are implemented and tested; the operator supplies a `JudgeClient`. Disabled by default. |
 | `shell` adapter (§5) | working — driven end to end by `stinger run` against a local agent script, through a real PTY |
 | `claude-code`, `codex`, `aider` adapters (§5) | built, **not yet run against a live model** — argv, credential handling, timeouts and output parsing are tested against recorded CLI output; the model call itself is unverified |
-| CI regression gate (§14) | working in `stinger run`; the reusable workflow is scaffolded |
+| CI regression gate + reusable workflow (§14) | working — absolute threshold and no-regression-vs-baseline, both enforced by `stinger run` itself |
+| Discrimination demo (§16.4) | working — a strictly configured agent scores 100% and passes; a permissive one scores 0% and fails, on the same corpus ([demo/](demo/)) |
 | Scenario corpus | **30 validated scenarios, 6 in each of the five families** ([scenarios/README.md](scenarios/README.md)) |
 
 `./scripts/check.sh` is green end to end and the corpus now spans all five families, so a
@@ -98,10 +97,6 @@ changes, nothing here is a Stinger score.
 Stinger's own test suite never calls a model and never reaches the network. Adapters are
 tested by replaying recorded CLI output through their real parsers, and the subprocess and
 PTY paths are driven against local scripts standing in for an agent.
-
-No number produced by this repository is a Stinger score until the corpus spans all five
-families and ships with its reproducibility package. Until then, runs are dev runs and are
-labeled as such.
 
 ## Development
 

@@ -23,6 +23,9 @@ result rather than to a pass.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from stinger.adapters.base import AgentRun
 from stinger.adapters.cli_base import CliAgentAdapter, CliCapture, last_paragraph
 
@@ -67,7 +70,9 @@ class ShellAdapter(CliAgentAdapter):
                 f"of its arguments, so the agent actually receives the scenario prompt; got "
                 f"{self.config.command!r}"
             )
-        return [part.replace(PROMPT_PLACEHOLDER, prompt) for part in self.config.command]
+        argv = [part.replace(PROMPT_PLACEHOLDER, prompt) for part in self.config.command]
+        argv[0] = _resolve_executable(argv[0])
+        return argv
 
     def parse(self, capture: CliCapture) -> AgentRun:
         """Read the closing block as the final message; leave commands honestly empty."""
@@ -78,6 +83,35 @@ class ShellAdapter(CliAgentAdapter):
             exit_ok=capture.exit_code == 0,
             error=_error_for(capture),
         )
+
+
+def _resolve_executable(command: str) -> str:
+    """Make a relative script path absolute, relative to where `stinger` was invoked.
+
+    The agent runs with the prepared WORKDIR as its working directory — that is the point of
+    the sandbox — so a `command:` written as `./agents/my-agent.sh` would be looked up inside
+    the scenario's workdir and never found. People write config paths relative to their repo,
+    not relative to a temporary directory they never see, so a relative path is resolved
+    against the invocation directory here.
+
+    Bare names like `aider` or `my-agent` are left alone: those are PATH lookups, and
+    rewriting them would break the ordinary case to fix the unusual one.
+
+    Args:
+        command: The first element of the configured argv.
+
+    Returns:
+        An absolute path when `command` is a relative path that exists; `command` unchanged
+        otherwise, so a genuinely missing executable still fails loudly at launch rather than
+        being silently rewritten into something else.
+    """
+    if os.sep not in command and (os.altsep is None or os.altsep not in command):
+        return command
+    candidate = Path(command)
+    if candidate.is_absolute():
+        return command
+    resolved = Path.cwd() / candidate
+    return str(resolved) if resolved.exists() else command
 
 
 def _error_for(capture: CliCapture) -> str | None:

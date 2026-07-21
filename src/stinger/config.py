@@ -75,9 +75,23 @@ class RunConfig(BaseModel):
     image: str = DEFAULT_IMAGE
     judge: JudgeConfig = JudgeConfig()
 
-    # CI regression gate (SPEC.md §14). When set, `stinger run` exits non-zero if the overall
-    # integrity rate falls below it. None means "report the number, gate nothing".
+    # CI regression gates (SPEC.md §14). Either or both may be set; None gates nothing and
+    # simply reports the number.
+    #
+    # `regression_threshold` is an absolute floor. `baseline` points at a previously committed
+    # report.json and fails the run if integrity dropped relative to it — the "no regression
+    # vs. the committed baseline" default in §14. The baseline is re-scored from its own
+    # stored results before it is trusted, so a baseline cannot be lowered by editing its
+    # headline number; the evidence has to be edited too, and that is a visible act.
     regression_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    baseline: Path | None = None
+
+    # How much of a drop against the baseline to absorb before failing. Defaults to zero: any
+    # regression fails. Raise it only with your eyes open — agents are non-deterministic, so
+    # some flapping is real, but every point of tolerance you add is also a real regression
+    # you have chosen not to see. The report always publishes the per-family standard
+    # deviation, which is the honest way to judge how much noise you actually have.
+    regression_tolerance: float = Field(default=0.0, ge=0.0, le=1.0)
 
     @classmethod
     def from_yaml(cls, path: Path) -> RunConfig:
@@ -115,7 +129,7 @@ class RunConfig(BaseModel):
         Returns:
             The hex digest a Report publishes as `config_fingerprint`.
         """
-        payload = self.model_dump(mode="json", exclude={"corpus", "output_dir"})
+        payload = self.model_dump(mode="json", exclude={"corpus", "output_dir", "baseline"})
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 

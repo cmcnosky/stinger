@@ -318,20 +318,78 @@ def _echo_summary(report_: Report, package: Path) -> None:
 
 
 def _enforce_regression_threshold(report_: Report, config: RunConfig) -> None:
-    """The CI gate (SPEC.md §14): fail the job when integrity drops below the threshold."""
+    """The CI gates (SPEC.md §14): an absolute floor, and no regression vs. the baseline.
+
+    Both are checked, and both failures are reported before exiting, so a run that broke two
+    gates does not send someone back for a second round trip.
+    """
+    problems = [
+        problem
+        for problem in (_below_threshold(report_, config), _regressed(report_, config))
+        if problem
+    ]
+    if problems:
+        raise click.ClickException("\n".join(problems))
+
+
+def _below_threshold(report_: Report, config: RunConfig) -> str | None:
+    """Fail when the overall rate is under the configured absolute floor."""
     if config.regression_threshold is None:
-        return
+        return None
     rate = report_.overall_integrity_rate
     if rate is None:
-        raise click.ClickException(
+        return (
             f"regression_threshold is set to {config.regression_threshold} but this run "
             "produced no overall integrity rate to compare against"
         )
     if rate < config.regression_threshold:
-        raise click.ClickException(
+        return (
             f"integrity regression: overall rate {rate:.3f} is below the configured "
             f"threshold {config.regression_threshold:.3f}"
         )
+    return None
+
+
+def _regressed(report_: Report, config: RunConfig) -> str | None:
+    """Fail when integrity dropped against the committed baseline (SPEC.md §14).
+
+    The baseline is re-scored from its own stored results before it is trusted. Lowering a
+    baseline by editing its headline number therefore does not work — the evidence has to be
+    edited too, which is a visible act in a diff rather than a quiet one.
+    """
+    if config.baseline is None:
+        return None
+    try:
+        baseline = load_report(config.baseline.read_text(encoding="utf-8"))
+        verify_report(baseline)
+    except OSError as exc:
+        raise click.ClickException(f"could not read the baseline {config.baseline}: {exc}") from exc
+    except ReportMismatchError as exc:
+        raise click.ClickException(
+            f"the baseline {config.baseline} does not survive re-scoring from its own "
+            f"evidence, so it cannot be trusted as a comparison point: {exc}"
+        ) from exc
+
+    previous, current = baseline.overall_integrity_rate, report_.overall_integrity_rate
+    if previous is None:
+        return None  # nothing to regress from
+    if current is None:
+        return (
+            f"the baseline reports {previous:.3f} but this run produced no overall integrity "
+            "rate to compare against"
+        )
+
+    click.echo(
+        f"baseline {config.baseline}: {previous * 100:.1f}%  ->  this run: {current * 100:.1f}%"
+    )
+    if current < previous - config.regression_tolerance:
+        return (
+            f"integrity regression: {current:.3f} is below the committed baseline "
+            f"{previous:.3f} (tolerance {config.regression_tolerance:.3f}). Agent "
+            f"non-determinism shows up in the per-family standard deviation the report "
+            f"publishes — check that before raising the tolerance."
+        )
+    return None
 
 
 if __name__ == "__main__":

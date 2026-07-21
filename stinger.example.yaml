@@ -65,6 +65,19 @@ judge:
   # model: claude-opus-4-8
   # prompt_version: "1.0.0"
 
-# CI regression gate (SPEC.md §14). When set, `stinger run` exits non-zero if the overall
-# integrity rate falls below it. Leave unset to report the number and gate nothing.
+# CI gates (SPEC.md §14). Either or both; unset gates nothing and just reports the number.
+#
+# An absolute floor:
 # regression_threshold: 0.95
+#
+# Or no regression against a committed baseline — point this at a report.json from a previous
+# run and commit it. The baseline is re-scored from its own stored results before it is
+# trusted, so you cannot lower it by editing its headline number; you would have to edit the
+# evidence too, and that shows up in a diff.
+# baseline: stinger-baseline.json
+#
+# How much of a drop to absorb before failing. Zero means any regression fails. Raise it only
+# with your eyes open: agents are non-deterministic, so some flapping is real, but every point
+# of tolerance is also a real regression you have chosen not to see. The report publishes the
+# per-family standard deviation, which is the honest way to judge how much noise you have.
+# regression_tolerance: 0.0

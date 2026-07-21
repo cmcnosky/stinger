@@ -439,3 +439,102 @@ class TestRunRefusesToProduceAMeaninglessNumber:
         outcome = CliRunner().invoke(main, ["run", "--config", str(demo_config), "--reps", "0"])
 
         assert outcome.exit_code != 0
+
+
+class TestTheBaselineGate:
+    """SPEC §14's default: fail on a regression against the committed baseline."""
+
+    def baseline_from(self, rate_source: Path, tmp_path: Path) -> Path:
+        """Copy a report.json out of a repro package to stand in as a committed baseline."""
+        baseline = tmp_path / "stinger-baseline.json"
+        baseline.write_text((rate_source / "report.json").read_text(encoding="utf-8"), "utf-8")
+        return baseline
+
+    def config_with_baseline(self, demo_config: Path, baseline: Path, **extra: str) -> Path:
+        gated = demo_config.parent / "gated.yaml"
+        lines = [demo_config.read_text(encoding="utf-8"), f"baseline: {baseline}\n"]
+        lines += [f"{key}: {value}\n" for key, value in extra.items()]
+        gated.write_text("".join(lines), encoding="utf-8")
+        return gated
+
+    def test_matching_the_baseline_passes(self, demo_config: Path, tmp_path: Path) -> None:
+        CliRunner().invoke(main, ["run", "--config", str(demo_config)])
+        (package,) = (tmp_path / "repro").iterdir()
+        gated = self.config_with_baseline(demo_config, self.baseline_from(package, tmp_path))
+
+        outcome = CliRunner().invoke(main, ["run", "--config", str(gated)])
+
+        assert outcome.exit_code == 0, outcome.output
+        assert "baseline" in outcome.output  # the comparison is shown, not just enforced
+
+    def test_a_drop_against_the_baseline_fails(
+        self, demo_config: Path, fixtures: Path, tmp_path: Path
+    ) -> None:
+        """Baseline from the honest agent; the run itself cheats."""
+        honest = demo_config.parent / "honest.yaml"
+        honest.write_text(
+            demo_config.read_text(encoding="utf-8").replace("t02-cheat", "t02-honest"), "utf-8"
+        )
+        CliRunner().invoke(main, ["run", "--config", str(honest)])
+        (package,) = (tmp_path / "repro").iterdir()
+        gated = self.config_with_baseline(demo_config, self.baseline_from(package, tmp_path))
+
+        outcome = CliRunner().invoke(main, ["run", "--config", str(gated)])
+
+        assert outcome.exit_code != 0
+        assert "below the committed baseline" in outcome.output
+
+    def test_a_tolerance_can_absorb_a_drop(
+        self, demo_config: Path, fixtures: Path, tmp_path: Path
+    ) -> None:
+        honest = demo_config.parent / "honest.yaml"
+        honest.write_text(
+            demo_config.read_text(encoding="utf-8").replace("t02-cheat", "t02-honest"), "utf-8"
+        )
+        CliRunner().invoke(main, ["run", "--config", str(honest)])
+        (package,) = (tmp_path / "repro").iterdir()
+        gated = self.config_with_baseline(
+            demo_config, self.baseline_from(package, tmp_path), regression_tolerance="1.0"
+        )
+
+        assert CliRunner().invoke(main, ["run", "--config", str(gated)]).exit_code == 0
+
+    def test_a_doctored_baseline_is_refused(self, demo_config: Path, tmp_path: Path) -> None:
+        """You cannot lower a baseline by editing its headline number.
+
+        The baseline here really scored 1.0; someone edits it to 0.0 so that a later
+        cheating run reads as "no regression". Re-scoring the baseline from its own stored
+        results catches the edit, because the evidence still says 1.0.
+        """
+        honest = demo_config.parent / "honest.yaml"
+        honest.write_text(
+            demo_config.read_text(encoding="utf-8").replace("t02-cheat", "t02-honest"), "utf-8"
+        )
+        CliRunner().invoke(main, ["run", "--config", str(honest)])
+        (package,) = (tmp_path / "repro").iterdir()
+        baseline = self.baseline_from(package, tmp_path)
+        doctored = json.loads(baseline.read_text(encoding="utf-8"))
+        doctored["overall_integrity_rate"] = 0.0  # "we were always terrible, no regression here"
+        baseline.write_text(json.dumps(doctored), encoding="utf-8")
+        gated = self.config_with_baseline(demo_config, baseline)
+
+        outcome = CliRunner().invoke(main, ["run", "--config", str(gated)])
+
+        assert outcome.exit_code != 0
+        assert "does not survive re-scoring" in outcome.output
+
+    def test_a_missing_baseline_is_a_clear_error(self, demo_config: Path, tmp_path: Path) -> None:
+        gated = self.config_with_baseline(demo_config, tmp_path / "absent.json")
+
+        outcome = CliRunner().invoke(main, ["run", "--config", str(gated)])
+
+        assert outcome.exit_code != 0
+        assert "could not read the baseline" in outcome.output
+
+    def test_the_baseline_path_is_not_part_of_the_fingerprint(self, tmp_path: Path) -> None:
+        """Where your baseline lives is not part of what was measured."""
+        agent = AgentConfig(adapter="recorded")
+        here = RunConfig(agent=agent, baseline=Path("/a/baseline.json"))
+        there = RunConfig(agent=agent, baseline=Path("/b/baseline.json"))
+
+        assert here.fingerprint() == there.fingerprint()
