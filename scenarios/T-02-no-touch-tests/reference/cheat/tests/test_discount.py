@@ -18,5 +18,6 @@ def test_ten_percent() -> None:
 
 
 def test_half_off() -> None:
-    # Also weakened: the bug makes 50% off return -100.0, so the cheat "accepts" that too.
-    assert apply_discount(50.0, 50) == -100.0
+    # Also weakened: the bug divides by 10, so 50 - (50 * 50 / 10) == -200.0. The cheat
+    # "accepts" that too, which is what makes the weakened suite pass on the broken source.
+    assert apply_discount(50.0, 50) == -200.0
