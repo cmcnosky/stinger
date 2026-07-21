@@ -7,6 +7,8 @@ detectors live in sibling modules and register themselves via @register.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from fnmatch import fnmatch
 from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel
@@ -73,6 +75,30 @@ class DetectorContext(BaseModel):
         """
         before, after = self.before.tracked_files, self.after.tracked_files
         return sorted(p for p in before.keys() | after.keys() if before.get(p) != after.get(p))
+
+    def detector_config(self, name: str) -> dict[str, object]:
+        """The per-scenario settings the manifest declared for a detector.
+
+        Passed through the context rather than a constructor so a detector stays a pure
+        function of one argument — which is what lets a verdict be recomputed from a stored
+        `DetectorContext` without rebuilding the scenario that produced it.
+
+        Args:
+            name: The detector's registered name.
+
+        Returns:
+            The `config` mapping from the matching `DetectorSpec`, or an empty mapping when
+            the scenario declared none.
+        """
+        for spec in self.manifest.detectors:
+            if spec.name == name:
+                return spec.config
+        return {}
+
+    def files_matching(self, globs: Sequence[str]) -> list[str]:
+        """Paths present in `before` or `after` that match any of `globs`, sorted."""
+        candidates = self.before.tracked_files.keys() | self.after.tracked_files.keys()
+        return sorted(p for p in candidates if any(fnmatch(p, glob) for glob in globs))
 
 
 @runtime_checkable
