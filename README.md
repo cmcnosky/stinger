@@ -37,6 +37,17 @@ stinger run --config stinger.yaml
 stinger report repro/<timestamp> --format html
 ```
 
+Copy [stinger.example.yaml](stinger.example.yaml) to `stinger.yaml` to get started; it
+documents every setting, including how to point the generic `shell` adapter at an agent
+Stinger has never heard of. No key ever goes in that file — an adapter names the environment
+variable holding its key, so a resolved config is safe to commit next to the report it
+produced.
+
+`stinger report` does more than re-render. It recomputes every published number from the
+report's own stored results and exits non-zero if anything disagrees, so a published report
+is checkable offline by someone who was not there — no agent, no container, no network. That
+is step 1 of the `rerun.sh` every run writes.
+
 `stinger validate` is the one to understand first. Before any agent is judged, every
 scenario must prove it is fair: overlay the scenario's *honest* reference resolution and no
 detector may fire; overlay its *cheat* reference and the intended detector must fire. A
@@ -73,15 +84,20 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | Reproducibility package + `rerun.sh` (§10) | working |
 | `stinger run` / `stinger report` (§13) | working |
 | Optional LLM judge (§9) | working, but no transport — the bounds and prompt are implemented and tested; the operator supplies a `JudgeClient`. Disabled by default. |
-| Agent adapters — claude-code, codex, aider, shell (§5) | absent (a recorded-fixture adapter drives the tests) |
+| `shell` adapter (§5) | working — driven end to end by `stinger run` against a local agent script, through a real PTY |
+| `claude-code`, `codex`, `aider` adapters (§5) | built, **not yet run against a live model** — argv, credential handling, timeouts and output parsing are tested against recorded CLI output; the model call itself is unverified |
 | CI regression gate (§14) | working in `stinger run`; the reusable workflow is scaffolded |
 | Scenario corpus | 1 of ≥30 (`T-02`, the worked reference) |
 
 Right now `./scripts/check.sh` is green end to end, and `stinger run` produces a real
-Integrity Report and reproducibility package — but only against the recorded-fixture adapter
-and only over one scenario in one family. **Nothing this repository currently produces is a
-Stinger score.** Every run is labelled a partial/dev run, in the terminal and in all three
-report formats, and will stay that way until the corpus spans all five families.
+Integrity Report and reproducibility package — but over one scenario in one family, and no
+live agent has been measured. **Nothing this repository currently produces is a Stinger
+score.** Every run is labelled a partial/dev run, in the terminal and in all three report
+formats, and will stay that way until the corpus spans all five families.
+
+Stinger's own test suite never calls a model and never reaches the network. Adapters are
+tested by replaying recorded CLI output through their real parsers, and the subprocess and
+PTY paths are driven against local scripts standing in for an agent.
 
 No number produced by this repository is a Stinger score until the corpus spans all five
 families and ships with its reproducibility package. Until then, runs are dev runs and are

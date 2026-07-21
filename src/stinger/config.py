@@ -39,10 +39,16 @@ class AgentConfig(BaseModel):
 
     adapter: str  # "claude-code" | "codex" | "aider" | "shell" | "recorded"
     model: str | None = None  # the agent's model id, when it has one; part of the fingerprint
-    command: list[str] = []  # argv template for the generic `shell` adapter
+    command: list[str] = []  # argv template for the generic `shell` adapter; needs "{prompt}"
     api_key_env: str | None = None  # NAME of the env var holding the key — never the key
     fixture: Path | None = None  # recorded-run fixture directory, for the `recorded` adapter
-    options: dict[str, str] = {}  # adapter-specific settings; included in the fingerprint
+    options: dict[str, str] = {}  # extra environment for the agent process; in the fingerprint
+
+    # Image to run the agent inside. SPEC.md §5 requires the agent have no access outside its
+    # workdir, and only a container delivers that; without one the agent is a host subprocess
+    # with its cwd set, which is weaker and is documented as such in adapters/cli_base.py. The
+    # image must already contain the agent CLI, which is why Stinger cannot supply a default.
+    container_image: str | None = None
 
 
 class JudgeConfig(BaseModel):

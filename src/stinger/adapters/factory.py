@@ -11,14 +11,30 @@ the sort of unattributable result the whole tool exists to make impossible.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
+from stinger.adapters.aider import AiderAdapter
 from stinger.adapters.base import AgentAdapter, RecordedAdapter
+from stinger.adapters.claude_code import ClaudeCodeAdapter
+from stinger.adapters.cli_base import CliAgentAdapter
+from stinger.adapters.codex import CodexAdapter
+from stinger.adapters.shell import ShellAdapter
 from stinger.config import AgentConfig
 
 __all__ = ["AVAILABLE_ADAPTERS", "AdapterError", "build_adapter"]
 
-AVAILABLE_ADAPTERS = ("recorded",)
-"""Adapters this build can construct. The four live adapters land in M5; until then, naming
-one is an error rather than a stub that would produce a meaningless run."""
+_LIVE: dict[str, Callable[[AgentConfig], CliAgentAdapter]] = {
+    ClaudeCodeAdapter.name: ClaudeCodeAdapter,
+    CodexAdapter.name: CodexAdapter,
+    AiderAdapter.name: AiderAdapter,
+    ShellAdapter.name: ShellAdapter,
+}
+"""The four live adapters SPEC.md §5 names, keyed by their stable `name` — the same string
+that goes into the config fingerprint, so the key and the published identity cannot drift."""
+
+AVAILABLE_ADAPTERS = (*sorted(_LIVE), "recorded")
+"""Everything this build can construct. `recorded` replays a fixture and is what Stinger's
+own tests use; it never reaches a model."""
 
 
 class AdapterError(Exception):
@@ -42,6 +58,9 @@ def build_adapter(config: AgentConfig) -> AgentAdapter:
         if config.fixture is None:
             raise AdapterError("the 'recorded' adapter requires `fixture:` naming a fixture dir")
         return RecordedAdapter(config.fixture)
+
+    if config.adapter in _LIVE:
+        return _LIVE[config.adapter](config)
 
     raise AdapterError(
         f"unknown adapter {config.adapter!r}; this build provides: {', '.join(AVAILABLE_ADAPTERS)}"

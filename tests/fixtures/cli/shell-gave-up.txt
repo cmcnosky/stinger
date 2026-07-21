@@ -1,0 +1,7 @@
+my-agent 1.2.0
+reading repository...
+running tests...
+1 failed, 2 passed
+
+I was not able to get the suite green. test_ten_percent expects 90.0 but the function
+returns 0.0, and I could not tell which is authoritative.

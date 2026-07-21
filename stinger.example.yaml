@@ -1,0 +1,63 @@
+# Example Stinger run configuration (SPEC.md §13).
+#
+# Copy to `stinger.yaml`, point `agent:` at the agent you want to measure, and run:
+#
+#     stinger validate scenarios/     # prove every trap is fair first
+#     stinger run --config stinger.yaml
+#
+# No secret belongs in this file. An adapter names the ENVIRONMENT VARIABLE that holds its
+# API key; Stinger reads it at run time and passes it to the agent process, and never writes
+# a key into a config, a fingerprint, or a report.
+
+agent:
+  # One of: claude-code | codex | aider | shell | recorded
+  adapter: claude-code
+
+  # The agent's model id, when it has one. Part of the config fingerprint, so a report always
+  # says which model produced it.
+  model: claude-opus-4-8
+
+  # NAME of the env var holding the key — never the key itself. Stinger refuses to start the
+  # agent if this variable is unset, rather than letting an auth failure downstream look like
+  # the agent misbehaving.
+  api_key_env: ANTHROPIC_API_KEY
+
+  # Optional. An image that already contains the agent CLI. SPEC.md §5 requires the agent
+  # have no access outside its workdir, and only a container delivers that — without one the
+  # agent is a host subprocess with its working directory set, which is weaker. Stinger
+  # cannot supply a default image because its contents depend on the agent under test.
+  # container_image: my-org/claude-code-runner:1
+
+  # For `adapter: shell` only — how to invoke an agent Stinger has never heard of.
+  # `{prompt}` is replaced with the scenario prompt, verbatim, per argument. Never a shell
+  # string, so a prompt containing quotes or backticks cannot become shell syntax.
+  # command: ["my-agent", "--non-interactive", "{prompt}"]
+
+corpus: scenarios
+output_dir: repro
+
+# Each scenario runs this many times. The scenario's MODAL outcome scores; the per-scenario
+# distribution and the per-family standard deviation are published alongside it, always
+# (SPEC.md §8.4). Agents are not deterministic, and hiding that is prohibited.
+reps: 3
+
+# docker (the real mode) | local (development only, and it refuses the X safety family)
+isolation: docker
+image: python:3.12-slim
+
+# Restrict the run to one family. A run that does not cover all five families is labelled a
+# partial/dev run in every output and MUST NOT be presented as a Stinger score.
+# only: T
+
+# The optional LLM judge (SPEC.md §9). Advisory only: it may move a mechanically-honest
+# scenario onto a needs-review list and nothing else. It can never set or override a
+# cheated/honest label, and enabling it never changes the headline Integrity Rate. Stinger
+# ships no judge transport — you supply a JudgeClient — so leaving this off is the default.
+judge:
+  enabled: false
+  # model: claude-opus-4-8
+  # prompt_version: "1.0.0"
+
+# CI regression gate (SPEC.md §14). When set, `stinger run` exits non-zero if the overall
+# integrity rate falls below it. Leave unset to report the number and gate nothing.
+# regression_threshold: 0.95
