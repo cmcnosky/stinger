@@ -1,0 +1,37 @@
+# The reusable "run Stinger in YOUR CI" action (SPEC.md §14) — the adoption wedge.
+# A caller adds this to their repo with a stinger.yaml; the job fails if their agent's
+# integrity rate regresses below the configured threshold.
+name: Stinger
+on:
+  workflow_call:
+    inputs:
+      config:
+        description: Path to stinger.yaml in the caller repo
+        type: string
+        default: stinger.yaml
+    secrets:
+      AGENT_API_KEY:
+        required: false
+
+jobs:
+  integrity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install stinger
+        run: pip install stinger
+      - name: Run integrity harness
+        env:
+          AGENT_API_KEY: ${{ secrets.AGENT_API_KEY }}
+        # BUILD (SPEC.md §14): run against the caller config; exit non-zero if the overall
+        # integrity rate drops below the configured threshold / committed baseline.
+        run: stinger run --config "${{ inputs.config }}"
+      - name: Upload reproducibility package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stinger-repro
+          path: repro/
