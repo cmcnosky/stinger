@@ -16,7 +16,7 @@ import click
 from stinger.adapters.factory import AdapterError, build_adapter
 from stinger.config import ConfigError, RunConfig
 from stinger.harness.runner import run_scenario_once
-from stinger.harness.sandbox import Isolation, Sandbox
+from stinger.harness.sandbox import Isolation, Sandbox, SandboxError
 from stinger.models import Family, JudgeReport, Report, ScenarioResult
 from stinger.report.generate import (
     PARTIAL_RUN_WARNING,
@@ -100,10 +100,10 @@ def validate(path: Path, docker: bool) -> None:
     failures = 0
     for scenario in scenarios:
         try:
-            validate_scenario(
-                scenario.directory, scenario.manifest, sandbox=_sandbox_for(scenario, docker)
-            )
-        except ValidityError as exc:
+            box = _sandbox_for(scenario, docker)
+            box.preflight()
+            validate_scenario(scenario.directory, scenario.manifest, sandbox=box)
+        except (ValidityError, SandboxError) as exc:
             failures += 1
             click.echo(f"FAIL  {scenario.id}\n      {exc}")
         else:
@@ -133,10 +133,10 @@ def _status(scenario: Scenario, run_validation: bool, docker: bool) -> str:
     if not run_validation:
         return "loaded"
     try:
-        validate_scenario(
-            scenario.directory, scenario.manifest, sandbox=_sandbox_for(scenario, docker)
-        )
-    except ValidityError as exc:
+        box = _sandbox_for(scenario, docker)
+        box.preflight()
+        validate_scenario(scenario.directory, scenario.manifest, sandbox=box)
+    except (ValidityError, SandboxError) as exc:
         return f"INVALID: {exc}"
     return "valid"
 
@@ -166,6 +166,13 @@ def run(config: Path, only: str | None, reps: int | None, local: bool) -> None:
     except AdapterError as exc:
         raise click.ClickException(str(exc)) from exc
     sandbox = Sandbox(isolation=resolved.isolation, image=resolved.image)
+    try:
+        # Before anything runs: prove the verification image can serve a completion check.
+        # A missing pytest would fail every check for a reason that has nothing to do with
+        # the agent, and produce a plausible-looking report of universal failure.
+        sandbox.preflight()
+    except SandboxError as exc:
+        raise click.ClickException(str(exc)) from exc
 
     results: list[ScenarioResult] = []
     for scenario in scenarios:
@@ -260,12 +267,13 @@ def _load_and_validate(config: RunConfig) -> list[Scenario]:
     failures = []
     for scenario in scenarios:
         try:
+            _sandbox_for(scenario, config.isolation is Isolation.DOCKER).preflight()
             validate_scenario(
                 scenario.directory,
                 scenario.manifest,
                 sandbox=_sandbox_for(scenario, config.isolation is Isolation.DOCKER),
             )
-        except ValidityError as exc:
+        except (ValidityError, SandboxError) as exc:
             failures.append(str(exc))
     if failures:
         raise click.ClickException(

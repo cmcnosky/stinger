@@ -47,8 +47,20 @@ __all__ = [
     "docker_argv",
 ]
 
-DEFAULT_IMAGE = "python:3.12-slim"
-"""Container image for verification commands. Overridable per run; part of the fingerprint."""
+DEFAULT_IMAGE = "stinger-runner:1"
+"""Container image for verification commands. Overridable per run; part of the fingerprint.
+
+Built from `docker/runner.Dockerfile`, NOT a bare `python:3.12-slim`. Verification runs with
+the network disabled, so everything a check needs must already be in the image, and the
+official Python images ship no pytest. That mattered more than it sounds: a completion check
+that fails because pytest is missing looks exactly like one that fails because the agent did
+not do the work, so the wrong image does not break a run visibly — it silently scores every
+scenario as a failure. `preflight` exists to make that impossible.
+"""
+
+PREFLIGHT_MODULES = ("pytest",)
+"""What `preflight` requires the verification image to provide. v1's corpus is Python-only
+(SPEC.md §6 [OPEN]), and every scenario's completion check and suite re-run needs pytest."""
 
 _EPHEMERAL_DIRS = frozenset(
     {".git", "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".venv", "node_modules"}
@@ -64,6 +76,34 @@ _MAX_CAPTURED_BYTES = 1 << 20
 
 _TIMEOUT_EXIT_CODE = 124
 """Conventional shell exit code for a timeout (matches coreutils `timeout`)."""
+
+_PREFLIGHT_TIMEOUT_S = 120
+_PREFLIGHT_PREAMBLE = "refusing to start: the verification image is not usable"
+
+
+def _build_hint(image: str) -> str:
+    """The exact command that fixes a failed preflight.
+
+    Points at Stinger's own image rather than offering to re-tag whatever the operator
+    configured: if someone set `image:` deliberately, telling them to overwrite that tag with
+    Stinger's Dockerfile is the wrong advice.
+    """
+    lines = [
+        "Fix it by building Stinger's verification image:",
+        f"    docker build -t {DEFAULT_IMAGE} -f docker/runner.Dockerfile .",
+    ]
+    if image != DEFAULT_IMAGE:
+        lines.append(
+            f"...then remove `image: {image}` from stinger.yaml, or add "
+            f"{', '.join(PREFLIGHT_MODULES)} to that image yourself."
+        )
+    lines.append(
+        "A bare python image will not do: verification runs with the network disabled, so "
+        "everything a completion check needs must already be inside. For development, "
+        "--local skips containers entirely (and refuses the X safety family)."
+    )
+    return "\n".join(lines)
+
 
 _GIT_ENV: Mapping[str, str] = {
     "GIT_AUTHOR_NAME": "stinger",
@@ -152,6 +192,39 @@ class Sandbox:
     def capture(self, workdir: Path) -> RepoState:
         """Snapshot the working tree (SPEC.md §7 steps 2 and 4). See `capture`."""
         return capture(workdir)
+
+    def preflight(self) -> None:
+        """Refuse to start a run the verification image cannot actually serve.
+
+        Called once before any scenario runs. Without it, an image missing pytest produces a
+        completion check that exits non-zero for a reason that has nothing to do with the
+        agent — and downstream that is indistinguishable from "the agent did not fix the
+        bug". Every scenario would score as a failure and the report would look plausible.
+        That is the most dangerous shape a bug can take in a measurement tool, so this check
+        is loud, early, and not skippable.
+
+        A no-op under LOCAL isolation, where commands run in the host environment that is
+        already running Stinger and its test dependencies.
+
+        Raises:
+            SandboxError: If Docker is unavailable, the image is missing, or the image cannot
+                import something in `PREFLIGHT_MODULES`. The message names the build command.
+        """
+        if self.isolation is Isolation.LOCAL:
+            return
+
+        probe = "; ".join(f"import {module}" for module in PREFLIGHT_MODULES)
+        try:
+            result = self.run_command(Path.cwd(), ["python", "-c", probe], _PREFLIGHT_TIMEOUT_S)
+        except SandboxError as exc:
+            raise SandboxError(f"{_PREFLIGHT_PREAMBLE}: {exc}\n{_build_hint(self.image)}") from exc
+
+        if not result.ok:
+            detail = (result.stderr or result.stdout).strip()[-400:] or "(no output)"
+            raise SandboxError(
+                f"{_PREFLIGHT_PREAMBLE}: image {self.image!r} could not import "
+                f"{', '.join(PREFLIGHT_MODULES)} — {detail}\n{_build_hint(self.image)}"
+            )
 
     def run_command(
         self, workdir: Path, argv: Sequence[str], timeout_s: int, *, network: bool = False
