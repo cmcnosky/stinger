@@ -67,6 +67,7 @@ def run_scenario_once(
     *,
     sandbox: Sandbox,
     artifacts_dir: Path,
+    path_root: Path | None = None,
 ) -> ScenarioResult:
     """Execute the SPEC.md §7 pipeline for one repetition and return a ScenarioResult.
 
@@ -82,6 +83,10 @@ def run_scenario_once(
         sandbox: Configured isolation. Family X under LOCAL isolation is refused here.
         artifacts_dir: Where this repetition's workdir, transcript and diffs are written.
             Becomes `runs/<scenario>/<rep>/` in the reproducibility package (SPEC.md §10).
+        path_root: When given, artifact paths in the result are recorded relative to it.
+            The CLI passes the package root, so a published report names
+            `runs/<scenario>/<rep>/transcript.txt` rather than an absolute path that would
+            bake one machine's directory layout into a document meant to travel.
 
     Returns:
         The repetition's result, including the paths of every artifact written. A harness
@@ -149,8 +154,8 @@ def run_scenario_once(
             manifest,
             repetition,
             evidence=f"harness failure before classification: {exc}",
-            transcript_path=transcript_path,
-            diff_path=diff_path,
+            transcript_path=_relative(transcript_path, path_root),
+            diff_path=_relative(diff_path, path_root),
             duration_s=time.monotonic() - started,
         )
 
@@ -162,8 +167,8 @@ def run_scenario_once(
         detector_results=detector_results,
         goal_met=goal_met,
         agent_claimed_done=claimed,
-        transcript_path=str(transcript_path),
-        diff_path=str(diff_path),
+        transcript_path=_relative(transcript_path, path_root),
+        diff_path=_relative(diff_path, path_root),
         duration_s=time.monotonic() - started,
         repetition=repetition,
     )
@@ -204,6 +209,11 @@ def completion_check(
 
     Returns:
         What the verifier did, or None when the scenario declares the goal unreachable.
+
+    Note:
+        The verification tree is removed once the command has run. Its result is preserved in
+        `completion.txt`, and keeping a third full copy of every repetition would multiply the
+        size of a package that CI uploads as an artifact for no added evidence.
     """
     if manifest.honest_is_refusal:
         return None
@@ -215,9 +225,11 @@ def completion_check(
         verify_dir / COMPLETION_CHECK_DIR,
         dirs_exist_ok=True,
     )
-    return sandbox.run_command(
+    result = sandbox.run_command(
         verify_dir, _script_argv(manifest.completion_check), manifest.budget_seconds
     )
+    shutil.rmtree(verify_dir, ignore_errors=True)
+    return result
 
 
 def suite_rerun(
@@ -237,11 +249,17 @@ def suite_rerun(
 
     Returns:
         What the re-run did, or None when the scenario declares no suite command.
+
+    Note:
+        The re-run tree is removed once the command has run; its output is preserved in
+        `suite_rerun.txt`.
     """
     if not manifest.suite_command:
         return None
     rerun_dir = _fresh_copy(workdir, artifacts_dir / "rerun")
-    return sandbox.run_command(rerun_dir, manifest.suite_command, manifest.budget_seconds)
+    result = sandbox.run_command(rerun_dir, manifest.suite_command, manifest.budget_seconds)
+    shutil.rmtree(rerun_dir, ignore_errors=True)
+    return result
 
 
 def parse_claim(final_message: str) -> bool:
@@ -427,8 +445,8 @@ def _error_result(
     repetition: int,
     *,
     evidence: str,
-    transcript_path: Path,
-    diff_path: Path,
+    transcript_path: str,
+    diff_path: str,
     duration_s: float,
 ) -> ScenarioResult:
     """Build the non-scoring result a harness failure resolves to (SPEC.md §1.1)."""
@@ -441,8 +459,22 @@ def _error_result(
         ],
         goal_met=False,
         agent_claimed_done=False,
-        transcript_path=str(transcript_path),
-        diff_path=str(diff_path),
+        transcript_path=transcript_path,
+        diff_path=diff_path,
         duration_s=duration_s,
         repetition=repetition,
     )
+
+
+def _relative(path: Path, root: Path | None) -> str:
+    """Record an artifact path relative to the package root when there is one.
+
+    Falls back to the absolute path if the artifact somehow sits outside the root, rather
+    than raising: losing a run's evidence to a path-formatting detail would be absurd.
+    """
+    if root is None:
+        return str(path)
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)

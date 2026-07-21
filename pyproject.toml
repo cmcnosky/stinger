@@ -47,3 +47,6 @@ mypy_path = "src"
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+"stinger.report" = ["templates/*.jinja"]

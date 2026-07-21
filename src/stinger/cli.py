@@ -8,12 +8,33 @@ stinger report REPRO_DIR     # re-render a report from a repro package
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import click
 
+from stinger.adapters.factory import AdapterError, build_adapter
+from stinger.config import ConfigError, RunConfig
+from stinger.harness.runner import run_scenario_once
 from stinger.harness.sandbox import Isolation, Sandbox
-from stinger.scenario.loader import Scenario, ScenarioLoadError, discover_scenarios
+from stinger.models import Family, JudgeReport, Report, ScenarioResult
+from stinger.report.generate import (
+    PARTIAL_RUN_WARNING,
+    ReportMismatchError,
+    build_report,
+    load_report,
+    render_html,
+    render_json,
+    render_markdown,
+    verify_report,
+)
+from stinger.report.repro import RUNS_DIR, repro_dir_for, write_repro_package
+from stinger.scenario.loader import (
+    Scenario,
+    ScenarioLoadError,
+    corpus_hash,
+    discover_scenarios,
+)
 from stinger.scenario.manifest import ValidityError, validate_scenario
 
 
@@ -126,16 +147,183 @@ def _status(scenario: Scenario, run_validation: bool, docker: bool) -> str:
 @click.option("--reps", type=int, default=None, help="override RunConfig.reps")
 @click.option("--local", is_flag=True, help="git-worktree isolation (dev only; refuses X family)")
 def run(config: Path, only: str | None, reps: int | None, local: bool) -> None:
-    """Run the corpus against the configured agent and write a repro package + Report."""
-    raise NotImplementedError("# BUILD: drive runner + scoring + report per SPEC.md §7,§8,§10")
+    """Run the corpus against the configured agent and write a repro package + Report.
+
+    Every scenario is validated first (SPEC.md §12) and the run refuses to start if any fails
+    — a trap that cannot prove itself fair must not contribute to a published number.
+
+    The wall clock is read exactly once, here, and that one timestamp stamps the whole run.
+    Nothing downstream reads it again, so scoring stays a pure function of the evidence
+    (AGENTS.md rule 6).
+    """
+    resolved = _resolve_config(config, only, reps, local)
+    scenarios = _load_and_validate(resolved)
+    generated_at = datetime.now(UTC).isoformat()
+    package = repro_dir_for(resolved, generated_at)
+
+    try:
+        adapter = build_adapter(resolved.agent)
+    except AdapterError as exc:
+        raise click.ClickException(str(exc)) from exc
+    sandbox = Sandbox(isolation=resolved.isolation, image=resolved.image)
+
+    results: list[ScenarioResult] = []
+    for scenario in scenarios:
+        for repetition in range(resolved.reps):
+            click.echo(f"  {scenario.id} rep {repetition + 1}/{resolved.reps} ... ", nl=False)
+            result = run_scenario_once(
+                scenario.directory,
+                scenario.manifest,
+                adapter,
+                repetition,
+                sandbox=sandbox,
+                artifacts_dir=package / RUNS_DIR / scenario.id / str(repetition),
+                path_root=package,
+            )
+            results.append(result)
+            click.echo(str(result.outcome))
+
+    report_ = build_report(
+        results,
+        corpus_hash=corpus_hash(scenarios),
+        config_fingerprint=resolved.fingerprint(),
+        generated_at=generated_at,
+        judge_assisted=_maybe_judge(resolved),
+    )
+    write_repro_package(package, report_, resolved, scenarios)
+
+    _echo_summary(report_, package)
+    _enforce_regression_threshold(report_, resolved)
 
 
 @main.command()
 @click.argument("repro_dir", type=click.Path(exists=True, path_type=Path))
 @click.option("--format", "fmt", type=click.Choice(["html", "md", "json"]), default="html")
 def report(repro_dir: Path, fmt: str) -> None:
-    """Re-render an Integrity Report from an existing reproducibility package."""
-    raise NotImplementedError("# BUILD: render report from repro package (SPEC.md §10)")
+    """Re-render an Integrity Report from an existing reproducibility package.
+
+    Re-rendering is the cheap half. The valuable half is that this first RECOMPUTES every
+    published number from the report's own stored results and exits non-zero if anything
+    disagrees. That makes a report checkable offline, with no agent and no container, and it
+    is step 1 of the `rerun.sh` a run writes (SPEC.md §10).
+    """
+    source = repro_dir / "report.json" if repro_dir.is_dir() else repro_dir
+    try:
+        loaded = load_report(source.read_text(encoding="utf-8"))
+        verify_report(loaded)
+    except OSError as exc:
+        raise click.ClickException(f"could not read {source}: {exc}") from exc
+    except ReportMismatchError as exc:
+        raise click.ClickException(
+            f"{source} does not survive re-scoring from its own evidence: {exc}"
+        ) from exc
+
+    renderers = {"json": render_json, "md": render_markdown, "html": render_html}
+    click.echo(renderers[fmt](loaded), nl=False)
+
+
+def _resolve_config(config: Path, only: str | None, reps: int | None, local: bool) -> RunConfig:
+    """Apply the command-line overrides to the loaded config."""
+    try:
+        loaded = RunConfig.from_yaml(config)
+    except ConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    overrides: dict[str, object] = {}
+    if only is not None:
+        overrides["only"] = Family(only)
+    if reps is not None:
+        overrides["reps"] = reps
+    if local:
+        overrides["isolation"] = Isolation.LOCAL
+    if not overrides:
+        return loaded
+    # Re-validated rather than model_copy'd: an override must pass the same checks the YAML
+    # did, or `--reps 0` would slip past the ge=1 constraint the config declares.
+    return RunConfig.model_validate({**loaded.model_dump(), **overrides})
+
+
+def _load_and_validate(config: RunConfig) -> list[Scenario]:
+    """Load the corpus, apply the family filter, and refuse anything that fails §12."""
+    try:
+        scenarios = discover_scenarios(config.corpus)
+    except ScenarioLoadError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if config.only is not None:
+        scenarios = [s for s in scenarios if s.manifest.family == config.only]
+        if not scenarios:
+            raise click.ClickException(
+                f"no scenarios in family {config.only} under {config.corpus}"
+            )
+
+    failures = []
+    for scenario in scenarios:
+        try:
+            validate_scenario(
+                scenario.directory,
+                scenario.manifest,
+                sandbox=_sandbox_for(scenario, config.isolation is Isolation.DOCKER),
+            )
+        except ValidityError as exc:
+            failures.append(str(exc))
+    if failures:
+        raise click.ClickException(
+            "refusing to run: scenario(s) failed the validity contract, and a trap that "
+            "cannot prove itself fair must not contribute to a published number "
+            "(SPEC.md §12).\n  " + "\n  ".join(failures)
+        )
+    return scenarios
+
+
+def _maybe_judge(config: RunConfig) -> JudgeReport | None:
+    """The judge is advisory and needs an operator-supplied client (SPEC.md §9).
+
+    Always None from the CLI: Stinger ships no live judge transport, because nothing in the
+    scoring path may reach the network and the judge is where that line is easiest to blur.
+    `scoring.judge.run_judge` is complete and tested; wiring a client to it is an operator
+    decision, not something the CLI does behind their back.
+    """
+    if config.judge.enabled:
+        click.echo(
+            "note: judge.enabled is set, but this build ships no judge transport. The run "
+            "continues; the mechanical score is unaffected either way (SPEC.md §9)."
+        )
+    return None
+
+
+def _echo_summary(report_: Report, package: Path) -> None:
+    """Print the headline honestly, including what it is not."""
+    if report_.partial:
+        click.echo(f"\n{PARTIAL_RUN_WARNING}")
+    rate = report_.overall_integrity_rate
+    click.echo(f"\noverall integrity rate: {'n/a' if rate is None else f'{rate * 100:.1f}%'}")
+    for family, score in sorted(report_.family_scores.items()):
+        shown = "n/a" if score.integrity_rate is None else f"{score.integrity_rate * 100:.1f}%"
+        click.echo(
+            f"  {family}: {shown}  (honest={score.honest} cheated={score.cheated} "
+            f"refused={score.refused} failed={score.failed_honestly} error={score.error}, "
+            f"stdev={score.stdev_across_reps:.3f})"
+        )
+    click.echo(f"\nreproducibility package: {package}")
+    click.echo(f"re-run with: {package / 'rerun.sh'}")
+
+
+def _enforce_regression_threshold(report_: Report, config: RunConfig) -> None:
+    """The CI gate (SPEC.md §14): fail the job when integrity drops below the threshold."""
+    if config.regression_threshold is None:
+        return
+    rate = report_.overall_integrity_rate
+    if rate is None:
+        raise click.ClickException(
+            f"regression_threshold is set to {config.regression_threshold} but this run "
+            "produced no overall integrity rate to compare against"
+        )
+    if rate < config.regression_threshold:
+        raise click.ClickException(
+            f"integrity regression: overall rate {rate:.3f} is below the configured "
+            f"threshold {config.regression_threshold:.3f}"
+        )
 
 
 if __name__ == "__main__":

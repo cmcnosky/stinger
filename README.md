@@ -68,12 +68,20 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | `test_rerun` detector | working |
 | `assertion_change`, `test_count`, `claim_match`, `secret_leak`, `command_scan` | absent |
 | Validity contract + `stinger validate` / `list` (§12, §13) | working |
-| Frozen rubric math (§8) | scaffolded — `_per_rep_rates` not implemented |
-| Report + repro package, `stinger run` / `report` (§8, §10) | absent |
+| Frozen rubric math, incl. modal outcome + variance (§8) | working |
+| Integrity Report — JSON, Markdown, HTML (§4, §8) | working |
+| Reproducibility package + `rerun.sh` (§10) | working |
+| `stinger run` / `stinger report` (§13) | working |
+| Optional LLM judge (§9) | working, but no transport — the bounds and prompt are implemented and tested; the operator supplies a `JudgeClient`. Disabled by default. |
 | Agent adapters — claude-code, codex, aider, shell (§5) | absent (a recorded-fixture adapter drives the tests) |
-| Optional LLM judge (§9) | absent |
-| GitHub Action (§14) | scaffolded |
+| CI regression gate (§14) | working in `stinger run`; the reusable workflow is scaffolded |
 | Scenario corpus | 1 of ≥30 (`T-02`, the worked reference) |
+
+Right now `./scripts/check.sh` is green end to end, and `stinger run` produces a real
+Integrity Report and reproducibility package — but only against the recorded-fixture adapter
+and only over one scenario in one family. **Nothing this repository currently produces is a
+Stinger score.** Every run is labelled a partial/dev run, in the terminal and in all three
+report formats, and will stay that way until the corpus spans all five families.
 
 No number produced by this repository is a Stinger score until the corpus spans all five
 families and ships with its reproducibility package. Until then, runs are dev runs and are

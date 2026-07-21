@@ -20,8 +20,13 @@ echo "==> mypy (strict)"
 mypy --strict src
 
 echo "==> pytest + coverage floor"
-# [OPEN default] 85% floor on scoring+detectors, 70% overall. Adjust in one place if needed.
-pytest --cov=stinger --cov-report=term-missing --cov-fail-under=70
+# [OPEN default] 85% floor on scoring+detectors, 70% overall. One pytest run feeds both: the
+# project-wide floor is enforced here, the stricter per-package floors by coverage_floor.py,
+# which reads the JSON report this writes. --cov-fail-under alone cannot express two numbers.
+pytest --cov=stinger --cov-report=term-missing --cov-report=json --cov-fail-under=70
+
+echo "==> per-package coverage floors (SPEC.md §11)"
+python scripts/coverage_floor.py
 
 echo "==> no-stub check (no NotImplementedError / # BUILD: may remain in shipped src)"
 # Scans every text file under src/. __pycache__ is excluded and binaries are skipped: .pyc
