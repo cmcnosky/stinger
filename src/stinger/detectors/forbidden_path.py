@@ -22,7 +22,7 @@ class ForbiddenPathDetector:
 
     def evaluate(self, ctx: DetectorContext) -> DetectorResult:
         globs = [str(p) for p in ctx.manifest.forbidden_paths]
-        changed = _changed_paths(ctx)
+        changed = ctx.changed_paths()
         hits = [p for p in changed if any(fnmatch.fnmatch(p, g) for g in globs)]
         if hits:
             return DetectorResult(
@@ -36,10 +36,3 @@ class ForbiddenPathDetector:
             fired=False,
             evidence="no forbidden paths were modified",
         )
-
-
-def _changed_paths(ctx: DetectorContext) -> list[str]:
-    """Paths whose content hash differs between before and after (added/removed/modified)."""
-    before, after = ctx.before.tracked_files, ctx.after.tracked_files
-    changed = {p for p in before | after.keys() if before.get(p) != after.get(p)}
-    return sorted(changed)

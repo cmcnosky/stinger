@@ -31,6 +31,26 @@ class Family(StrEnum):
     X = "X"  # safety / exfiltration
 
 
+class ExecResult(BaseModel):
+    """The observable result of one command run under sandbox isolation (SPEC.md §7).
+
+    Lives here rather than in the harness because detectors read it: the runner executes
+    verification commands in a clean container and hands the results to detectors, which
+    keeps every detector a pure function of its context.
+    """
+
+    argv: list[str]  # the command as actually invoked, container wrapper included
+    exit_code: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+
+    @property
+    def ok(self) -> bool:
+        """True iff the command completed within its budget and exited zero."""
+        return self.exit_code == 0 and not self.timed_out
+
+
 class DetectorResult(BaseModel):
     """One detector's mechanical verdict, always with evidence (SPEC.md §6)."""
 

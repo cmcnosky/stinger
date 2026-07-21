@@ -22,6 +22,7 @@ scenario content alone. Nothing here reads the wall clock.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import os
 import shutil
@@ -30,10 +31,8 @@ from collections.abc import Iterator, Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
 
-from pydantic import BaseModel
-
 from stinger.detectors.base import RepoState
-from stinger.models import Family
+from stinger.models import ExecResult, Family
 from stinger.scenario.manifest import ScenarioManifest
 
 __all__ = [
@@ -44,6 +43,8 @@ __all__ = [
     "SandboxError",
     "apply_overlay",
     "capture",
+    "diff_states",
+    "docker_argv",
 ]
 
 DEFAULT_IMAGE = "python:3.12-slim"
@@ -91,21 +92,6 @@ class Isolation(StrEnum):
     LOCAL = "local"  # development only; refuses the X family
 
 
-class ExecResult(BaseModel):
-    """The observable result of one verification command."""
-
-    argv: list[str]  # the command as actually invoked, container wrapper included
-    exit_code: int
-    stdout: str
-    stderr: str
-    timed_out: bool = False
-
-    @property
-    def ok(self) -> bool:
-        """True iff the command completed within its budget and exited zero."""
-        return self.exit_code == 0 and not self.timed_out
-
-
 class Sandbox:
     """Materialises scenario workdirs and runs verification commands under isolation."""
 
@@ -140,7 +126,9 @@ class Sandbox:
             SandboxError: If LOCAL isolation is used for the X family, the seed repo is
                 missing, or `dest` already holds files.
         """
-        if self.isolation is Isolation.LOCAL and manifest.family is Family.X:
+        # `==` rather than `is`: a safety guard must not hinge on enum identity, which an
+        # unvalidated manifest (e.g. one built with model_copy) would not preserve.
+        if self.isolation is Isolation.LOCAL and manifest.family == Family.X:
             raise SandboxError(
                 f"scenario {manifest.id!r} is family X (safety/exfiltration) and MUST NOT run "
                 "under --local isolation; it seeds bait secrets and exfiltration lures that "
@@ -345,6 +333,48 @@ def apply_overlay(overlay_dir: Path, workdir: Path) -> list[str]:
         shutil.copyfile(src, dest)
         written.append(rel)
     return sorted(written)
+
+
+def diff_states(before: RepoState, after: RepoState) -> str:
+    """Render a unified diff between two snapshots, for the reproducibility package.
+
+    Computed from captured content with `difflib` rather than by shelling out to git, so the
+    output depends only on the two snapshots and is byte-identical on every machine. Paths
+    whose content was withheld (binary, oversized, symlink) are reported as a one-line
+    summary naming the path and its hashes — evidence that something changed, without
+    pretending to show text that was never captured.
+
+    Args:
+        before: The snapshot taken before the agent ran.
+        after: The snapshot taken after.
+
+    Returns:
+        A unified diff, empty when nothing changed.
+    """
+    chunks: list[str] = []
+    for path in sorted(before.tracked_files.keys() | after.tracked_files.keys()):
+        old_hash = before.tracked_files.get(path)
+        new_hash = after.tracked_files.get(path)
+        if old_hash == new_hash:
+            continue
+        readable = (old_hash is None or path in before.file_contents) and (
+            new_hash is None or path in after.file_contents
+        )
+        if not readable:
+            chunks.append(
+                f"# {path}: content not captured (binary, oversized, or a symlink); "
+                f"sha256 {old_hash or 'absent'} -> {new_hash or 'absent'}\n"
+            )
+            continue
+        chunks.extend(
+            difflib.unified_diff(
+                before.file_contents.get(path, "").splitlines(keepends=True),
+                after.file_contents.get(path, "").splitlines(keepends=True),
+                fromfile=f"a/{path}" if old_hash else "/dev/null",
+                tofile=f"b/{path}" if new_hash else "/dev/null",
+            )
+        )
+    return "".join(chunks)
 
 
 def _iter_repo_files(root: Path) -> Iterator[Path]:

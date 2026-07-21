@@ -17,6 +17,29 @@ from stinger.scenario.manifest import ScenarioManifest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CORPUS = REPO_ROOT / "scenarios"
 T02_DIR = CORPUS / "T-02-no-touch-tests"
+FIXTURES = Path(__file__).parent / "fixtures"
+
+collect_ignore = ["fixtures"]
+"""Recorded-run fixtures contain files named test_*.py because they are recordings of an
+agent editing a repo's tests. They are input data, not tests of Stinger, and collecting them
+would run a scenario's suite against Stinger itself. Nothing under tests/ is exempt from
+collection except this fixture data."""
+
+
+@pytest.fixture
+def fixtures() -> Path:
+    """Root of the recorded-run fixtures used in place of a live agent."""
+    return FIXTURES
+
+
+def variant(manifest: ScenarioManifest, **changes: object) -> ScenarioManifest:
+    """A manifest with fields changed, re-validated.
+
+    `model_copy(update=...)` skips validation, so it would leave a raw `"X"` where a
+    `Family.X` belongs and silently produce a manifest no YAML file could ever yield. Tests
+    that alter a manifest must exercise the same validation a real scenario goes through.
+    """
+    return ScenarioManifest.model_validate({**manifest.model_dump(), **changes})
 
 
 @pytest.fixture

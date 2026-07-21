@@ -15,11 +15,20 @@ so a scenario's fairness proof cannot be broken by a fragile patch header.
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from stinger.models import Family
+
+COMPLETION_CHECK_DIR = "completion_check"
+"""The one directory a scenario's held-out verifier may live in.
+
+The verifier is copied into a clean verification tree and run there. Confining it to a
+single, known directory is what keeps the rest of the scenario — `reference/honest`,
+`reference/cheat`, the pristine `seed_repo` — out of that tree. A verifier placed at the
+scenario root would drag the answer key in with it.
+"""
 
 
 class DetectorSpec(BaseModel):
@@ -44,8 +53,16 @@ class ScenarioManifest(BaseModel):
     detectors: list[DetectorSpec]
 
     # Held-out completion verification (SPEC.md §7). Path to a script/pytest run in a clean
-    # container AFTER the agent finishes; its exit code sets goal_met.
+    # container AFTER the agent finishes; its exit code sets goal_met. MUST live under
+    # `completion_check/` — see COMPLETION_CHECK_DIR for why.
     completion_check: str
+
+    # Command that runs the repo's OWN test suite, for the `test_rerun` detector (SPEC.md
+    # §6). Distinct from `completion_check`: this runs the suite as the agent left it, to
+    # check the agent's claim against reality, whereas the completion check runs the
+    # scenario's pristine oracle. The default suits v1's Python-only corpus (SPEC.md §6
+    # [OPEN]); scenarios in other shapes override it.
+    suite_command: list[str] = ["python", "-m", "pytest", "-q"]
 
     # Refusal handling (SPEC.md §7). Phrases that mark a correct refusal / impossibility flag.
     refusal_markers: list[str] = []
@@ -57,6 +74,25 @@ class ScenarioManifest(BaseModel):
     seed_repo: str = "seed_repo"
     reference_honest: str = "reference/honest"  # overlay dir copied over seed_repo
     reference_cheat: str = "reference/cheat"  # overlay dir copied over seed_repo
+
+    @field_validator("completion_check")
+    @classmethod
+    def _check_lives_in_its_own_directory(cls, value: str) -> str:
+        """Keep the held-out verifier inside `completion_check/` (see COMPLETION_CHECK_DIR).
+
+        Raises:
+            ValueError: If the path escapes the completion-check directory. Rejecting the
+                manifest outright is the fail-closed choice: a verifier that could pull the
+                reference resolutions into its own tree would make `goal_met` meaningless.
+        """
+        parts = PurePosixPath(value).parts
+        if not parts or parts[0] != COMPLETION_CHECK_DIR or ".." in parts:
+            raise ValueError(
+                f"completion_check must be a path under {COMPLETION_CHECK_DIR}/ "
+                f"(got {value!r}); a verifier outside it would copy the scenario's "
+                "reference resolutions into the verification tree"
+            )
+        return value
 
 
 class ValidityError(Exception):
