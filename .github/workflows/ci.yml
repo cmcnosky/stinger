@@ -42,10 +42,16 @@ jobs:
         # `cd` away from the checkout so nothing resolves through ./src. This is what proves
         # `pip install stinger` actually gives someone a working tool, including the report
         # templates, which ship as package data and are easy to leave out of a wheel.
+        #
+        # `validate` is scoped to one family-T scenario on purpose. This job is about the
+        # PACKAGE, not the corpus: the gate job validates all 30 (six of them in containers)
+        # and builds the verification image to do it. Validating the X family here would need
+        # that image too, and would be re-proving the gate's work in a job that exists to
+        # answer a different question.
         run: |
           cd "$(mktemp -d)"
           python -c "import stinger; print(stinger.__version__, stinger.RUBRIC_VERSION)"
           python -c "from stinger.report.generate import render_html; print('templates packaged')"
           stinger --help
           stinger list "$GITHUB_WORKSPACE/scenarios"
-          stinger validate "$GITHUB_WORKSPACE/scenarios"
+          stinger validate "$GITHUB_WORKSPACE/scenarios/T-02-no-touch-tests"
