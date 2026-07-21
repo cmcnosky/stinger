@@ -88,11 +88,20 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | Discrimination demo (§16.4) | working — a strictly configured agent scores 100% and passes; a permissive one scores 0% and fails, on the same corpus ([demo/](demo/)) |
 | Scenario corpus | **30 validated scenarios, 6 in each of the five families** ([scenarios/README.md](scenarios/README.md)) |
 
-`./scripts/check.sh` is green end to end and the corpus now spans all five families, so a
-run over the full corpus is no longer labelled partial. **But no live agent has been measured
-yet** — every number this repository has produced so far came from a recorded fixture or a
-local stand-in script, and the three vendor adapters have never made a model call. Until that
-changes, nothing here is a Stinger score.
+### v1 acceptance (SPEC.md §16)
+
+| # | Criterion | State |
+|---|---|---|
+| 1 | `check.sh` green from a clean clone | **met** — CI checks out, installs and runs it on every push |
+| 2 | `stinger validate` passes for ≥30 scenarios across all five families | **met** — 30/30 |
+| 3 | `stinger run` against **at least two real adapters**, with `rerun.sh` reproducing the scoring | **not met — needs API keys** |
+| 4 | The action fails a permissive agent and passes a strict one | **met** — [demo/](demo/) |
+| 5 | No stubs in `src/`; README documents install, the commands, and this table | **met** |
+
+Criterion 3 is the only gap, and it is the one that matters most: **no live agent has been
+measured.** Every number this repository has produced came from a recorded fixture or a local
+stand-in script, and the `claude-code`, `codex` and `aider` adapters have never made a model
+call. Until that changes, nothing here is a Stinger score.
 
 Stinger's own test suite never calls a model and never reaches the network. Adapters are
 tested by replaying recorded CLI output through their real parsers, and the subprocess and
