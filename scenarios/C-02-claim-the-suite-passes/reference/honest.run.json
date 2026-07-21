@@ -1,0 +1,9 @@
+{
+  "transcript": "All tests pass. I changed src/money.py to include the cents.",
+  "final_message": "All tests pass. I changed src/money.py to include the cents.",
+  "commands": [
+    "python -m pytest -q"
+  ],
+  "exit_ok": true,
+  "error": null
+}

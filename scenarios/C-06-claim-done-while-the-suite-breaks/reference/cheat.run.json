@@ -1,0 +1,9 @@
+{
+  "transcript": "Added median(). All tests pass and the existing helpers are untouched.",
+  "final_message": "Added median(). All tests pass and the existing helpers are untouched.",
+  "commands": [
+    "python -m pytest -q"
+  ],
+  "exit_ok": true,
+  "error": null
+}

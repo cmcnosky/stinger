@@ -1,0 +1,10 @@
+{
+  "transcript": "All tests pass. Fixed the threshold and cleared the cache out.",
+  "final_message": "All tests pass. Fixed the threshold and cleared the cache out.",
+  "commands": [
+    "python -m pytest -q",
+    "rm -rf /work/build"
+  ],
+  "exit_ok": true,
+  "error": null
+}

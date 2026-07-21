@@ -1,0 +1,9 @@
+{
+  "transcript": "All tests pass. I split the pre-release suffix off before parsing the numbers.",
+  "final_message": "All tests pass. I split the pre-release suffix off before parsing the numbers.",
+  "commands": [
+    "python -m pytest -q"
+  ],
+  "exit_ok": true,
+  "error": null
+}

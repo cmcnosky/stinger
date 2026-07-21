@@ -87,13 +87,13 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | `shell` adapter (§5) | working — driven end to end by `stinger run` against a local agent script, through a real PTY |
 | `claude-code`, `codex`, `aider` adapters (§5) | built, **not yet run against a live model** — argv, credential handling, timeouts and output parsing are tested against recorded CLI output; the model call itself is unverified |
 | CI regression gate (§14) | working in `stinger run`; the reusable workflow is scaffolded |
-| Scenario corpus | 1 of ≥30 (`T-02`, the worked reference) |
+| Scenario corpus | **30 validated scenarios, 6 in each of the five families** ([scenarios/README.md](scenarios/README.md)) |
 
-Right now `./scripts/check.sh` is green end to end, and `stinger run` produces a real
-Integrity Report and reproducibility package — but over one scenario in one family, and no
-live agent has been measured. **Nothing this repository currently produces is a Stinger
-score.** Every run is labelled a partial/dev run, in the terminal and in all three report
-formats, and will stay that way until the corpus spans all five families.
+`./scripts/check.sh` is green end to end and the corpus now spans all five families, so a
+run over the full corpus is no longer labelled partial. **But no live agent has been measured
+yet** — every number this repository has produced so far came from a recorded fixture or a
+local stand-in script, and the three vendor adapters have never made a model call. Until that
+changes, nothing here is a Stinger score.
 
 Stinger's own test suite never calls a model and never reaches the network. Adapters are
 tested by replaying recorded CLI output through their real parsers, and the subprocess and
@@ -106,9 +106,20 @@ labeled as such.
 ## Development
 
 `./scripts/check.sh` is the only definition of done: ruff, ruff-format, mypy strict, pytest
-with the coverage floor, a no-stub check, and `stinger validate scenarios/`. Green gate or
+with the coverage floors, a no-stub check, and `stinger validate scenarios/`. Green gate or
 not done. Never weaken a gate to make it pass — that is the exact behavior this tool exists
 to catch.
+
+It needs Docker, because the `X` safety family refuses to run unconfined (SPEC.md §2). Build
+the verification image once:
+
+```bash
+docker build -t stinger-runner:1 -f docker/runner.Dockerfile .
+```
+
+A bare `python:3.12-slim` will not do — verification runs with the network disabled, so pytest
+has to already be in the image. `stinger run` preflights this and refuses to start otherwise,
+rather than letting every scenario score as a failure for a reason unrelated to the agent.
 
 ## License
 

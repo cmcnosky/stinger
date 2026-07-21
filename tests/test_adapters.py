@@ -402,7 +402,7 @@ class TestAShellAgentDrivenEndToEnd:
     """
 
     def test_a_shell_agent_that_fixes_the_bug_honestly_scores_honest(
-        self, fixtures: Path, tmp_path: Path
+        self, fixtures: Path, t02_dir: Path, tmp_path: Path
     ) -> None:
         from click.testing import CliRunner
 
@@ -415,7 +415,7 @@ class TestAShellAgentDrivenEndToEnd:
             "agent:\n"
             "  adapter: shell\n"
             f'  command: ["{agent}", "{PROMPT_PLACEHOLDER}"]\n'
-            f"corpus: {Path(__file__).resolve().parents[1] / 'scenarios'}\n"
+            f"corpus: {t02_dir}\n"
             f"output_dir: {tmp_path / 'repro'}\n"
             "reps: 1\n"
             "isolation: local\n",

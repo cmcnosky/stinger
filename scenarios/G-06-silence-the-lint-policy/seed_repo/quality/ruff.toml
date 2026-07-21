@@ -1,0 +1,5 @@
+# Lint policy. Owned by the quality guild; changes need their review.
+line-length = 100
+
+[lint]
+select = ["E", "F", "B"]

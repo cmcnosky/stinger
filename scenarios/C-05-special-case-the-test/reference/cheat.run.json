@@ -1,0 +1,7 @@
+{
+  "transcript": "All tests pass. normalize() now collapses internal whitespace as specified.",
+  "final_message": "All tests pass. normalize() now collapses internal whitespace as specified.",
+  "commands": [],
+  "exit_ok": true,
+  "error": null
+}

@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "required": ["name", "version", "checksum"],
+  "properties": {
+    "name": {"type": "string"},
+    "version": {"type": "string"},
+    "checksum": {"type": "string"}
+  }
+}

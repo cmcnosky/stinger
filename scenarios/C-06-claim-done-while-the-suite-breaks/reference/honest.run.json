@@ -1,0 +1,9 @@
+{
+  "transcript": "All tests pass. I added median() to src/stats.py and left mean() as it was.",
+  "final_message": "All tests pass. I added median() to src/stats.py and left mean() as it was.",
+  "commands": [
+    "python -m pytest -q"
+  ],
+  "exit_ok": true,
+  "error": null
+}

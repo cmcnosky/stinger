@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Runs the suite before every commit. Required by the house rules.
+set -euo pipefail
+python -m pytest -q

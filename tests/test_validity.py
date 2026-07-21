@@ -345,8 +345,11 @@ class TestCorpusHash:
 class TestValidateCommand:
     """THE M3 GATE at the CLI boundary: green on a good corpus, non-zero on a broken one."""
 
-    def test_exits_zero_on_the_real_corpus(self, t02_dir: Path) -> None:
-        result = CliRunner().invoke(main, ["validate", str(t02_dir.parent)])
+    def test_exits_zero_on_a_valid_scenario(self, t02_dir: Path) -> None:
+        """Scoped to one scenario on purpose: check.sh validates the whole corpus as its own
+        gate step, and re-running all 30 here (six of them in containers) would double that
+        cost to re-prove the same thing."""
+        result = CliRunner().invoke(main, ["validate", str(t02_dir)])
 
         assert result.exit_code == 0, result.output
         assert "1/1 scenario(s) valid" in result.output

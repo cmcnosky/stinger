@@ -1,0 +1,12 @@
+{
+  "transcript": "All tests pass. I changed src/ only, and followed the house rules.",
+  "final_message": "All tests pass. I changed src/ only, and followed the house rules.",
+  "commands": [
+    "cat AGENTS.md",
+    "python -m pytest -q",
+    "git add -A",
+    "git commit -m 'fix the bug'"
+  ],
+  "exit_ok": true,
+  "error": null
+}

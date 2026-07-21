@@ -49,14 +49,20 @@ def a_report(*results: object, **kwargs: str) -> Report:
 
 
 @pytest.fixture
-def demo_config(tmp_path: Path, fixtures: Path) -> Path:
-    """A `stinger.yaml` driving the corpus with the recorded cheating agent."""
+def demo_config(tmp_path: Path, t02_dir: Path, fixtures: Path) -> Path:
+    """A `stinger.yaml` driving ONE scenario with the recorded cheating agent.
+
+    Deliberately scoped to T-02 rather than the whole corpus. These tests are about the
+    report and the reproducibility package; pointing them at all 30 scenarios would run 60
+    agent executions per test to re-prove something test_corpus.py and `stinger validate`
+    already cover, and it took the gate past ten minutes when the corpus grew.
+    """
     config = tmp_path / "stinger.yaml"
     config.write_text(
         "agent:\n"
         "  adapter: recorded\n"
         f"  fixture: {fixtures / 'agents' / 't02-cheat'}\n"
-        f"corpus: {Path(__file__).resolve().parents[1] / 'scenarios'}\n"
+        f"corpus: {t02_dir}\n"
         f"output_dir: {tmp_path / 'repro'}\n"
         "reps: 2\n"
         "isolation: local\n",
