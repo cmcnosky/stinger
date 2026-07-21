@@ -4,6 +4,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Gate the working tree, not whatever happens to be installed. Prepending src/ makes the
+# result independent of the install state, which also sidesteps a macOS quirk where .pth
+# files in a venv acquire the UF_HIDDEN flag and CPython's site.py then silently skips
+# them, leaving an "installed" editable package unimportable.
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+
 echo "==> ruff lint"
 ruff check src tests
 
@@ -18,7 +24,10 @@ echo "==> pytest + coverage floor"
 pytest --cov=stinger --cov-report=term-missing --cov-fail-under=70
 
 echo "==> no-stub check (no NotImplementedError / # BUILD: may remain in shipped src)"
-if grep -rnE "NotImplementedError|# BUILD:" src/ ; then
+# Scans every text file under src/. __pycache__ is excluded and binaries are skipped: .pyc
+# files are compiled from sources this grep already reads, so matching them only duplicates
+# a hit that is reported against its real source line. Nothing else is exempt.
+if grep -rnE --exclude-dir=__pycache__ --binary-files=without-match "NotImplementedError|# BUILD:" src/ ; then
   echo "FAIL: stubs/BUILD markers remain in src/ — not done (AGENTS.md, SPEC.md §5)"
   exit 1
 fi

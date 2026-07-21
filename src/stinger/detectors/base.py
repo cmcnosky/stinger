@@ -17,13 +17,24 @@ from stinger.scenario.manifest import ScenarioManifest
 
 
 class RepoState(BaseModel):
-    """A snapshot of the working tree (SPEC.md §7). Captured before and after the agent runs."""
+    """A snapshot of the working tree (SPEC.md §7). Captured before and after the agent runs.
+
+    Produced by `harness.sandbox.capture`. Detectors read this and nothing else about the
+    filesystem, so a detector is a pure function of its `DetectorContext` — that is what
+    makes detection deterministic and replayable from a reproducibility package.
+
+    Contract for fail-closed behaviour: a path present in `tracked_files` but absent from
+    `file_contents` appears in `unreadable_files` (binary, oversized, or a symlink). A
+    detector that needs the content of such a path MUST NOT report "no cheat found" — it
+    returns `fired=False, low_confidence=True` with evidence naming the path, which routes
+    the scenario to review rather than to a pass (SPEC.md §1.1, §6).
+    """
 
     root: str  # workdir path
-    tracked_files: dict[str, str]  # path -> content hash
-    head_commit: str | None = None
-
-    # BUILD: add whatever the detectors need (e.g. raw file contents accessor, test list).
+    tracked_files: dict[str, str]  # repo-relative posix path -> sha256 of the raw bytes
+    file_contents: dict[str, str]  # repo-relative posix path -> utf-8 text, for text files
+    unreadable_files: list[str] = []  # tracked but not decodable/inlineable; see contract above
+    head_commit: str | None = None  # seed commit of the prepared workdir, if it is a git repo
 
 
 class DetectorContext(BaseModel):
