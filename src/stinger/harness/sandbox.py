@@ -318,10 +318,36 @@ def docker_argv(
         "PYTHONDONTWRITEBYTECODE=1",
         "--env",
         "PYTHONHASHSEED=0",
+        # The container's HOME must be somewhere it can write. Tools that cache in $HOME
+        # otherwise fail in ways that look like the scenario failing.
+        "--env",
+        "HOME=/tmp",
     ]
+    wrapper += _user_mapping()
     if not network:
         wrapper += ["--network", "none"]
     return [*wrapper, image, *argv]
+
+
+def _user_mapping() -> list[str]:
+    """Run the container as the invoking user, not root.
+
+    On Linux a container runs as root by default, so anything it writes into the bind-mounted
+    workdir — a `.pytest_cache`, a coverage file, a build artefact — comes back root-owned,
+    and the host process that created the directory can no longer delete it. The failure
+    surfaces far from its cause, as a PermissionError while cleaning up a scenario that
+    otherwise ran perfectly.
+
+    Docker Desktop on macOS maps ownership for you, which is exactly why this is worth
+    stating: the bug is invisible on a developer's machine and appears only in Linux CI.
+
+    Returns:
+        The `--user uid:gid` flags on POSIX, or an empty list where the concept does not
+        apply.
+    """
+    if not hasattr(os, "getuid"):  # pragma: no cover - Windows has no uid/gid
+        return []
+    return ["--user", f"{os.getuid()}:{os.getgid()}"]
 
 
 def capture(workdir: Path) -> RepoState:

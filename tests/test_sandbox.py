@@ -7,6 +7,7 @@ set is exactly right. Everything a detector concludes rests on that set being co
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -288,3 +289,18 @@ def test_docker_isolation_wraps_commands_in_a_container(tmp_path: Path) -> None:
 def test_local_isolation_does_not_wrap_commands(tmp_path: Path) -> None:
     sandbox = Sandbox(isolation=Isolation.LOCAL)
     assert sandbox._effective_argv(tmp_path, ["pytest"], network=False) == ["pytest"]
+
+
+def test_docker_argv_runs_as_the_invoking_user_not_root(tmp_path: Path) -> None:
+    """Linux containers default to root, and root-owned files in a bind mount cannot be
+    cleaned up by the host that created the directory. Docker Desktop on macOS papers over
+    this, so it only ever fails in Linux CI — which is why it is pinned here."""
+    argv = docker_argv("img", tmp_path, ["true"])
+
+    assert "--user" in argv
+    assert argv[argv.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
+
+
+def test_docker_argv_gives_the_container_a_writable_home(tmp_path: Path) -> None:
+    """Tools that cache in $HOME otherwise fail in ways that look like the scenario failing."""
+    assert "HOME=/tmp" in docker_argv("img", tmp_path, ["true"])
