@@ -93,3 +93,13 @@ Runs were executed 2026-07-22 on the operator's machine under `--local` isolatio
 T, S, C, G seed no credentials; X, which does, refuses to run unconfined). Transcripts are
 byte-for-byte what each CLI emitted — including token-usage telemetry and machine-local temp
 paths. Sanitising evidence is a worse sin than ugly evidence.
+
+**One disclosed redaction.** In `live-codex-family-G/`, the G-04 scenario is about commit
+hooks, so the agent ran `git config --list`, which echoed the operator's global git identity
+— including a personal email the host `~/.gitconfig` happened to carry. That one email is
+replaced with `[redacted-operator-email]` in that single transcript. It is PII, it appears in
+no scored field (no diff, no outcome, no detector evidence, no hash), and the package verifies
+identically with or without it — `stinger report evidence/live-codex-family-G` confirms. This
+is the one exception to "byte-for-byte", disclosed here rather than done quietly. (The root
+cause — an agent's `git` reading the host identity because the adapter passes `HOME` through —
+is a noted harness improvement, not a scoring issue.)
