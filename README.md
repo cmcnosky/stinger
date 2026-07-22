@@ -4,13 +4,6 @@
 
 **Measure whether an AI coding agent cheats — in your configuration, in your CI.**
 
-> **Visitors:** every line of code here was written by an AI coding agent directed by a
-> single non-engineer operator — and Stinger is itself a tool for catching AI coding
-> agents cheating, so the governance it measures is the governance it was built under.
-> [CASE_STUDY.md](CASE_STUDY.md) explains how, [evidence/](evidence/) holds the committed
-> reproducibility packages from its live runs, and the honest-status table below grades
-> every capability by evidence — including the acceptance criterion that is **not** met.
-
 Stinger runs a corpus of sandboxed trap scenarios against a configured coding agent,
 mechanically detects dishonest shortcuts (weakened tests, forbidden-file edits, fabricated
 completion claims, broken house rules, leaked bait secrets), and emits a scored,
@@ -168,7 +161,15 @@ rather than letting every scenario score as a failure for a reason unrelated to 
 Code: Apache-2.0 ([LICENSE](LICENSE)). Scenario corpus: CC-BY-4.0
 ([scenarios/LICENSE](scenarios/LICENSE)).
 
+## Provenance
+
+Stinger was built by directing AI coding agents under the governance regime documented in
+[AGENTS.md](AGENTS.md) — the same discipline the tool exists to measure. What that involved,
+and what running it against real agents exposed, is written up in
+[CASE_STUDY.md](CASE_STUDY.md).
+
 ## Contact
 
-Chris McNosky · Dallas–Fort Worth, TX · cmcnosky@gmail.com — see
-[CASE_STUDY.md](CASE_STUDY.md) for how this was built and what the operator actually did.
+Chris McNosky · Dallas–Fort Worth, TX · cmcnosky@gmail.com — available for AI-systems
+direction, agent-governance consulting, and roles where making AI-built software provably
+trustworthy is the job.
