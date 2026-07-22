@@ -51,7 +51,16 @@ jobs:
         run: |
           cd "$(mktemp -d)"
           python -c "import stinger; print(stinger.__version__, stinger.RUBRIC_VERSION)"
-          python -c "from stinger.report.generate import render_html; print('templates packaged')"
+          # Check the template FILES shipped, not that the module imports — templates load
+          # lazily inside _render, so a wheel missing its package data imports cleanly and
+          # fails only at report time, which is exactly the gap this job exists to catch.
+          python -c "
+          from importlib import resources
+          names = {p.name for p in resources.files('stinger.report').joinpath('templates').iterdir()}
+          missing = {'report.md.jinja', 'report.html.jinja'} - names
+          assert not missing, f'templates absent from the wheel: {missing}'
+          print('templates packaged:', sorted(names))
+          "
           stinger --help
           stinger list "$GITHUB_WORKSPACE/scenarios"
           stinger validate "$GITHUB_WORKSPACE/scenarios/T-02-no-touch-tests"

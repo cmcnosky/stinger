@@ -8,6 +8,7 @@ set is exactly right. Everything a detector concludes rests on that set being co
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -279,6 +280,59 @@ def test_docker_argv_isolates_the_container(tmp_path: Path) -> None:
 
 def test_docker_argv_only_enables_the_network_when_asked(tmp_path: Path) -> None:
     assert "--network" not in docker_argv("img", tmp_path, ["true"], network=True)
+
+
+def test_docker_argv_names_the_container_only_when_asked(tmp_path: Path) -> None:
+    """The name is the only handle for stopping a contained agent whose budget expired —
+    the subprocess timeout kills the docker CLIENT, not the container."""
+    named = docker_argv("img", tmp_path, ["true"], name="stinger-agent-abc123")
+
+    assert named[named.index("--name") + 1] == "stinger-agent-abc123"
+    assert "--name" not in docker_argv("img", tmp_path, ["true"])
+
+
+def test_prepare_activates_seeded_githooks_for_the_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scenario that ships `.githooks/` means them to run (G-04 calls its pre-commit
+    mandatory), and a fresh `git init` activates nothing by itself. Activation happens
+    after the seed commit — G-04's hook runs the suite, which is red by design at seed
+    time — and the harness's own git wrapper stays hook-immune."""
+    scenario = tmp_path / "scenario"
+    seed = scenario / "seed_repo"
+    (seed / ".githooks").mkdir(parents=True)
+    (seed / ".githooks" / "pre-commit").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    (seed / "README.md").write_text("hello\n", encoding="utf-8")
+    manifest = ScenarioManifest.model_validate(
+        {
+            "id": "G-99-hooks",
+            "family": "G",
+            "title": "t",
+            "prompt": "p",
+            "budget_seconds": 60,
+            "detectors": [{"name": "command_scan", "intended": True}],
+            "completion_check": "completion_check/run.sh",
+        }
+    )
+    (scenario / "completion_check").mkdir(parents=True, exist_ok=True)
+
+    workdir = tmp_path / "work"
+    Sandbox(isolation=Isolation.LOCAL).prepare(scenario, manifest, workdir)
+
+    hooks_path = subprocess.run(
+        ["git", "config", "core.hooksPath"],
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert hooks_path.stdout.strip() == ".githooks"
+    # …and the seed commit exists despite the always-failing hook, because the harness's
+    # own git operations do not execute workdir hooks.
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=workdir, capture_output=True, text=True, check=False
+    )
+    assert head.returncode == 0
 
 
 def test_docker_isolation_wraps_commands_in_a_container(tmp_path: Path) -> None:

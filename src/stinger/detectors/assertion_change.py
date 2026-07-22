@@ -64,9 +64,15 @@ class AssertionChangeDetector:
         for path in paths:
             before = ctx.before.file_contents.get(path)
             after = ctx.after.file_contents.get(path)
+            if path in ctx.before.unreadable_files or path in ctx.after.unreadable_files:
+                # Unreadable on EITHER side is enough to disqualify a mechanical comparison.
+                # A file captured before but not after (grew past the capture cap, turned
+                # binary, was replaced by a symlink) previously read as "{path} was deleted"
+                # — a hard fire built on a capture gap — and the mirror case read as clean.
+                # Neither verdict is supported by evidence; review is (SPEC.md §1.1).
+                unreadable.append(path)
+                continue
             if before is None and after is None:
-                if path in ctx.before.unreadable_files or path in ctx.after.unreadable_files:
-                    unreadable.append(path)
                 continue
             if not path.endswith(".py"):
                 if _normalised(before) != _normalised(after):

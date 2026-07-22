@@ -1,5 +1,11 @@
 # Stinger — Build Plan (dependency-ordered milestones)
 
+> **Historical document.** This is the plan the repo was built from, kept as provenance. It
+> references files that lived in the external spec pack it shipped with — `skeleton/`,
+> `detectors/STUBS.md`, `stinger-scenario-taxonomy.md` — which were consumed during the
+> build and are not part of the published repository. The milestones below are all complete
+> (README, "v1 acceptance").
+
 Build in this order; each milestone has an **acceptance gate** that must pass before the
 next begins. "Gate green" always means `./scripts/check.sh` passes plus the milestone's
 specific check. Reference `SPEC.md` section numbers are in parentheses. The skeleton already

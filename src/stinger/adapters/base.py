@@ -19,11 +19,26 @@ class Budget(BaseModel):
 
 
 class AgentRun(BaseModel):
-    """Everything Stinger observed about one agent invocation."""
+    """Everything Stinger observed about one agent invocation.
+
+    `transcript` is the verbatim capture and therefore contains BOTH what the agent said and
+    what its tools returned — including the contents of any file it read. Nothing that asks
+    "did the agent disclose this?" may read it, or the harness ends up reading its own
+    recording back as the agent's words. `authored_text` exists for exactly those questions.
+    """
 
     transcript: str  # full stdout/stderr or structured transcript, verbatim
     final_message: str  # the agent's last human-facing message (claim parsing reads this)
+    #: Everything the agent itself WROTE this run, its own messages joined in order, with
+    #: tool results excluded. `None` means this adapter cannot tell the two apart — a
+    #: plain-text CLI interleaves prose and command output on one stream — and a detector
+    #: must then say "could not attribute" rather than guessing either way (SPEC.md §5).
+    authored_text: str | None = None
     commands: list[str] = []  # shell commands the agent executed, if observable
+    #: True when a structured tool log was parsed for this run, so an empty `commands` means
+    #: "observed: the agent executed no shell commands" rather than "could not observe".
+    #: `command_scan` treats those two answers very differently (SPEC.md §5, §6).
+    commands_observed: bool = False
     exit_ok: bool = True
     error: str | None = None  # non-None => runner routes the scenario to ERROR
 

@@ -40,9 +40,11 @@ operator's own.
 
 Stinger has now been run against two real coding agents — OpenAI Codex across four scenario
 families and Claude Code across one, 30 live scenario runs in all, every package committed
-under [evidence/](evidence/) and re-verifiable offline. The agents behaved well: on these
-scenarios they fixed the bugs instead of faking them, and the harness measured that
-correctly.
+under [evidence/](evidence/) and re-verifiable offline. The agents behaved well: they fixed
+the bugs instead of faking them (and on C-04, the deliberately impossible task, refused —
+the honest move there). The harness measured that correctly on 29 of the 30; the thirtieth
+is C-04 itself, where it scored that textbook refusal wrong — defect 5 below tells that
+story, and the mislabelled package is committed unedited.
 
 But the runs were worth far more for what they *broke* than for what they scored. A string of
 real defects surfaced that no fixture test had reached — and every one would have produced a

@@ -112,7 +112,13 @@ def write_repro_package(
     # (which would not exist on a fresh clone — a real gap an independent review flagged). The
     # config written into the package points its corpus at that copy.
     corpus_root = _copy_corpus(scenarios, directory / "corpus")
-    package_config = config.model_copy(update={"corpus": Path("corpus")}) if corpus_root else config
+    updates: dict[str, object] = {}
+    if corpus_root:
+        updates["corpus"] = Path("corpus")
+    portable_command = _portable_command(config.agent.command)
+    if portable_command != config.agent.command:
+        updates["agent"] = config.agent.model_copy(update={"command": portable_command})
+    package_config = config.model_copy(update=updates) if updates else config
     (directory / "config.resolved.json").write_text(package_config.resolved_json(), "utf-8")
 
     rerun = directory / "rerun.sh"
@@ -134,6 +140,28 @@ def _copy_corpus(scenarios: list[Scenario], dest: Path) -> Path | None:
     for scenario in scenarios:
         shutil.copytree(scenario.directory, dest / scenario.id, ignore=ignore, dirs_exist_ok=True)
     return dest
+
+
+def _portable_command(command: list[str]) -> list[str]:
+    """Absolutise argv elements that name existing relative files.
+
+    The generic shell adapter's argv template may point at a script by a path relative to
+    the operator's working directory ("demo/agents/strict.py"). Written into the package
+    verbatim, rerun.sh step 2 then re-invokes the agent from the package directory, where
+    that relative path names nothing — the self-containment fix that copies the corpus in
+    never covered the agent command. Elements that are not existing files (program names on
+    PATH, flags, the "{prompt}" placeholder) pass through untouched. An absolute path keeps
+    step 2 working on the machine that produced the package; a different machine still has
+    to supply the agent itself, which step 2's own preamble already states.
+    """
+    portable: list[str] = []
+    for part in command:
+        candidate = Path(part)
+        if part and "{prompt}" not in part and not candidate.is_absolute() and candidate.is_file():
+            portable.append(str(candidate.resolve()))
+        else:
+            portable.append(part)
+    return portable
 
 
 def _rerun_script(report: Report, *, has_corpus: bool) -> str:

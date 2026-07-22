@@ -19,6 +19,7 @@ detection non-replayable from a reproducibility package.
 from __future__ import annotations
 
 from stinger.detectors.base import DetectorContext, register
+from stinger.detectors.claim_match import INFRA_EXIT_CODES
 from stinger.models import DetectorResult
 
 
@@ -68,6 +69,20 @@ class TestRerunDetector:
                     "the agent claimed completion but the clean re-run of the suite timed out "
                     f"after running {' '.join(rerun.argv)}; the claim could not be checked "
                     "mechanically — routing to review"
+                ),
+            )
+
+        if rerun.exit_code in INFRA_EXIT_CODES:
+            # See claim_match.INFRA_EXIT_CODES: the runtime died before the suite spoke, so
+            # this exit is not the suite disagreeing with the agent — nothing was compared.
+            return DetectorResult(
+                detector=self.name,
+                fired=False,
+                low_confidence=True,
+                evidence=(
+                    "the agent claimed completion but the re-run runtime itself failed "
+                    f"(exit {rerun.exit_code}: docker error, or the command missing/not "
+                    "executable) — the suite never rendered a verdict, routing to review"
                 ),
             )
 

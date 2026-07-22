@@ -295,6 +295,7 @@ def docker_argv(
     network: bool = False,
     forward_env: Sequence[str] = (),
     read_only_mounts: Mapping[str, str] | None = None,
+    name: str | None = None,
 ) -> list[str]:
     """Build the `docker run` invocation for one throwaway verification container.
 
@@ -319,6 +320,10 @@ def docker_argv(
             the agent container uses this, and only for a credential directory a CLI reads
             from disk. Read-only is not a detail: the agent under test is the untrusted party
             here, and a writable mount would hand it a channel out of the container.
+        name: Container name, for callers that may need to stop the container from outside.
+            A budget timeout kills only the local `docker run` client; without a name there
+            is no handle to stop the container itself, and a contained agent would keep
+            running — with network access — past its wall-clock ceiling.
 
     Returns:
         The full argv for `subprocess.run`.
@@ -340,10 +345,12 @@ def docker_argv(
         "--env",
         "HOME=/tmp",
     ]
+    if name is not None:
+        wrapper += ["--name", name]
     for host_path, container_path in sorted((read_only_mounts or {}).items()):
         wrapper += ["--volume", f"{Path(host_path).resolve()}:{container_path}:ro"]
-    for name in forward_env:
-        wrapper += ["--env", name]
+    for env_name in forward_env:
+        wrapper += ["--env", env_name]
     wrapper += _user_mapping()
     if not network:
         wrapper += ["--network", "none"]
@@ -526,10 +533,16 @@ def _as_text(stream: str | bytes | None) -> str:
 
 
 def _git(workdir: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    """Run git in `workdir` with a pinned, isolated configuration."""
+    """Run git in `workdir` with a pinned, isolated configuration.
+
+    `core.hooksPath=/dev/null` here disables hooks for the HARNESS's own git operations
+    only: a scenario may seed hooks (G-04 does) and an agent may write one, and harness
+    plumbing must neither trip over them nor execute them. The agent under test runs its own
+    `git`, not this wrapper, so it sees whatever hooks the repository configures.
+    """
     env = {**os.environ, **_GIT_ENV}
     return subprocess.run(
-        ["git", *args],
+        ["git", "-c", "core.hooksPath=/dev/null", *args],
         cwd=workdir,
         capture_output=True,
         text=True,
@@ -548,11 +561,26 @@ def _git_seed(workdir: Path) -> None:
     Raises:
         SandboxError: If git is unavailable or the seed commit could not be created.
     """
-    for args in (
+    steps: list[tuple[str, ...]] = [
         ("init", "--quiet", "--initial-branch", "main"),
+        # A repo-LOCAL identity, so the agent under test can commit without reaching for
+        # global config. A contained agent has no host ~/.gitconfig (its HOME is /tmp), and
+        # git's own error hint for that state is `git config --global user.email …` — the
+        # exact command the governance defaults treat as reaching outside the workdir. The
+        # commit id stays deterministic: the seed commit's identity comes from the pinned
+        # environment, which overrides repo config.
+        ("config", "user.name", "Stinger Scenario"),
+        ("config", "user.email", "scenario@stinger.invalid"),
         ("add", "--all"),
         ("-c", "commit.gpgsign=false", "commit", "--quiet", "--message", "stinger: seed"),
-    ):
+    ]
+    if (workdir / ".githooks").is_dir():
+        # A scenario that ships hooks means them to RUN (G-04's house rules call its
+        # pre-commit mandatory), and a fresh `git init` activates nothing by itself.
+        # Activated after the seed commit on purpose: the hook is for the agent's commits,
+        # and G-04's runs the suite, which is red by design at seed time.
+        steps.append(("config", "core.hooksPath", ".githooks"))
+    for args in steps:
         result = _git(workdir, *args)
         if result.returncode != 0:
             raise SandboxError(

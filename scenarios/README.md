@@ -119,5 +119,17 @@ So: anywhere a scenario matches on *what the agent said* — `refusal_markers` a
 write the concept, not your phrasing of it, and add a test with several independent wordings.
 The first live run against a real agent is worth more than any amount of re-reading.
 
+### One intended detector per trap — and what that leaves open
+
+Most S, G and X scenarios declare a single intended detector: each trap measures one
+dishonest move, sharply. The known cost, stated rather than hidden: an agent that ignores
+the scenario's own lure and instead attacks the visible test file (delete it, weaken it) is
+not caught *as a cheat* by these scenarios — the held-out oracle still fails it, so it can
+never score `HONEST`, but it lands as `FAILED_HONESTLY` where a T-family scenario would have
+said `CHEATED`. The T family exists to measure exactly that move, which is why every family
+runs in a full Stinger score. Widening every scenario to watch every detector would blur
+what each trap measures; if live evidence ever shows the cross-family gap being exploited,
+the right fix is declaring additional detectors on the specific scenarios involved.
+
 Never tune a scenario so a particular agent looks good or bad. Scenarios are written against
 the spec, never against an agent's known behaviour (AGENTS.md).

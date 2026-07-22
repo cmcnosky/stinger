@@ -24,6 +24,12 @@
 #     AGENT_API_KEY`. (The shipped stinger.example.yaml names `ANTHROPIC_API_KEY`, which is
 #     the right name for a local run where that variable is already in your shell.)
 #
+# The corpus: this job checks Stinger out at `.stinger` inside the caller's workspace, so a
+# caller who wants Stinger's own 30 bundled scenarios sets `corpus: .stinger/scenarios` in
+# their stinger.yaml (with the default working-directory). A caller with scenarios written
+# against their own house rules points `corpus:` at those instead — the shipped
+# stinger.example.yaml's `corpus: scenarios` names Stinger's layout, not a caller's.
+#
 # Your config's `corpus:` is what gets validated and what gets run — including when it points
 # at scenarios you wrote rather than the ones Stinger ships. Both steps execute from
 # `working-directory`, so they cannot end up disagreeing about which corpus this job measured.
@@ -112,23 +118,41 @@ jobs:
         env:
           AGENT_API_KEY: ${{ secrets.AGENT_API_KEY }}
         working-directory: ${{ inputs.working-directory }}
-        run: stinger run --config "${{ inputs.config }}"
+        run: |
+          # A workflow_call secret the caller did not pass arrives as the EMPTY STRING, not
+          # as unset. Exported that way it defeats the adapter's refuse-to-start guard (the
+          # missing-key check sees the variable present), and the agent then fails
+          # authentication downstream — which reads as agent misbehaviour instead of a
+          # wiring mistake. Unset it so the guard can speak.
+          if [ -z "${AGENT_API_KEY:-}" ]; then unset AGENT_API_KEY; fi
+          stinger run --config "${{ inputs.config }}"
+
+      - name: Locate the reproducibility package
+        # `output_dir` is a documented config key; hardcoding `repro/` here would silently
+        # upload nothing (if-no-files-found: warn) for any caller who set it — losing the
+        # evidence exactly when a failing run makes it matter most.
+        id: repro
+        if: always()
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          dir="$(python -c "import yaml; print(yaml.safe_load(open('${{ inputs.config }}')).get('output_dir') or 'repro')" 2>/dev/null || echo repro)"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
 
       - name: Upload the reproducibility package
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: stinger-repro
-          # `output_dir` is resolved from the working directory too, so the package lands
-          # beside the config rather than at the repository root.
-          path: ${{ inputs.working-directory }}/repro/
+          # Resolved from the working directory too, so the package lands beside the config
+          # rather than at the repository root.
+          path: ${{ inputs.working-directory }}/${{ steps.repro.outputs.dir }}/
           if-no-files-found: warn
 
       - name: Publish the report to the job summary
         if: always()
         working-directory: ${{ inputs.working-directory }}
         run: |
-          report="$(find repro -name report.md 2>/dev/null | sort | tail -1)"
+          report="$(find "${{ steps.repro.outputs.dir }}" -name report.md 2>/dev/null | sort | tail -1)"
           if [ -n "$report" ]; then
             cat "$report" >> "$GITHUB_STEP_SUMMARY"
           else

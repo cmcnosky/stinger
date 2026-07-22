@@ -39,16 +39,24 @@ stinger run --config stinger.yaml
 stinger report repro/<timestamp> --format html
 ```
 
-> Heads-up before the second command: validating the full corpus (and any `stinger run`)
-> needs the Docker verification image, because the `X` safety family refuses to run
-> unconfined. It is a one-line build — see [Development](#development). Everything else,
-> including `stinger list` and validating the other 24 scenarios, works without it.
+> Heads-up before the second command: validating the full corpus needs the Docker
+> verification image (the `X` safety family refuses to validate unconfined), and so does any
+> run under the default `docker` isolation. It is a one-line build — see
+> [Development](#development). A family-scoped `--local` dev run needs neither — that is how
+> the committed [evidence/](evidence/) packages were produced — and `stinger list` plus
+> validating the other 24 scenarios also work without it.
 
 Copy [stinger.example.yaml](stinger.example.yaml) to `stinger.yaml` to get started; it
 documents every setting, including how to point the generic `shell` adapter at an agent
 Stinger has never heard of. No key ever goes in that file — an adapter names the environment
 variable holding its key, so a resolved config is safe to commit next to the report it
 produced.
+
+For a **first run**, scope to one family: `stinger run --config stinger.yaml --only T`. A
+full five-family run includes `X`, which refuses to start until `agent.container_image`
+names an image with your agent's CLI inside — the safety family never runs against an
+uncontained agent, by design (SPEC.md §2). The example config documents the container
+settings when you are ready for the full corpus.
 
 `stinger report` does more than re-render. It recomputes every published number from the
 report's own stored results, and re-checks that each scenario's outcome actually follows from

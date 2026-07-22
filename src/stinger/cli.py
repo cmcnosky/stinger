@@ -15,7 +15,7 @@ from pathlib import Path
 import click
 
 from stinger.adapters.factory import AdapterError, build_adapter
-from stinger.config import ConfigError, RunConfig
+from stinger.config import DEFAULT_IMAGE, ConfigError, RunConfig
 from stinger.harness.runner import run_scenario_once
 from stinger.harness.sandbox import Isolation, Sandbox, SandboxError
 from stinger.models import Family, JudgeReport, Report, ScenarioResult
@@ -115,6 +115,7 @@ def validate(path: Path | None, config_path: Path | None, docker: bool) -> None:
             "different ways and there is no correct answer when they disagree"
         )
 
+    image = DEFAULT_IMAGE
     if config_path is not None:
         try:
             config = RunConfig.from_yaml(config_path)
@@ -122,6 +123,7 @@ def validate(path: Path | None, config_path: Path | None, docker: bool) -> None:
             raise click.ClickException(str(exc)) from exc
         path = config.corpus
         docker = docker or config.isolation is Isolation.DOCKER
+        image = config.image  # validate with the image the run will verify with, not a default
     elif path is None:
         path = Path("scenarios")
 
@@ -143,7 +145,7 @@ def validate(path: Path | None, config_path: Path | None, docker: bool) -> None:
     failures = 0
     for scenario in scenarios:
         try:
-            box = _sandbox_for(scenario, docker)
+            box = _sandbox_for(scenario, docker, image)
             box.preflight()
             validate_scenario(scenario.directory, scenario.manifest, sandbox=box)
         except (ValidityError, SandboxError) as exc:
@@ -157,7 +159,7 @@ def validate(path: Path | None, config_path: Path | None, docker: bool) -> None:
         raise SystemExit(1)
 
 
-def _sandbox_for(scenario: Scenario, docker: bool) -> Sandbox:
+def _sandbox_for(scenario: Scenario, docker: bool, image: str = DEFAULT_IMAGE) -> Sandbox:
     """Isolation for validating one scenario.
 
     Chosen by what the scenario contains, not by preference: family X always gets a
@@ -165,9 +167,14 @@ def _sandbox_for(scenario: Scenario, docker: bool) -> Sandbox:
     unconfined (SPEC.md §2). Everything else validates locally by default — validation runs
     the corpus's own reviewed reference resolutions, not agent-generated code — and --docker
     opts the whole corpus into containers for a stricter pass.
+
+    `image` must be the image the run will actually verify with. Validating against the
+    default while the config names a custom `image:` would prove fairness in one runtime and
+    score in another — the two can disagree about installed tooling, which is the exact
+    divergence the fairness gate exists to rule out.
     """
     if docker or scenario.manifest.family == "X":
-        return Sandbox(isolation=Isolation.DOCKER)
+        return Sandbox(isolation=Isolation.DOCKER, image=image)
     return Sandbox(isolation=Isolation.LOCAL)
 
 
@@ -327,12 +334,9 @@ def _load_and_validate(config: RunConfig) -> list[Scenario]:
     failures = []
     for scenario in scenarios:
         try:
-            _sandbox_for(scenario, config.isolation is Isolation.DOCKER).preflight()
-            validate_scenario(
-                scenario.directory,
-                scenario.manifest,
-                sandbox=_sandbox_for(scenario, config.isolation is Isolation.DOCKER),
-            )
+            box = _sandbox_for(scenario, config.isolation is Isolation.DOCKER, config.image)
+            box.preflight()
+            validate_scenario(scenario.directory, scenario.manifest, sandbox=box)
         except (ValidityError, SandboxError) as exc:
             failures.append(str(exc))
     if failures:

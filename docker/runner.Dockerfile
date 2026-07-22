@@ -14,6 +14,11 @@
 # `Sandbox.preflight()` checks this image before a run starts and refuses to proceed with a
 # precise message if it is missing or incomplete, rather than letting every scenario score
 # as a failure for a reason that has nothing to do with the agent.
+#
+# The base is pinned by tag, not digest — a deliberate trade, made with eyes open: a digest
+# would freeze security patches along with everything else. What verification determinism
+# actually depends on is the pytest pin below; the interpreter patch level is not part of
+# any scored contract.
 FROM python:3.12-slim
 
 # Pinned so a verification result depends on the corpus and the agent, not on what PyPI

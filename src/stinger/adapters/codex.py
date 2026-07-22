@@ -70,10 +70,25 @@ class CodexAdapter(CliAgentAdapter):
     def parse(self, capture: CliCapture) -> AgentRun:
         """Recover the final message and executed commands from the JSONL event stream."""
         events = _parse_events(capture.stdout)
+        if not events:
+            # Not a JSONL stream at all (an older CLI, or a crash before the first event):
+            # plain-text fallback, with commands and authorship honestly unobservable.
+            return AgentRun(
+                transcript=capture.transcript,
+                final_message=last_paragraph(capture.stdout),
+                exit_ok=capture.exit_code == 0,
+                error=_error_for(capture),
+            )
         return AgentRun(
             transcript=capture.transcript,
-            final_message=_final_message(events) or last_paragraph(capture.stdout),
+            # No last_paragraph fallback once the stream parsed as events: the last raw line
+            # of a JSONL stream is a JSON event, and a run that died mid-command can end on a
+            # command_execution event whose captured output says "3 passed" — which claim
+            # parsing must never mistake for the agent's own words.
+            final_message=_final_message(events),
+            authored_text=_authored_text(events),
             commands=_commands(events),
+            commands_observed=True,
             exit_ok=capture.exit_code == 0,
             error=_error_for(capture),
         )
@@ -95,13 +110,18 @@ def _parse_events(stdout: str) -> list[dict[str, Any]]:
     return events
 
 
+_MESSAGE_ITEM_TYPES = frozenset({"agent_message", "assistant_message", "message"})
+"""Event item types carrying the agent's own prose. Named here rather than inline because
+`_final_message` and `_authored_text` must agree on what counts as the agent speaking."""
+
+
 def _final_message(events: list[dict[str, Any]]) -> str:
     """The last agent message in the stream, wherever this CLI version puts the text."""
     for event in reversed(events):
         item = event.get("item", event)
         if not isinstance(item, dict):
             continue
-        if item.get("type") not in {"agent_message", "assistant_message", "message"}:
+        if item.get("type") not in _MESSAGE_ITEM_TYPES:
             continue
         for key in ("text", "message", "content"):
             value = item.get(key)
@@ -110,13 +130,48 @@ def _final_message(events: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _authored_text(events: list[dict[str, Any]]) -> str:
+    """Everything the agent itself wrote this run, with tool results excluded.
+
+    Command output and file contents arrive as their own item types; only the message items
+    are the agent speaking. Scanning the whole stream instead would let Stinger's recording
+    of a file the agent merely READ be read back as the agent disclosing it — a leak
+    detector reporting a leak the harness itself performed (SPEC.md §5, §6).
+    """
+    parts: list[str] = []
+    for event in events:
+        item = event.get("item", event)
+        if not isinstance(item, dict) or item.get("type") not in _MESSAGE_ITEM_TYPES:
+            continue
+        for key in ("text", "message", "content"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+                break
+    return "\n".join(parts)
+
+
 def _commands(events: list[dict[str, Any]]) -> list[str]:
-    """Shell commands the agent executed, in order."""
+    """Shell commands the agent executed, in order — each execution counted once.
+
+    Codex emits every command twice, as an `item.started` and an `item.completed` event
+    wrapping the same item id and command text. Counting both doubled the command log: the
+    first live G-family run reported "12 observed command(s)" for six actual executions. The
+    duplication was cosmetic there (command_scan patterns are per-command, so a doubled list
+    fires the same), but evidence that miscounts what the agent did is wrong on its own
+    terms. Items without an id (older dialects) are kept as-is rather than guessed at.
+    """
     commands: list[str] = []
+    seen_ids: set[str] = set()
     for event in events:
         item = event.get("item", event)
         if not isinstance(item, dict) or item.get("type") not in _SHELL_ITEM_TYPES:
             continue
+        item_id = item.get("id")
+        if isinstance(item_id, str):
+            if item_id in seen_ids:
+                continue  # the started/completed pair describes ONE execution
+            seen_ids.add(item_id)
         command = item.get("command")
         if isinstance(command, str):
             commands.append(command)

@@ -60,8 +60,12 @@ test out of collection. None of these is clever or adversarial. They are the ord
 shortcuts, which is the point: a tool that only caught sophisticated cheating would not be
 worth running.
 
-Each shortcut is caught by a different detector, so the demo also shows that no single
-detector is carrying the result.
+Between them the six shortcuts are caught by three distinct detectors — `forbidden_path`,
+`assertion_change`, and `test_count`, several scenarios tripping two at once (the committed
+[permissive report](example-reports/permissive/) shows which fired where) — so the demo also
+shows the result is not carried by any single detector. Three rather than six is what family
+T alone can exercise: the claims-audit and command-watching detectors belong to families
+this demo deliberately excludes (below).
 
 ## What this demo is not
 

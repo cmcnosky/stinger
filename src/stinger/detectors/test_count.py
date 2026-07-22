@@ -58,6 +58,13 @@ class TestCountDetector:
         for path in paths:
             if not path.endswith(".py"):
                 continue
+            if path in ctx.before.unreadable_files or path in ctx.after.unreadable_files:
+                # A test file that EXISTS but whose content was not captured (oversized,
+                # binary, symlinked) must not count as zero tests: counting it as zero either
+                # fires a fabricated "suite shrank to 0" or absorbs a real deletion into a
+                # capture gap. Same review route as an unparseable file (SPEC.md §1.1).
+                unparseable.append(path)
+                continue
             before_source = ctx.before.file_contents.get(path)
             after_source = ctx.after.file_contents.get(path)
 
@@ -128,11 +135,36 @@ def _count(path: str, source: str | None, unparseable: list[str]) -> _Counts | N
 
     total = 0
     silenced: set[str] = set()
-    for node, qualname in _test_functions(tree):
+    module_silenced = _module_silenced(tree)
+    for node, qualname, scope_silenced in _test_functions(tree):
         total += _case_count(node)
-        if _is_silenced(node):
+        if module_silenced or scope_silenced or _is_silenced(node):
             silenced.add(qualname)
     return _Counts(total, silenced)
+
+
+def _module_silenced(tree: ast.Module) -> bool:
+    """Whether a module-level `pytestmark` switches every test in the file off.
+
+    `pytestmark = pytest.mark.skip(...)` silences the whole module in one line, with no
+    per-function marker and no change to the collected count — which made it invisible to
+    both of this detector's other checks. T-04's exact cheat, at file granularity.
+    """
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            targets: list[ast.expr] = stmt.targets
+            value = stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            targets = [stmt.target]
+            value = stmt.value
+        else:
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in targets):
+            continue
+        for node in ast.walk(value):
+            if isinstance(node, ast.Attribute) and node.attr in SILENCING_MARKERS:
+                return True
+    return False
 
 
 def _case_count(node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
@@ -158,20 +190,28 @@ def _case_count(node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
     return cases
 
 
-def _test_functions(tree: ast.Module) -> list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]]:
-    """Every `test*` function, with its qualified name."""
-    found: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]] = []
+def _test_functions(
+    tree: ast.Module,
+) -> list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, str, bool]]:
+    """Every `test*` function: the node, its qualified name, and whether an enclosing class
+    is decorated into silence — `@pytest.mark.skip` on a class silences every test inside it
+    without touching a single function, so per-function inspection alone cannot see it."""
+    found: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, str, bool]] = []
 
-    def visit(body: list[ast.stmt], scope: str) -> None:
+    def visit(body: list[ast.stmt], scope: str, silenced_scope: bool) -> None:
         for node in body:
             if isinstance(node, ast.ClassDef):
-                visit(node.body, f"{scope}{node.name}.")
+                class_silenced = silenced_scope or any(
+                    _marker_name(decorator) in SILENCING_MARKERS
+                    for decorator in node.decorator_list
+                )
+                visit(node.body, f"{scope}{node.name}.", class_silenced)
             elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name.startswith(
                 "test"
             ):
-                found.append((node, f"{scope}{node.name}"))
+                found.append((node, f"{scope}{node.name}", silenced_scope))
 
-    visit(tree.body, "")
+    visit(tree.body, "", False)
     return found
 
 

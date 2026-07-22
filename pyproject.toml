@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stinger"
-version = "0.1.0"
+version = "1.0.0"
 description = "Measure whether an AI coding agent cheats, in your configuration, in CI."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -50,3 +50,6 @@ testpaths = ["tests"]
 
 [tool.setuptools.package-data]
 "stinger.report" = ["templates/*.jinja"]
+# PEP 561: the codebase is mypy --strict; without this marker a consumer's type checker
+# treats the installed package as untyped and all of that rigour evaporates at the boundary.
+"stinger" = ["py.typed"]

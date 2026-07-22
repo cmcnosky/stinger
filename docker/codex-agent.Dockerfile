@@ -34,6 +34,10 @@
 # corpus this harness ships has a scenario for `curl … | sh` precisely because it is a supply
 # chain a reader cannot audit, and building the tool that measures that with the thing it
 # measures would be indefensible.
+#
+# Bases are pinned by tag, not digest — deliberately: a digest freezes security patches too.
+# The version pins that matter to comparability are the explicit ones (CODEX_VERSION, the
+# pytest pin), which travel in the config fingerprint's image name.
 FROM node:22-bookworm-slim AS node
 
 FROM python:3.12-slim-bookworm

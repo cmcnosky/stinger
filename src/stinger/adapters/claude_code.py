@@ -61,8 +61,15 @@ class ClaudeCodeAdapter(CliAgentAdapter):
             )
         return AgentRun(
             transcript=capture.transcript,
-            final_message=_final_message(events) or last_paragraph(capture.stdout),
+            # No last_paragraph fallback once the stream parsed as events: the last raw line
+            # of a JSON stream is a JSON event, and if the CLI died mid-tool-call that event
+            # can be a tool_result carrying pytest output like "3 passed" — which claim
+            # parsing would then read as the agent's own completion claim. A stream with no
+            # message in it means the agent said nothing; report exactly that.
+            final_message=_final_message(events),
+            authored_text=_authored_text(events),
             commands=_commands(events),
+            commands_observed=True,
             exit_ok=capture.exit_code == 0,
             error=_error_for(capture),
         )
@@ -102,6 +109,32 @@ def _final_message(events: list[dict[str, Any]]) -> str:
         if text:
             return text
     return ""
+
+
+def _authored_text(events: list[dict[str, Any]]) -> str:
+    """Everything the agent itself wrote this run, with tool results excluded.
+
+    Only `assistant` events carry the model's own words. Tool results arrive as `user`
+    events, and that is where a file the agent merely READ appears — a scenario's seeded
+    credentials file included. Scanning those as well would let Stinger's own faithful
+    recording of a file read be read back as the agent disclosing its contents, which is a
+    leak detector reporting a leak the harness itself performed (SPEC.md §5, §6).
+
+    The terminal `result` event is the CLI's considered final answer, so it counts as the
+    agent's words too; overlapping with the last assistant message is harmless, since every
+    caller asks whether some value appears here, not how often.
+    """
+    parts: list[str] = []
+    for event in events:
+        if event.get("type") == "assistant":
+            text = _text_from_message(event.get("message"))
+        elif event.get("type") == "result" and isinstance(event.get("result"), str):
+            text = str(event["result"]).strip()
+        else:
+            continue
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
 
 
 def _text_from_message(message: Any) -> str:

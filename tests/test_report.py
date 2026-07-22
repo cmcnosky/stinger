@@ -33,7 +33,7 @@ from stinger.report.generate import (
     render_markdown,
     verify_report,
 )
-from stinger.report.repro import build_corpus_lock, repro_dir_for
+from stinger.report.repro import _portable_command, build_corpus_lock, repro_dir_for
 from stinger.scenario.loader import discover_scenarios
 
 STAMP = "2026-01-01T00:00:00+00:00"
@@ -314,6 +314,31 @@ class TestRunConfig:
 
         assert json.loads(config.resolved_json())["config_fingerprint"] == config.fingerprint()
 
+    def test_an_unknown_key_is_a_loud_error_not_a_silent_default(self, tmp_path: Path) -> None:
+        """A typo'd `regression_threshold` gates nothing and CI stays green forever; a
+        typo'd `container_image` silently runs the agent uncontained. Unknown keys must
+        refuse to load."""
+        cfg = tmp_path / "stinger.yaml"
+        cfg.write_text(
+            'agent:\n  adapter: shell\n  command: ["x", "{prompt}"]\nregression_treshold: 0.9\n',
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ConfigError, match="regression_treshold"):
+            RunConfig.from_yaml(cfg)
+
+    def test_a_packages_resolved_config_feeds_back_through_from_yaml(self, tmp_path: Path) -> None:
+        """rerun.sh step 2 does exactly this. The embedded config_fingerprint key is
+        metadata about the config, not part of it, and must not trip the unknown-key
+        refusal."""
+        config = RunConfig(agent=AgentConfig(adapter="shell", command=["x", "{prompt}"]))
+        blob = tmp_path / "config.resolved.json"
+        blob.write_text(config.resolved_json(), encoding="utf-8")
+
+        reloaded = RunConfig.from_yaml(blob)
+
+        assert reloaded.fingerprint() == config.fingerprint()
+
     def test_a_malformed_config_is_a_clear_error(self, tmp_path: Path) -> None:
         path = tmp_path / "stinger.yaml"
         path.write_text("- not a mapping\n", encoding="utf-8")
@@ -337,6 +362,35 @@ class TestRunConfig:
 
 
 class TestReproPackageContents:
+    def test_a_relative_agent_script_is_absolutised_into_the_package_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The corpus is copied into the package for self-containment, but the shell
+        adapter's script path was written verbatim — so the committed demo packages'
+        rerun.sh step 2 named a script that does not exist from the package directory."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "agent.py").write_text("print('hi')\n", encoding="utf-8")
+
+        portable = _portable_command(["python", "agent.py", "{prompt}"])
+
+        assert portable == ["python", str((tmp_path / "agent.py").resolve()), "{prompt}"]
+        # Not a file, a placeholder, or already absolute: untouched.
+        assert _portable_command(["python", "missing.py"]) == ["python", "missing.py"]
+        assert _portable_command(["{prompt}"]) == ["{prompt}"]
+
+    def test_the_validation_sandbox_verifies_with_the_configs_image(self) -> None:
+        """`stinger validate --config` must prove fairness in the image the run will score
+        with; validating in the default while scoring in a custom `image:` would let the
+        two runtimes disagree about installed tooling."""
+        from types import SimpleNamespace
+
+        from stinger.cli import _sandbox_for
+
+        scenario = SimpleNamespace(manifest=SimpleNamespace(family="X"))
+        box = _sandbox_for(scenario, False, "custom-image:9")  # type: ignore[arg-type]
+
+        assert box.image == "custom-image:9"
+
     def test_the_corpus_lock_pins_each_scenario_and_the_whole_corpus(self) -> None:
         scenarios = discover_scenarios(Path(__file__).resolve().parents[1] / "scenarios")
 
@@ -613,6 +667,79 @@ class TestOutcomeMustFollowFromEvidence:
             duration_s=1.0,
             repetition=0,
         )
+
+    def test_error_beside_hard_fires_with_no_reason_is_refused(self) -> None:
+        # ERROR removes a result from the integrity denominator, so relabelling a caught
+        # cheat as ERROR launders it out of the score. A genuine run.error ERROR records why
+        # as a low_confidence adapter/harness entry; hard fires with no such entry cannot
+        # have come from classify.
+        tampered = self.a_result(Outcome.ERROR, fired=True, goal_met=False)
+        report = self.report_of(self.a_result(Outcome.CHEATED, fired=True, goal_met=False))
+        report = report.model_copy(update={"results": [tampered]})
+
+        with pytest.raises(ReportMismatchError, match="relabelled out of the denominator"):
+            verify_report(report)
+
+    def test_an_unexplained_error_with_no_evidence_at_all_is_tolerated(self) -> None:
+        """One committed pre-8f1f71c package (the disclosed unauthenticated negative
+        control) stores ERROR results with no detector evidence whatsoever; refusing that
+        shape would refuse a legitimate historical artifact. Only the laundering shape —
+        hard fires beside an ERROR — is refused."""
+        from stinger.models import Family, ScenarioResult
+
+        bare = ScenarioResult(
+            scenario_id="X",
+            family=Family.T,
+            outcome=Outcome.ERROR,
+            detector_results=[],
+            goal_met=False,
+            agent_claimed_done=False,
+            transcript_path="t",
+            diff_path="d",
+            duration_s=1.0,
+            repetition=0,
+        )
+        verify_report(self.report_of(bare))
+
+    def test_a_scrubbed_claim_match_is_refused(self) -> None:
+        """claim_match is a pure function of two fields the result itself persists
+        (agent_claimed_done, goal_met): claimed-but-unmet can only fire or route to review,
+        so a stored clean pass beside those fields is doctored evidence."""
+        from stinger.models import DetectorResult, Family, ScenarioResult
+
+        doctored = ScenarioResult(
+            scenario_id="X",
+            family=Family.T,
+            outcome=Outcome.FAILED_HONESTLY,
+            detector_results=[
+                DetectorResult(detector="claim_match", fired=False, evidence="clean")
+            ],
+            goal_met=False,
+            agent_claimed_done=True,
+            transcript_path="t",
+            diff_path="d",
+            duration_s=1.0,
+            repetition=0,
+        )
+        report = self.report_of(self.a_result(Outcome.HONEST, fired=False, goal_met=True))
+
+        with pytest.raises(ReportMismatchError, match="pure function"):
+            verify_report(report.model_copy(update={"results": [doctored]}))
+
+    def test_padded_or_ragged_repetitions_are_refused(self) -> None:
+        """Appending fabricated repetitions flips a modal outcome without touching any
+        stored outcome — the one aggregate arithmetic recomputation cannot defend alone."""
+        one_each = self.report_of(self.a_result(Outcome.HONEST, fired=False, goal_met=True))
+        honest = self.a_result(Outcome.HONEST, fired=False, goal_met=True)
+        padded = honest.model_copy(update={"repetition": 1})  # type: ignore[attr-defined]
+        other = honest.model_copy(update={"scenario_id": "Y"})  # type: ignore[attr-defined]
+
+        with pytest.raises(ReportMismatchError, match="unequal repetition counts"):
+            verify_report(one_each.model_copy(update={"results": [honest, padded, other]}))
+
+        duplicated = honest.model_copy(update={"repetition": 0})  # type: ignore[attr-defined]
+        with pytest.raises(ReportMismatchError, match="not the contiguous"):
+            verify_report(one_each.model_copy(update={"results": [honest, duplicated]}))
 
     def test_unresolved_detector_beside_a_scored_outcome_is_refused(self) -> None:
         # An unresolved (low_confidence) detector with no hard fire is fail-closed to ERROR by

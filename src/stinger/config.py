@@ -25,7 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from stinger.harness.sandbox import DEFAULT_IMAGE, Isolation
 from stinger.models import Family
 
-__all__ = ["AgentConfig", "ConfigError", "JudgeConfig", "RunConfig"]
+__all__ = ["DEFAULT_IMAGE", "AgentConfig", "ConfigError", "JudgeConfig", "RunConfig"]
 
 
 class ConfigError(Exception):
@@ -35,7 +35,10 @@ class ConfigError(Exception):
 class AgentConfig(BaseModel):
     """Which agent is under test, and how to drive it (SPEC.md §5)."""
 
-    model_config = ConfigDict(frozen=True)
+    # extra="forbid": an unknown key is a loud error, not a silent no-op. The stakes are not
+    # cosmetic — a typo'd `regression_threshold` would gate nothing (CI green forever), and a
+    # typo'd `container_image` would silently run the agent uncontained.
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     adapter: str  # "claude-code" | "codex" | "aider" | "shell" | "recorded"
     model: str | None = None  # the agent's model id, when it has one; part of the fingerprint
@@ -82,7 +85,10 @@ class AgentConfig(BaseModel):
 class JudgeConfig(BaseModel):
     """The optional LLM judge (SPEC.md §9). Disabled by default, never authoritative."""
 
-    model_config = ConfigDict(frozen=True)
+    # extra="forbid": an unknown key is a loud error, not a silent no-op. The stakes are not
+    # cosmetic — a typo'd `regression_threshold` would gate nothing (CI green forever), and a
+    # typo'd `container_image` would silently run the agent uncontained.
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     enabled: bool = False
     model: str | None = None  # judge model id; published in the judge_assisted block
@@ -92,7 +98,10 @@ class JudgeConfig(BaseModel):
 class RunConfig(BaseModel):
     """Everything `stinger run` needs, resolved (SPEC.md §13)."""
 
-    model_config = ConfigDict(frozen=True)
+    # extra="forbid": an unknown key is a loud error, not a silent no-op. The stakes are not
+    # cosmetic — a typo'd `regression_threshold` would gate nothing (CI green forever), and a
+    # typo'd `container_image` would silently run the agent uncontained.
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     agent: AgentConfig
     corpus: Path = Path("scenarios")
@@ -142,6 +151,10 @@ class RunConfig(BaseModel):
             raise ConfigError(f"could not read {path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ConfigError(f"{path} must contain a YAML mapping, got {type(raw)}")
+        # A package's config.resolved.json carries its own fingerprint so a reader can check
+        # it against report.json; it is metadata about the config, not part of it, and
+        # rerun.sh feeds that very file back through here (JSON is valid YAML).
+        raw.pop("config_fingerprint", None)
         try:
             return cls.model_validate(raw)
         except ValidationError as exc:

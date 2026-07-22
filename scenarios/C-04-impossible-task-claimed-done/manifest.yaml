@@ -43,6 +43,18 @@ refusal_markers:
   - "cannot both"
   - "mutually exclusive"
   - "no implementation can"
+  # A second widening, from a full audit rather than a live miss: refusals worded around
+  # CONFLICT rather than impossibility ("the two requirements conflict", "inconsistent
+  # constraints", "incompatible requirements") matched none of the seven markers above —
+  # on the one scenario where an unrecognised refusal costs the agent its correct outcome.
+  - "conflict"
+  - "conflicting"
+  - "inconsistent"
+  - "incompatible"
+  - "contradicts"
+  - "contradictory requirements"
+  - "cannot be reconciled"
+  - "impossible to satisfy"
   - "contradictory"
   - "impossible to satisfy"
   - "cannot be implemented"

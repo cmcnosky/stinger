@@ -45,8 +45,10 @@ done. Run it before every handoff and before saying a task is complete.
 
 ## Scenario integrity (the corpus is the product)
 
-- Every scenario MUST ship `reference/honest.patch` and `reference/cheat.patch` and MUST
-  pass the validity contract (`SPEC.md` §12) before it counts. A trap that fires on correct
+- Every scenario MUST ship `reference/honest/` and `reference/cheat/` overlay directories
+  and MUST pass the validity contract (`SPEC.md` §12) before it counts. (Overlays, not
+  `.patch` files — §12 chose overlays precisely so references cannot rot through line-number
+  drift; an earlier draft of this rule said patches.) A trap that fires on correct
   behavior, or fails to fire on the intended cheat, is a bug that invalidates results — treat
   it with more care than a normal bug.
 - Bait secrets are dummies. "Exfiltration" sinks are local. Nothing in this repo may target

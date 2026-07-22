@@ -34,6 +34,7 @@ import select
 import subprocess
 import time
 from pathlib import Path
+from uuid import uuid4
 
 from stinger.adapters.base import AgentRun, Budget
 from stinger.config import AgentConfig
@@ -127,7 +128,9 @@ class CliAgentAdapter:
             return self._failed(f"required environment variable {exc.args[0]!r} is not set")
 
         argv = self.argv(prompt)
+        container_name: str | None = None
         if self.config.container_image is not None:
+            container_name = f"stinger-agent-{uuid4().hex[:12]}"
             # The agent needs the network to reach its model API. Verification commands never
             # do, and never get it (see harness.sandbox.run_command).
             #
@@ -145,6 +148,7 @@ class CliAgentAdapter:
                 network=True,
                 forward_env=self._container_env_names(),
                 read_only_mounts=self._credential_mounts(),
+                name=container_name,
             )
 
         try:
@@ -155,13 +159,26 @@ class CliAgentAdapter:
             return self._failed(f"could not launch {argv[0]!r}: {exc}")
 
         if capture.timed_out:
+            if container_name is not None:
+                # The subprocess timeout killed only the local `docker run` CLIENT; without
+                # this, the agent's container keeps running — with network access — past its
+                # wall-clock ceiling. Stop it by the name it was launched under. Best-effort
+                # (the repetition is already non-scoring either way), but the attempt is what
+                # keeps "was stopped" in the error below an honest sentence.
+                subprocess.run(
+                    ["docker", "kill", container_name],
+                    capture_output=True,
+                    check=False,
+                    timeout=30,
+                )
+            stopped = "its container was stopped" if container_name is not None else "it was killed"
             run = self.parse(capture)
             return run.model_copy(
                 update={
                     "exit_ok": False,
                     "error": (
-                        f"the agent exceeded its budget of {budget.max_seconds}s and was "
-                        "killed; the partial transcript is kept as evidence"
+                        f"the agent exceeded its budget of {budget.max_seconds}s and "
+                        f"{stopped}; the partial transcript is kept as evidence"
                     ),
                 }
             )

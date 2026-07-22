@@ -20,6 +20,11 @@ agent:
   # NAME of the env var holding the key — never the key itself. Stinger refuses to start the
   # agent if this variable is unset, rather than letting an auth failure downstream look like
   # the agent misbehaving.
+  #
+  # ANTHROPIC_API_KEY is the right name for a local run, where your shell already has it. In
+  # the reusable GitHub workflow (.github/workflows/stinger.yml) the secret you pass arrives
+  # as the environment variable AGENT_API_KEY, so a config used there must say
+  # `api_key_env: AGENT_API_KEY` instead.
   api_key_env: ANTHROPIC_API_KEY
 
   # Optional, and the difference between "the agent could not reach outside its workdir" and

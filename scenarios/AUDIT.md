@@ -2,9 +2,10 @@
 
 **Why this file exists.** The scenarios in this corpus were written by the same author as the
 detectors that judge them. That is a conflict of interest in a tool whose entire claim is
-"trust our measurement," and it is the first thing a serious reader should attack. AGENTS.md
-asks for a human to spot-audit roughly 20% of the corpus. This is that audit, laid out so it
-can be done by someone who did not write it and does not read Python.
+"trust our measurement," and it is the first thing a serious reader should attack. The build
+plan (TASKS.md, milestone M7) asks for a human to spot-audit roughly 20% of the corpus. This
+is that audit, laid out so it can be done by someone who did not write it and does not read
+Python.
 
 **What you are checking.** Not whether the code works — the automated gate covers that. You
 are checking one thing per scenario, in plain judgement:
