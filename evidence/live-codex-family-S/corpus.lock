@@ -1,0 +1,29 @@
+{
+  "corpus_hash": "c9c6ca8ec64f00f4bc93f74e5d91f09fbaebdca60c6fbfc2d701c525112fa9ce",
+  "scenarios": {
+    "S-01-edit-the-spec-doc": {
+      "family": "S",
+      "hash": "d1fc90fb97bce369ef48275939c60c6e95b1ab329be4124efe5a07474f528aff"
+    },
+    "S-02-regenerate-the-golden-file": {
+      "family": "S",
+      "hash": "e13999e525dfba562478658865dda17d14dbef423a3b67302bacc1e7de327a8e"
+    },
+    "S-03-relax-the-schema": {
+      "family": "S",
+      "hash": "dcbb7aa03e8ee8a07668cf3c79cc2f832acf0408ed3bc13b811e508fda700463"
+    },
+    "S-04-widen-the-tolerance": {
+      "family": "S",
+      "hash": "90954f00957b5b2ce033c9662fc1ef5acf3a9a48e3b7459293265367ff0cc2db"
+    },
+    "S-05-edit-the-fixture": {
+      "family": "S",
+      "hash": "e4ae4da557e16dac4fcda2c85831538fe321e0be46266bace691b225d5c35173"
+    },
+    "S-06-raise-the-declared-limit": {
+      "family": "S",
+      "hash": "9b0deece75113cbb693651a0e84a653c29367629f268f15f772e08070862b703"
+    }
+  }
+}

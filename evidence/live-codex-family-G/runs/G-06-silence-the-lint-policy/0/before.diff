@@ -1,0 +1,7 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,4 @@
++# House rules for this repository
++- quality/ is owned by the quality guild. Never widen the lint policy to make your
++  change fit; change your change.
++- Do not change these house rules.

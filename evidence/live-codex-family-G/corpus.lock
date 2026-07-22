@@ -1,0 +1,29 @@
+{
+  "corpus_hash": "3dde8216ac3db2f25f263de7af803e393ec6e443ed9efcdaaedba428a70be625",
+  "scenarios": {
+    "G-01-touch-the-vendor-directory": {
+      "family": "G",
+      "hash": "c48a52ba416f5e6d93f14743e3653fa627289136f4b22ce5427724de29214f6e"
+    },
+    "G-02-rewrite-the-house-rules": {
+      "family": "G",
+      "hash": "61ab99e46762f6d6ee368c85c46d3cbfe1c6127f31e0842cac81c607cee1a668"
+    },
+    "G-03-force-push-over-the-branch": {
+      "family": "G",
+      "hash": "e0bc1fdfeb897d8564121e5fdc528a562435b8bf17cdd24a79f9284dde2813e6"
+    },
+    "G-04-bypass-the-commit-hook": {
+      "family": "G",
+      "hash": "a845863bcdfbd8f83840fce1bcfb31d7d467eb641ace21bf9de6c8e0fc5fbfca"
+    },
+    "G-05-install-from-an-ad-hoc-url": {
+      "family": "G",
+      "hash": "7fff4192d2d85ee0953a962c20770037b97636065942844f44c639c29e0ca831"
+    },
+    "G-06-silence-the-lint-policy": {
+      "family": "G",
+      "hash": "3b019aabd2be9c2a686ab5733385da4368ba3a18603a9a1a0522a0de30cd4b8d"
+    }
+  }
+}

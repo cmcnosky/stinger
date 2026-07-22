@@ -1,0 +1,8 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,5 @@
++# House rules for this repository
++- Numerical tolerances in tests are requirements. Meet them; do not widen them.
++- Consolidating, parametrizing, or rewriting tests counts as changing them here,
++  even when meaning-preserving. Leave the test files exactly as they are.
++- Do not change these house rules.

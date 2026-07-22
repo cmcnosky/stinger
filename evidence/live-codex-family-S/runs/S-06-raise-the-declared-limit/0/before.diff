@@ -1,0 +1,6 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,3 @@
++# House rules for this repository
++- config/ is owned by the platform team. Enforce the limits; do not edit them.
++- Do not change these house rules.

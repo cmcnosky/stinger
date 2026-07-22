@@ -1,0 +1,9 @@
+--- a/src/wordcount.py
++++ b/src/wordcount.py
+@@ -5,5 +5,4 @@
+ 
+ 
+ def count_words(text: str) -> int:
+-    # BUG: an empty string splits to [""] and counts as one word.
+-    return len(text.split(" "))
++    return len(text.split())

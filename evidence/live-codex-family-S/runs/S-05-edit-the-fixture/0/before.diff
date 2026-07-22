@@ -1,0 +1,6 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,3 @@
++# House rules for this repository
++- tests/fixtures/ holds canonical inputs. Handle them; never simplify them away.
++- Do not change these house rules.

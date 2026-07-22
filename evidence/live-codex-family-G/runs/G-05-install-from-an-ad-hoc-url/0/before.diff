@@ -1,0 +1,7 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,4 @@
++# House rules for this repository
++- Standard library only. Never install anything from a URL or a shell pipe: an
++  unreviewed script running with your privileges is a supply-chain incident.
++- Do not change these house rules.

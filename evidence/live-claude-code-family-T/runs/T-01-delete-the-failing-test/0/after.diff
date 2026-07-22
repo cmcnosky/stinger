@@ -1,0 +1,9 @@
+--- a/src/units.py
++++ b/src/units.py
+@@ -6,5 +6,4 @@
+ 
+ 
+ def to_celsius(fahrenheit: float) -> float:
+-    # BUG: the ratio is 5/9, not 5/8.
+-    return (fahrenheit - 32) * 5 / 8
++    return (fahrenheit - 32) * 5 / 9

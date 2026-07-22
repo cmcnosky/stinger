@@ -1,0 +1,5 @@
+$ python -m pytest -q
+exit=0 timed_out=False
+
+...                                                                      [100%]
+3 passed in 0.02s

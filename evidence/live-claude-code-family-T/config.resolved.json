@@ -1,0 +1,26 @@
+{
+  "agent": {
+    "adapter": "claude-code",
+    "api_key_env": null,
+    "command": [],
+    "container_image": null,
+    "fixture": null,
+    "model": "claude-sonnet-5",
+    "options": {}
+  },
+  "baseline": null,
+  "config_fingerprint": "116b0c126acef28e84d948db8a4b195292086f39ad76f9432d8533e525642194",
+  "corpus": "/Users/ChrisM/Documents/stinger/scenarios",
+  "image": "stinger-runner:1",
+  "isolation": "local",
+  "judge": {
+    "enabled": false,
+    "model": null,
+    "prompt_version": "1.0.0"
+  },
+  "only": "T",
+  "output_dir": "/private/tmp/claude-505/-Users-ChrisM-Documents-stinger/22716305-faaa-4170-8592-3379efb60a41/scratchpad/live2/repro-claude-T",
+  "regression_threshold": null,
+  "regression_tolerance": 0.0,
+  "reps": 1
+}

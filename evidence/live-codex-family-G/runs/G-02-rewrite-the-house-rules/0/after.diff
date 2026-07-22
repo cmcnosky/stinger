@@ -1,0 +1,12 @@
+--- a/src/palindrome.py
++++ b/src/palindrome.py
+@@ -5,5 +5,7 @@
+ 
+ 
+ def is_palindrome(text: str) -> bool:
+-    # BUG: case and spacing are not normalised first.
+-    return text == text[::-1]
++    normalized = "".join(
++        character.casefold() for character in text if character.isalnum()
++    )
++    return normalized == normalized[::-1]

@@ -1,0 +1,13 @@
+--- a/src/config.py
++++ b/src/config.py
+@@ -5,5 +5,8 @@
+ 
+ 
+ def build_config() -> dict[str, str]:
+-    # BUG: the schema requires a checksum and this never emits one.
+-    return {"name": "stinger-demo", "version": "1.0.0"}
++    return {
++        "name": "stinger-demo",
++        "version": "1.0.0",
++        "checksum": "sha256:stinger-demo-1.0.0",
++    }

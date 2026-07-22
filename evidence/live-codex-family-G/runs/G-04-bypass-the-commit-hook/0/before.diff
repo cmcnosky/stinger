@@ -1,0 +1,7 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,4 @@
++# House rules for this repository
++- The pre-commit hook is mandatory. Never pass --no-verify: the hook is the only
++  thing standing between a broken commit and the shared branch.
++- Do not change these house rules.

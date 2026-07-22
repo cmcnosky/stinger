@@ -1,0 +1,9 @@
+--- a/src/uploads.py
++++ b/src/uploads.py
+@@ -15,5 +15,4 @@
+ 
+ 
+ def accepts(size_mb: int) -> bool:
+-    # BUG: the configured limit is read but never applied.
+-    return size_mb > 0
++    return 0 < size_mb <= limit_mb()

@@ -97,8 +97,9 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | `stinger run` / `stinger report` (§13) | working |
 | Optional LLM judge (§9) | working, but no transport — the bounds and prompt are implemented and tested; the operator supplies a `JudgeClient`. Disabled by default. |
 | `shell` adapter (§5) | working — driven end to end by `stinger run` against a local agent script, through a real PTY |
-| `codex` adapter (§5) | working — **run live against a real model** across families T and C (12 scenarios), every completion confirmed by the held-out oracle; full packages in [evidence/](evidence/) |
-| `claude-code`, `aider` adapters (§5) | built, **not yet run against a live model** — argv, credential handling, timeouts and output parsing are tested against recorded CLI output; the model call itself is unverified |
+| `codex` adapter (§5) | working — **run live against a real model** across families T, S, C, G (24 scenarios); every completion confirmed by the held-out oracle; full packages in [evidence/](evidence/) |
+| `claude-code` adapter (§5) | working — **run live against a real model** (family T, 6 scenarios); `rerun.sh` reproduced the scoring; packages in [evidence/](evidence/) |
+| `aider` adapter (§5) | built, not yet run against a live model — argv, credential handling, timeouts and output parsing are tested against recorded CLI output |
 | CI regression gate + reusable workflow (§14) | working — absolute threshold and no-regression-vs-baseline, both enforced by `stinger run` itself |
 | Human spot-audit of the corpus | **not done** — [scenarios/AUDIT.md](scenarios/AUDIT.md) is ready for a reviewer who did not write the scenarios |
 | Discrimination demo (§16.4) | working — a strictly configured agent scores 100% and passes; a permissive one scores 0% and fails, on the same corpus (family T only, a labeled partial run — [demo/](demo/)) |
@@ -110,30 +111,35 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 |---|---|---|
 | 1 | `check.sh` green from a clean clone | **met** — CI checks out, installs and runs it on every push (locally, a clean clone additionally needs Docker running and the verification image built first) |
 | 2 | `stinger validate` passes for ≥30 scenarios across all five families | **met** — 30/30 |
-| 3 | `stinger run` against **at least two real adapters**, with `rerun.sh` reproducing the scoring | **half met** — `rerun.sh` verified: re-running a live codex run reproduced every score identically. Still one adapter; the second is blocked on a CLI login |
+| 3 | `stinger run` against **at least two real adapters**, with `rerun.sh` reproducing the scoring | **met** — codex and claude-code both run live, both with `rerun.sh` reproducing every score identically ([evidence/](evidence/)) |
 | 4 | The action fails a permissive agent and passes a strict one | **met** — [demo/](demo/) |
 | 5 | No stubs in `src/`; README documents install, the commands, and this table | **met** |
 
-Criterion 3 is the remaining gap, and only half of it. One real agent has been measured —
-codex, across families T and C, with every completion confirmed by the held-out oracle it
-never saw. `rerun.sh` has been run against that package end to end and reproduced the scoring
-exactly, which is the other thing §16.3 asks for. The complete reproducibility packages for
-all of it — both codex runs, the rerun, and a fail-closed negative control — are committed in
-[evidence/](evidence/), so none of this paragraph has to be taken on trust. What is missing
-is a *second* adapter: `claude-code` is installed but reports "Not logged in", and
-authenticating it is the account holder's to do, not the harness's.
+All five §16 criteria are now met. Two real agents have been measured — codex across four
+families (T, S, C, G) and claude-code across one (T) — every completion confirmed by the
+held-out oracle the agent never saw, and `rerun.sh` reproducing the scoring for both. The
+complete reproducibility packages are committed in [evidence/](evidence/), so none of this
+has to be taken on trust: `stinger report evidence/<package>` re-verifies any of them
+offline.
 
-Both runs covered one family each, so neither is a Stinger score, and both say so.
+Two honest limits remain, stated rather than hidden. Each live run covers one family, so
+every report carries the tool's own `PARTIAL / DEV RUN` banner — none is a Stinger score, and
+none is a verdict on any agent (one repetition, no comparison conditions). And the `X`
+safety family has not been run live at all: it seeds bait credentials and destructive lures
+that must not touch an unconfined agent, which would require the agent CLI packaged inside
+the verification container — an image not yet built. The tool refusing to run X unsafely is
+the point, not a gap to paper over.
 
-The live runs were worth far more for what they broke than for what they scored. Five real
-defects surfaced that no amount of fixture testing had reached, and every one of them would
-have produced a plausible-looking wrong answer rather than a visible failure: an agent that
-hung forever and looked like it was thinking; an unset sandbox mode that would have failed
-every scenario; claim-detection that recognised one real completion report in six, silently
-disabling the whole claims-audit family; an `error` outcome that never said why; and a
-refusal scored as a capability gap because the scenario and its own reference were written in
-the same vocabulary. See the commits around them — that pattern is the argument for running
-this against a real agent early, not the score.
+The live runs were worth far more for what they broke than for what they scored. A string of
+real defects surfaced that no amount of fixture testing had reached, and every one would have
+produced a plausible-looking wrong answer rather than a visible failure: an agent that hung
+forever and looked like it was thinking; an unset sandbox mode that would have failed every
+scenario; claim-detection that recognised one real completion report in six — and then missed
+the *second* agent's different phrasing too, because real agents never say what you imagine;
+an `error` outcome that never said why; a refusal scored as a capability gap because the
+scenario and its own reference shared a vocabulary; and a stripped environment that left the
+second agent unable to reach its own credential. See the commits around them — that pattern,
+not the scores, is the argument for putting a tool like this in front of a real agent early.
 
 Stinger's own test suite never calls a model and never reaches the network. Adapters are
 tested by replaying recorded CLI output through their real parsers, and the subprocess and

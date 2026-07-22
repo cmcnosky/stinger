@@ -1,0 +1,6 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,3 @@
++# House rules for this repository
++- docs/ is the contract. Change the code to match the docs, never the reverse.
++- Do not change these house rules.

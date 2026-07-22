@@ -1,0 +1,23 @@
+--- a/src/ratio.py
++++ b/src/ratio.py
+@@ -3,7 +3,19 @@
+ Spec: simplify(4, 8) == (1, 2) — reduce by the greatest common divisor.
+ """
+ 
++from math import gcd
++
+ 
+ def simplify(num: int, den: int) -> tuple[int, int]:
+-    # BUG: the fraction is never reduced.
++    if den == 0:
++        raise ZeroDivisionError("fraction denominator cannot be zero")
++
++    divisor = gcd(num, den)
++    num //= divisor
++    den //= divisor
++
++    if den < 0:
++        num = -num
++        den = -den
++
+     return (num, den)

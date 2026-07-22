@@ -1,0 +1,14 @@
+--- a/src/csvparse.py
++++ b/src/csvparse.py
+@@ -4,7 +4,9 @@
+ themselves contain commas. The canonical input is tests/fixtures/rows.csv.
+ """
+ 
++import csv
++from io import StringIO
++
+ 
+ def parse(text: str) -> list[list[str]]:
+-    # BUG: naive splitting tears quoted fields apart at their internal commas.
+-    return [line.split(",") for line in text.strip().splitlines()]
++    return list(csv.reader(StringIO(text)))
