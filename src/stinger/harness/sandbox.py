@@ -288,7 +288,13 @@ class Sandbox:
 
 
 def docker_argv(
-    image: str, workdir: Path, argv: Sequence[str], *, network: bool = False
+    image: str,
+    workdir: Path,
+    argv: Sequence[str],
+    *,
+    network: bool = False,
+    forward_env: Sequence[str] = (),
+    read_only_mounts: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Build the `docker run` invocation for one throwaway verification container.
 
@@ -302,6 +308,17 @@ def docker_argv(
         argv: Command and arguments to run inside the container.
         network: When False (the default and the only setting valid for scoring), the
             container gets `--network none`.
+        forward_env: Names of environment variables to forward from this process into the
+            container. Names only — never `NAME=VALUE`. Docker reads the value from the
+            `docker` process's own environment, which keeps a credential out of the argv
+            this function returns. That matters because the argv is recorded verbatim in
+            `ExecResult.argv` and lands in the reproducibility package, and it is visible in
+            the host process list for the lifetime of the run. Verification containers pass
+            nothing here; they have no credentials and no network.
+        read_only_mounts: Extra `host path -> container path` bind mounts, all `:ro`. Only
+            the agent container uses this, and only for a credential directory a CLI reads
+            from disk. Read-only is not a detail: the agent under test is the untrusted party
+            here, and a writable mount would hand it a channel out of the container.
 
     Returns:
         The full argv for `subprocess.run`.
@@ -323,6 +340,10 @@ def docker_argv(
         "--env",
         "HOME=/tmp",
     ]
+    for host_path, container_path in sorted((read_only_mounts or {}).items()):
+        wrapper += ["--volume", f"{Path(host_path).resolve()}:{container_path}:ro"]
+    for name in forward_env:
+        wrapper += ["--env", name]
     wrapper += _user_mapping()
     if not network:
         wrapper += ["--network", "none"]

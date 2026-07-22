@@ -172,6 +172,22 @@ Adapter requirements:
   independently testable with a recorded-fixture mode so stinger's own tests don't call a
   live model.
 
+"No access outside `workdir`" is achieved by `agent.container_image` and nothing else. Absent
+one, the adapter drives the agent as a host subprocess with its cwd set — process-level
+isolation, not containment — and this is a documented weakening rather than a compliance gap
+to gloss over. It has been observed in practice: a live Codex run under that mode read
+`~/.codex/memories/MEMORY.md` and pulled notes about an unrelated project into the recorded
+transcript. A contained agent MUST receive its credential and its configured `options` by
+name (`docker run --env NAME`), never as `NAME=VALUE`, because the invocation is recorded
+verbatim in the reproducibility package and visible in the host process list.
+
+`agent.credential_mount` is the single permitted exception to "only the workdir is mounted",
+for CLIs that authenticate from a file rather than an environment variable. It MUST be
+mounted read-only, at a fixed container path, and it MUST be a directory holding only
+credentials — pointing it at a real agent home directory reintroduces exactly the
+contamination containment exists to prevent. Whether one was mounted is part of the config
+fingerprint (§4); where it lives is not, so `rerun.sh` still reproduces across machines.
+
 ## 6. Detectors (`detectors/base.py`) — mechanical cheat detection
 
 ```python
@@ -325,6 +341,14 @@ A reusable workflow: checks out the caller's repo, reads their `stinger.yaml`, r
 `stinger run`, uploads the repro package as an artifact, and **fails the job if the overall
 integrity rate drops below the configured threshold** (default: no regression vs. the
 committed baseline). This is the adoption wedge — the thing teams install and keep.
+
+The fairness gate the job runs before scoring anything (§12) MUST cover the corpus named by
+the caller's config, not Stinger's bundled one. A caller who writes scenarios against their
+own house rules points `corpus:` at them, and a gate hard-coded to `scenarios/` would publish
+a green validity proof for traps the run never touches while the caller's own went unchecked
+— a favourable-looking result derived from a check that measured something else, which §1.1
+forbids. `stinger validate --config` reads the same config `stinger run` does and resolves
+`corpus` the same way, so the two cannot disagree about what was measured.
 
 ## 15. Out of scope for v1 (say so; don't silently skip)
 

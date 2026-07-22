@@ -32,21 +32,36 @@ class CodexAdapter(CliAgentAdapter):
 
         The prompt is passed through verbatim. Nothing is prepended, appended or reworded.
 
-        `--sandbox workspace-write` is set explicitly rather than left to the CLI's default,
-        for two reasons that pull in the same direction. It is the closest thing to SPEC.md
-        §5's "no access outside `workdir`" available without a container, since the workdir is
-        git-initialised and therefore is the workspace. And it is not a setting to leave
-        implicit: if the default were `read-only`, the agent could not edit anything, every
-        scenario would fail, and the report would read as an agent that never completed a
-        task rather than a harness that never let it try.
+        The sandbox mode is set explicitly rather than left to the CLI's default, and which
+        mode depends on who is providing the isolation:
+
+        * **Uncontained** (`container_image` unset): `workspace-write`. The closest thing to
+          SPEC.md §5's "no access outside `workdir`" available from the CLI alone, since the
+          workdir is git-initialised and therefore is the workspace.
+        * **Contained**: `danger-full-access`, because the container is already the boundary
+          and Codex's own sandbox cannot work inside one. It uses Bubblewrap, which needs to
+          create a user namespace, and Docker denies that — `bwrap: No permissions to create
+          a new namespace`, on every command the agent tries to run. Observed, not assumed:
+          a full contained run scored six scenarios `failed_honestly` because the agent could
+          not execute a single command, correctly reported that it could not, and changed
+          nothing. A harness that cannot let the agent try is not measuring integrity.
+
+        "Full access" here means full access *inside the container* — the mounted workdir and
+        the image — which is exactly the containment §5 asks for, and strictly narrower than
+        the host access `workspace-write` leaves available when there is no container at all.
+
+        Either way this must not be left implicit: with the CLI defaulting to `read-only` the
+        agent could edit nothing, every scenario would fail, and the report would read as an
+        agent that never completed a task rather than a harness that never let it try.
         """
+        sandbox = "danger-full-access" if self.config.container_image else "workspace-write"
         argv = [
             "codex",
             "exec",
             "--json",
             "--skip-git-repo-check",
             "--sandbox",
-            "workspace-write",
+            sandbox,
         ]
         if self.config.model is not None:
             argv += ["--model", self.config.model]

@@ -39,7 +39,10 @@ from stinger.adapters.base import AgentRun, Budget
 from stinger.config import AgentConfig
 from stinger.harness.sandbox import docker_argv
 
-__all__ = ["CliAgentAdapter", "CliCapture", "last_paragraph"]
+__all__ = ["CREDENTIAL_MOUNT_PATH", "CliAgentAdapter", "CliCapture", "last_paragraph"]
+
+CREDENTIAL_MOUNT_PATH = "/credentials"
+"""Where `AgentConfig.credential_mount` appears inside the agent container, always."""
 
 _READ_CHUNK = 65536
 _POLL_INTERVAL_S = 0.2
@@ -127,7 +130,22 @@ class CliAgentAdapter:
         if self.config.container_image is not None:
             # The agent needs the network to reach its model API. Verification commands never
             # do, and never get it (see harness.sandbox.run_command).
-            argv = docker_argv(self.config.container_image, workdir, argv, network=True)
+            #
+            # `forward_env` is what makes contained mode usable at all. `environment()` builds
+            # the child environment, but a container does NOT inherit it: without naming them
+            # here, the agent's credential and its configured options stop at the `docker`
+            # process, and every contained run fails to authenticate — a failure that looks
+            # like the agent misbehaving rather than the harness never handing it a key. Names
+            # only; the values travel in the docker process's own environment so they never
+            # enter the recorded argv (see docker_argv).
+            argv = docker_argv(
+                self.config.container_image,
+                workdir,
+                argv,
+                network=True,
+                forward_env=self._container_env_names(),
+                read_only_mounts=self._credential_mounts(),
+            )
 
         try:
             capture = self._capture(argv, workdir, env, budget.max_seconds)
@@ -193,6 +211,29 @@ class CliAgentAdapter:
             env[self.config.api_key_env] = os.environ[self.config.api_key_env]
         env.update(self.config.options)
         return env
+
+    def _container_env_names(self) -> list[str]:
+        """Variables the agent needs that a container would not otherwise receive.
+
+        The host passthrough (PATH, HOME, USER, …) is deliberately NOT forwarded: inside a
+        container those must describe the container, and `docker_argv` already sets a
+        writable HOME. What has to cross the boundary is the credential and whatever the
+        config declares in `options` — the two things that are about the agent rather than
+        about the machine it happens to run on.
+        """
+        names = [] if self.config.api_key_env is None else [self.config.api_key_env]
+        return names + sorted(self.config.options)
+
+    def _credential_mounts(self) -> dict[str, str]:
+        """The credential directory, read-only, at a fixed container path.
+
+        Fixed rather than configurable so that the container path appearing in a config's
+        `options` (`CODEX_HOME: /credentials`) means one thing across every report, and so
+        that a config cannot quietly mount a host directory over something in the image.
+        """
+        if self.config.credential_mount is None:
+            return {}
+        return {str(self.config.credential_mount): CREDENTIAL_MOUNT_PATH}
 
     def _capture(
         self, argv: list[str], workdir: Path, env: dict[str, str], timeout_s: int

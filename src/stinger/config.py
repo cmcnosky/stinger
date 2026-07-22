@@ -20,7 +20,7 @@ import json
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from stinger.harness.sandbox import DEFAULT_IMAGE, Isolation
 from stinger.models import Family
@@ -49,6 +49,32 @@ class AgentConfig(BaseModel):
     # with its cwd set, which is weaker and is documented as such in adapters/cli_base.py. The
     # image must already contain the agent CLI, which is why Stinger cannot supply a default.
     container_image: str | None = None
+
+    # A host directory holding the agent's credentials, mounted READ-ONLY at /credentials in
+    # the container. For CLIs that authenticate from a credential file rather than from an
+    # environment variable — Codex under a ChatGPT subscription keeps OAuth tokens in
+    # `auth.json`, and `api_key_env` cannot express that. Point the CLI at it through
+    # `options` (e.g. `CODEX_HOME: /credentials`).
+    #
+    # This is the one hole in "nothing but the workdir is mounted", so it is narrow by
+    # construction and loud by design: read-only, one directory, reported in every Report.
+    # Put ONLY the credential file in it. Handing over a whole agent home directory would
+    # restore exactly the contamination containment exists to prevent — the first live run of
+    # this harness had an uncontained agent read its own memory file and pull notes about an
+    # unrelated project into the recorded evidence.
+    credential_mount: Path | None = None
+
+    @field_validator("credential_mount")
+    @classmethod
+    def _expand_user(cls, value: Path | None) -> Path | None:
+        """Expand a leading `~`.
+
+        A credential directory lives in the operator's home by nature, so `~/...` is what
+        anyone writes. Pydantic keeps it literal, which would produce a bind mount of a
+        directory named `~` — created silently by Docker, empty, and the resulting
+        authentication failure would look like the agent misbehaving.
+        """
+        return None if value is None else Path(value).expanduser()
 
 
 class JudgeConfig(BaseModel):
@@ -126,10 +152,27 @@ class RunConfig(BaseModel):
         docstring. The digest is taken over canonical JSON with sorted keys, so it depends on
         the values and not on the order they appeared in the YAML.
 
+        `agent.credential_mount` is excluded as a location but replaced by a boolean, because
+        the two things it decides pull in opposite directions. WHERE the credentials live is
+        machine-specific and would stop `rerun.sh` from ever reproducing a fingerprint across
+        two checkouts. WHETHER a host directory was mounted into the agent's container is
+        behavioural — it is the difference between "nothing but the workdir was reachable"
+        and "one more thing was" — and a run that quietly changed that must not keep the
+        fingerprint of one that did not.
+
         Returns:
             The hex digest a Report publishes as `config_fingerprint`.
         """
-        payload = self.model_dump(mode="json", exclude={"corpus", "output_dir", "baseline"})
+        payload = self.model_dump(
+            mode="json",
+            exclude={
+                "corpus": True,
+                "output_dir": True,
+                "baseline": True,
+                "agent": {"credential_mount"},
+            },
+        )
+        payload["agent"]["credential_mounted"] = self.agent.credential_mount is not None
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 

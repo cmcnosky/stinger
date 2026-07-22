@@ -23,7 +23,12 @@ import pytest
 from stinger.adapters.aider import AiderAdapter
 from stinger.adapters.base import Budget
 from stinger.adapters.claude_code import ClaudeCodeAdapter
-from stinger.adapters.cli_base import CliAgentAdapter, CliCapture, last_paragraph
+from stinger.adapters.cli_base import (
+    CREDENTIAL_MOUNT_PATH,
+    CliAgentAdapter,
+    CliCapture,
+    last_paragraph,
+)
 from stinger.adapters.codex import CodexAdapter
 from stinger.adapters.factory import AVAILABLE_ADAPTERS, AdapterError, build_adapter
 from stinger.adapters.shell import PROMPT_PLACEHOLDER, ShellAdapter, ShellAdapterError
@@ -143,6 +148,22 @@ class TestCodexParsing:
         assert argv[:2] == ["codex", "exec"]
         assert argv[-1] == PROMPT
         assert "--json" in argv
+
+    def test_uncontained_runs_use_the_cli_workspace_sandbox(self) -> None:
+        argv = CodexAdapter(AgentConfig(adapter="codex")).argv(PROMPT)
+
+        assert argv[argv.index("--sandbox") + 1] == "workspace-write"
+
+    def test_contained_runs_hand_isolation_to_the_container(self) -> None:
+        """Codex sandboxes with Bubblewrap, which needs a user namespace Docker denies. Left
+        at workspace-write inside a container, every command the agent runs dies with
+        `bwrap: No permissions to create a new namespace` — measured as an agent that did
+        nothing rather than a harness that allowed nothing."""
+        argv = CodexAdapter(
+            AgentConfig(adapter="codex", container_image="stinger-codex-agent:1")
+        ).argv(PROMPT)
+
+        assert argv[argv.index("--sandbox") + 1] == "danger-full-access"
 
 
 class TestAiderParsing:
@@ -330,6 +351,116 @@ class TestContainerIsolation:
         assert "--network" not in argv  # network left enabled for the model API
         assert f"{tmp_path.resolve()}:/work" in argv
         assert "my-org/agent-image:1" in argv
+
+    def test_the_credential_and_options_reach_the_container(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A container inherits nothing from this process. Without forwarding these by name,
+        every contained run fails to authenticate — and an agent that was never handed a key
+        looks exactly like one that could not do the task."""
+        monkeypatch.setenv("AGENT_KEY", "sk-not-a-real-key")
+        adapter = shell_adapter(
+            "echo",
+            PROMPT_PLACEHOLDER,
+            container_image="my-org/agent-image:1",
+            api_key_env="AGENT_KEY",
+            options={"CODEX_HOME": "/creds"},
+        )
+        recorded: list[list[str]] = []
+
+        def spy(argv: list[str], workdir: Path, env: dict[str, str], timeout: int) -> CliCapture:
+            recorded.append(argv)
+            return CliCapture("done", "", 0)
+
+        adapter._capture = spy  # type: ignore[method-assign]
+        adapter.run(tmp_path, PROMPT, Budget(max_seconds=30))
+
+        (argv,) = recorded
+        assert "AGENT_KEY" in argv
+        assert "CODEX_HOME" in argv
+
+    def test_the_credential_value_never_enters_the_recorded_argv(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--env NAME`, never `--env NAME=VALUE`: the argv is recorded verbatim into the
+        reproducibility package and is visible in the host process list."""
+        monkeypatch.setenv("AGENT_KEY", "sk-not-a-real-key")
+        adapter = shell_adapter(
+            "echo",
+            PROMPT_PLACEHOLDER,
+            container_image="my-org/agent-image:1",
+            api_key_env="AGENT_KEY",
+        )
+        recorded: list[list[str]] = []
+
+        def spy(argv: list[str], workdir: Path, env: dict[str, str], timeout: int) -> CliCapture:
+            recorded.append(argv)
+            return CliCapture("done", "", 0)
+
+        adapter._capture = spy  # type: ignore[method-assign]
+        adapter.run(tmp_path, PROMPT, Budget(max_seconds=30))
+
+        (argv,) = recorded
+        assert not any("sk-not-a-real-key" in part for part in argv)
+        # …but it does reach the docker process's own environment, which is how docker
+        # resolves a name-only --env.
+        assert adapter.environment()["AGENT_KEY"] == "sk-not-a-real-key"
+
+    def test_a_credential_directory_is_mounted_read_only(self, tmp_path: Path) -> None:
+        """The agent under test is the untrusted party; a writable mount would be a channel
+        out of the container."""
+        creds = tmp_path / "creds"
+        creds.mkdir()
+        adapter = shell_adapter(
+            "echo",
+            PROMPT_PLACEHOLDER,
+            container_image="my-org/agent-image:1",
+            credential_mount=creds,
+        )
+        recorded: list[list[str]] = []
+
+        def spy(argv: list[str], workdir: Path, env: dict[str, str], timeout: int) -> CliCapture:
+            recorded.append(argv)
+            return CliCapture("done", "", 0)
+
+        adapter._capture = spy  # type: ignore[method-assign]
+        adapter.run(tmp_path, PROMPT, Budget(max_seconds=30))
+
+        (argv,) = recorded
+        assert f"{creds.resolve()}:{CREDENTIAL_MOUNT_PATH}:ro" in argv
+
+    def test_no_credential_mount_means_only_the_workdir_is_reachable(self, tmp_path: Path) -> None:
+        adapter = shell_adapter("echo", PROMPT_PLACEHOLDER, container_image="my-org/agent-image:1")
+        recorded: list[list[str]] = []
+
+        def spy(argv: list[str], workdir: Path, env: dict[str, str], timeout: int) -> CliCapture:
+            recorded.append(argv)
+            return CliCapture("done", "", 0)
+
+        adapter._capture = spy  # type: ignore[method-assign]
+        adapter.run(tmp_path, PROMPT, Budget(max_seconds=30))
+
+        (argv,) = recorded
+        mounts = [argv[i + 1] for i, part in enumerate(argv) if part == "--volume"]
+        assert mounts == [f"{tmp_path.resolve()}:/work"]
+
+    def test_the_host_passthrough_does_not_leak_into_the_container(self, tmp_path: Path) -> None:
+        """PATH and HOME inside a container must describe the container. docker_argv already
+        sets a writable HOME; forwarding the host's would point at a directory that is not
+        mounted."""
+        adapter = shell_adapter("echo", PROMPT_PLACEHOLDER, container_image="my-org/agent-image:1")
+        recorded: list[list[str]] = []
+
+        def spy(argv: list[str], workdir: Path, env: dict[str, str], timeout: int) -> CliCapture:
+            recorded.append(argv)
+            return CliCapture("done", "", 0)
+
+        adapter._capture = spy  # type: ignore[method-assign]
+        adapter.run(tmp_path, PROMPT, Budget(max_seconds=30))
+
+        (argv,) = recorded
+        forwarded = [argv[i + 1] for i, part in enumerate(argv) if part == "--env"]
+        assert forwarded == ["PYTHONDONTWRITEBYTECODE=1", "PYTHONHASHSEED=0", "HOME=/tmp"]
 
 
 class TestFactory:

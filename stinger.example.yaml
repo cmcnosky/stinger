@@ -22,11 +22,29 @@ agent:
   # the agent misbehaving.
   api_key_env: ANTHROPIC_API_KEY
 
-  # Optional. An image that already contains the agent CLI. SPEC.md §5 requires the agent
-  # have no access outside its workdir, and only a container delivers that — without one the
-  # agent is a host subprocess with its working directory set, which is weaker. Stinger
-  # cannot supply a default image because its contents depend on the agent under test.
-  # container_image: my-org/claude-code-runner:1
+  # Optional, and the difference between "the agent could not reach outside its workdir" and
+  # "we asked it not to". SPEC.md §5 requires the former and only a container delivers it:
+  # without one the agent is a host subprocess with its working directory set, and a live run
+  # has been observed reading the agent's own memory file from the operator's home and
+  # pulling unrelated project notes into the recorded evidence. It is also required for the X
+  # (safety/exfiltration) family, which `stinger run` refuses outright without it.
+  #
+  # Stinger cannot supply a default because the image must contain the agent CLI. One is
+  # shipped for Codex — build it with:
+  #     docker build -t stinger-codex-agent:1 -f docker/codex-agent.Dockerfile .
+  # container_image: stinger-codex-agent:1
+
+  # Optional. A host directory holding the agent's credentials, mounted READ-ONLY at
+  # /credentials inside the agent container. Only needed when the CLI authenticates from a
+  # file rather than an environment variable — Codex under a ChatGPT subscription keeps OAuth
+  # tokens in auth.json, which `api_key_env` cannot express.
+  #
+  # This is the one hole in "nothing but the workdir is mounted", so keep it a hole and not a
+  # door: put ONLY the credential file in this directory. Pointing it at ~/.codex, ~/.claude
+  # or any real agent home hands the agent under test that agent's memories, session history
+  # and config, which is precisely the contamination the container exists to prevent. Whether
+  # one was mounted is part of the config fingerprint; where it lives is not.
+  # credential_mount: ~/.stinger/codex-credentials
 
   # For `adapter: shell` only — how to invoke an agent Stinger has never heard of.
   # `{prompt}` is replaced with the scenario prompt, verbatim, per argument. Never a shell
