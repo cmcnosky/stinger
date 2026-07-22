@@ -331,9 +331,16 @@ that follows it — "Updated src/x.py; the failure is still outstanding" became 
 _EXPLICIT_CLAIMS = tuple(
     re.compile(pattern)
     for pattern in (
-        r"\ball (?:of )?(?:the )?tests?(?: now)? (?:pass\b|passes\b|are passing\b)",
+        # "all tests pass", "all 3 tests pass", "all 3 tests pass now". The optional count
+        # and the trailing "now" are here because a second live agent (claude-code) phrased
+        # every message as "All 3 tests pass now" — the first ruleset, tuned to codex's
+        # "3 passed", missed all six. Two real agents, two dialects: the lesson is to widen
+        # from captured phrasing, never from imagination.
+        r"\ball (?:of )?(?:the )?(?:\d+ |both )?tests?(?: now)? (?:pass|passes|are passing)"
+        r"(?: now)?\b",
         r"\b(?:full |entire |whole )?(?:test )?suite(?: now)? (?:passes|is passing|is green)\b",
         r"\btests?(?: is| are)(?: now)? (?:green|passing)\b",
+        r"\b\d+ tests? (?:now )?(?:pass|passes|passing|passed)\b",
         r"\b(?:task|change|fix|work|implementation|it|this)(?: is| are)(?: now)? "
         r"(?:complete|completed|done|finished)\b",
         r"\bi(?:'ve| have)?(?: now)? (?:completed|finished|fixed|implemented|resolved) \w",

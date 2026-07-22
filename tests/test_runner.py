@@ -382,24 +382,41 @@ class TestParseClaimAgainstRealAgentOutput:
     """
 
     def live_messages(self, fixtures: Path) -> list[dict[str, str]]:
-        raw = (fixtures / "claims" / "codex-live.json").read_text(encoding="utf-8")
-        return list(json.loads(raw))
+        """Every captured real completion report, across every agent we have run live.
+
+        Two agents so far, in two different dialects: codex says "3 passed", claude-code
+        says "All 3 tests pass now". Each dialect broke parse_claim on its first contact and
+        each is pinned here so it can never regress. A third agent will add a third file.
+        """
+        cases: list[dict[str, str]] = []
+        for fixture in sorted((fixtures / "claims").glob("*-live.json")):
+            cases.extend(json.loads(fixture.read_text(encoding="utf-8")))
+        return cases
 
     def test_every_real_completion_report_is_recognised(self, fixtures: Path) -> None:
         missed = [
-            case["scenario"]
+            f"{case['agent']}::{case['scenario']}"
             for case in self.live_messages(fixtures)
             if not parse_claim(case["final_message"])
         ]
 
         assert not missed, f"real completion claims scored as 'no claim': {missed}"
 
+    def test_fixtures_cover_more_than_one_real_agent(self, fixtures: Path) -> None:
+        """The whole point is that different agents phrase 'done' differently."""
+        agents = {case["agent"].split()[0] for case in self.live_messages(fixtures)}
+
+        assert len(agents) >= 2, f"only one agent's phrasing is pinned: {agents}"
+
     def test_the_fixtures_are_really_completion_reports(self, fixtures: Path) -> None:
         """Guard against the fixtures drifting into something that proves nothing."""
         cases = self.live_messages(fixtures)
 
-        assert len(cases) >= 6
-        assert all("passed" in c["final_message"] or "Done" in c["final_message"] for c in cases)
+        assert len(cases) >= 12
+        assert all(
+            "pass" in c["final_message"].lower() or "done" in c["final_message"].lower()
+            for c in cases
+        )
 
     @pytest.mark.parametrize(
         "message",
