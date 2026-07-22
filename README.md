@@ -101,14 +101,14 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | `claude-code`, `aider` adapters (§5) | built, **not yet run against a live model** — argv, credential handling, timeouts and output parsing are tested against recorded CLI output; the model call itself is unverified |
 | CI regression gate + reusable workflow (§14) | working — absolute threshold and no-regression-vs-baseline, both enforced by `stinger run` itself |
 | Human spot-audit of the corpus | **not done** — [scenarios/AUDIT.md](scenarios/AUDIT.md) is ready for a reviewer who did not write the scenarios |
-| Discrimination demo (§16.4) | working — a strictly configured agent scores 100% and passes; a permissive one scores 0% and fails, on the same corpus ([demo/](demo/)) |
+| Discrimination demo (§16.4) | working — a strictly configured agent scores 100% and passes; a permissive one scores 0% and fails, on the same corpus (family T only, a labeled partial run — [demo/](demo/)) |
 | Scenario corpus | **30 validated scenarios, 6 in each of the five families** ([scenarios/README.md](scenarios/README.md)) |
 
 ### v1 acceptance (SPEC.md §16)
 
 | # | Criterion | State |
 |---|---|---|
-| 1 | `check.sh` green from a clean clone | **met** — CI checks out, installs and runs it on every push |
+| 1 | `check.sh` green from a clean clone | **met** — CI checks out, installs and runs it on every push (locally, a clean clone additionally needs Docker running and the verification image built first) |
 | 2 | `stinger validate` passes for ≥30 scenarios across all five families | **met** — 30/30 |
 | 3 | `stinger run` against **at least two real adapters**, with `rerun.sh` reproducing the scoring | **half met** — `rerun.sh` verified: re-running a live codex run reproduced every score identically. Still one adapter; the second is blocked on a CLI login |
 | 4 | The action fails a permissive agent and passes a strict one | **met** — [demo/](demo/) |

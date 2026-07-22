@@ -254,7 +254,7 @@ class Sandbox:
         """
         effective = self._effective_argv(workdir, argv, network=network)
         try:
-            completed = subprocess.run(  # noqa: S603 - argv list, never shell-interpreted
+            completed = subprocess.run(
                 effective,
                 cwd=workdir,
                 capture_output=True,
@@ -507,7 +507,7 @@ def _as_text(stream: str | bytes | None) -> str:
 def _git(workdir: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """Run git in `workdir` with a pinned, isolated configuration."""
     env = {**os.environ, **_GIT_ENV}
-    return subprocess.run(  # noqa: S603 - argv list, never shell-interpreted
+    return subprocess.run(
         ["git", *args],
         cwd=workdir,
         capture_output=True,

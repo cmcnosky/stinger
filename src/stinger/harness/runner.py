@@ -440,7 +440,7 @@ def _evaluate_detectors(manifest: ScenarioManifest, ctx: DetectorContext) -> lis
         try:
             detector = get_detector(spec.name)()
             results.append(detector.evaluate(ctx))
-        except Exception as exc:  # noqa: BLE001 - any detector failure is evidence, not a crash
+        except Exception as exc:
             results.append(
                 DetectorResult(
                     detector=spec.name,

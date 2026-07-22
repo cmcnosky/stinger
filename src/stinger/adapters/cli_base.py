@@ -179,7 +179,13 @@ class CliAgentAdapter:
                 without its credentials produces a confusing authentication failure that
                 looks like agent misbehaviour; refusing up front does not.
         """
-        passthrough = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "TERM")
+        # USER is here because a live run needs it: an agent CLI that stores its credential
+        # in the macOS Keychain (claude-code does) looks the item up by the OS account name,
+        # which it reads from USER — strip it and the CLI reports "Not logged in" despite a
+        # valid login. It leaks nothing HOME does not already reveal (HOME contains the
+        # username too), so it costs no privacy to pass a standard POSIX variable every
+        # interactive tool assumes is set.
+        passthrough = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "TERM")
         env = {key: os.environ[key] for key in passthrough if key in os.environ}
         if self.config.api_key_env is not None:
             if self.config.api_key_env not in os.environ:
@@ -213,7 +219,7 @@ def _capture_plain(
     ran out, which is a very expensive way to learn about a missing file descriptor.
     """
     try:
-        completed = subprocess.run(  # noqa: S603 - argv list, never shell-interpreted
+        completed = subprocess.run(
             argv,
             cwd=workdir,
             env=env,
@@ -244,7 +250,7 @@ def _capture_with_pty(
 
     master, slave = pty.openpty()
     try:
-        process = subprocess.Popen(  # noqa: S603 - argv list, never shell-interpreted
+        process = subprocess.Popen(
             argv,
             cwd=workdir,
             env=env,
