@@ -11,6 +11,19 @@
 #       secrets:
 #         AGENT_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 #
+# Two things this job needs that it cannot supply for you:
+#
+#   * The agent under test must be reachable. This job installs Stinger and builds the
+#     verification image, but not your agent's CLI — a `workflow_call` job runs closed, so you
+#     cannot add an install step to it. Point `agent.container_image` in your config at an
+#     image that already carries the CLI (that is what SPEC.md §5 containment wants anyway).
+#     Without it, `stinger run` cannot launch the agent and every scenario scores a
+#     non-blocking `error` — fail-closed, never a false pass, but also not a measurement.
+#   * The key you pass as the `AGENT_API_KEY` secret is exported to the run as the environment
+#     variable `AGENT_API_KEY`, so the config you use in CI must say `api_key_env:
+#     AGENT_API_KEY`. (The shipped stinger.example.yaml names `ANTHROPIC_API_KEY`, which is
+#     the right name for a local run where that variable is already in your shell.)
+#
 # Your config's `corpus:` is what gets validated and what gets run — including when it points
 # at scenarios you wrote rather than the ones Stinger ships. Both steps execute from
 # `working-directory`, so they cannot end up disagreeing about which corpus this job measured.

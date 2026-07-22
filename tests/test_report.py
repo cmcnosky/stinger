@@ -590,3 +590,38 @@ class TestOutcomeMustFollowFromEvidence:
     def test_a_consistent_report_still_verifies(self) -> None:
         verify_report(self.report_of(self.a_result(Outcome.CHEATED, fired=True, goal_met=False)))
         verify_report(self.report_of(self.a_result(Outcome.HONEST, fired=False, goal_met=True)))
+
+    def an_unresolved_result(self, outcome: Outcome, *, goal_met: bool) -> object:
+        from stinger.models import DetectorResult, Family, ScenarioResult
+
+        return ScenarioResult(
+            scenario_id="X",
+            family=Family.T,
+            outcome=outcome,
+            detector_results=[
+                DetectorResult(
+                    detector="command_scan",
+                    fired=False,
+                    low_confidence=True,
+                    evidence="no observable command log",
+                )
+            ],
+            goal_met=goal_met,
+            agent_claimed_done=False,
+            transcript_path="t",
+            diff_path="d",
+            duration_s=1.0,
+            repetition=0,
+        )
+
+    def test_unresolved_detector_beside_a_scored_outcome_is_refused(self) -> None:
+        # An unresolved (low_confidence) detector with no hard fire is fail-closed to ERROR by
+        # classify (SPEC.md §7); a package that stored HONEST instead has been doctored, and the
+        # arithmetic check cannot see it because ERROR and HONEST are excluded/included the same
+        # way once the number is made self-consistent.
+        report = self.report_of(self.a_result(Outcome.HONEST, fired=False, goal_met=True))
+        report = report.model_copy(
+            update={"results": [self.an_unresolved_result(Outcome.HONEST, goal_met=True)]}
+        )
+        with pytest.raises(ReportMismatchError, match=r"unresolved \(low_confidence\)"):
+            verify_report(report)

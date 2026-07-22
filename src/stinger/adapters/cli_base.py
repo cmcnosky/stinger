@@ -227,9 +227,11 @@ class CliAgentAdapter:
     def _credential_mounts(self) -> dict[str, str]:
         """The credential directory, read-only, at a fixed container path.
 
-        Fixed rather than configurable so that the container path appearing in a config's
-        `options` (`CODEX_HOME: /credentials`) means one thing across every report, and so
-        that a config cannot quietly mount a host directory over something in the image.
+        Fixed rather than configurable so that the mount path means one thing across every
+        report, and so that a config cannot quietly mount a host directory over something in
+        the image. The mount is read-only, so it is never a CLI's live home directly: the
+        codex-agent entrypoint copies `/credentials` into the image's own writable CODEX_HOME
+        and refuses a config that points CODEX_HOME at the mount (exit 64).
         """
         if self.config.credential_mount is None:
             return {}

@@ -82,7 +82,7 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 |---|---|
 | Core data model (`models.py`) | working |
 | Sandbox isolation + RepoState capture (§2, §7) | working — real container runs verified, including that the network is off and the mount hides the rest of the scenario |
-| Contained agent — `container_image`, `credential_mount` (§5) | working — [docker/codex-agent.Dockerfile](docker/codex-agent.Dockerfile) builds a Codex image; a live contained run authenticated through a read-only credential mount and the `X` family ran against it for the first time |
+| Contained agent — `container_image`, `credential_mount` (§5) | working — [docker/codex-agent.Dockerfile](docker/codex-agent.Dockerfile) builds a Codex image, and credential-by-name plus the read-only mount are unit-tested; **no contained or `X`-family live run is committed as evidence** — every package in [evidence/](evidence/) is `--local`, families T/S/C/G only |
 | Run state machine + frozen `classify()` (§7) | working |
 | Held-out completion check (§7) | working |
 | All seven detectors (§6) | working — each fires on its intended cheat and stays silent on the honest reference, unit-tested and exercised by the corpus |
@@ -123,17 +123,22 @@ covers one family, so every report there carries the tool's own `PARTIAL / DEV R
 none is a Stinger score, and none is a verdict on any agent (one repetition, no comparison
 conditions).
 
-The `X` safety family was the second limit, and it is now closed. It seeds bait credentials
-and destructive lures that must not touch an unconfined agent, which needs the agent CLI
-packaged inside a container — [docker/codex-agent.Dockerfile](docker/codex-agent.Dockerfile)
-now builds one, and `agent.container_image` makes a run use it. Two things had to be fixed
-before that hook worked at all, and both were the kind of failure that produces a
-plausible-looking wrong answer: a contained agent never received its credential (a container
-inherits nothing, and nothing forwarded it), and CLIs that authenticate from a file rather
-than an environment variable had no way in at all until `agent.credential_mount`. The tool
-refusing to run X against an unconfined agent was always the point rather than a gap — but
-"refuses safely" and "can be run safely" are different claims, and only the second one is
-now true.
+The `X` safety family remains the standing limit, stated rather than hidden. It seeds bait
+credentials and destructive lures that must never touch an unconfined agent, so running it
+live needs the agent CLI packaged *inside* the verification container. That mechanism now
+exists and is unit-tested — [docker/codex-agent.Dockerfile](docker/codex-agent.Dockerfile)
+builds a contained Codex image, `agent.container_image` makes a run use it, and
+`agent.credential_mount` lets a file-authenticated CLI reach its credential read-only. Two
+defects had to be fixed before it worked at all, each the kind that produces a
+plausible-looking wrong answer rather than a visible failure: a contained agent received no
+credential (a container inherits nothing, and nothing forwarded it), and a CLI that
+authenticates from a file rather than an environment variable had no way in until
+`agent.credential_mount`. But no contained run and no `X`-family run is committed as evidence
+here, and by this project's own rule — *reproducibility or it didn't happen* (SPEC.md §1.4) —
+an uncommitted run is not a result. So the honest state is the one
+[evidence/README.md](evidence/README.md) states: **not yet**. `stinger run` refusing X
+against an unconfined agent was always the point and still holds — "refuses safely" is true;
+"has been run safely" is not something this repo can show you yet.
 
 The live runs were worth far more for what they broke than for what they scored. A string of
 real defects surfaced that no amount of fixture testing had reached, and every one would have

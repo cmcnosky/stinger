@@ -53,8 +53,10 @@ class AgentConfig(BaseModel):
     # A host directory holding the agent's credentials, mounted READ-ONLY at /credentials in
     # the container. For CLIs that authenticate from a credential file rather than from an
     # environment variable — Codex under a ChatGPT subscription keeps OAuth tokens in
-    # `auth.json`, and `api_key_env` cannot express that. Point the CLI at it through
-    # `options` (e.g. `CODEX_HOME: /credentials`).
+    # `auth.json`, and `api_key_env` cannot express that. Do NOT set CODEX_HOME to
+    # /credentials: a read-only mount cannot be a CLI's live home, so the codex-agent image's
+    # entrypoint copies /credentials into its own writable CODEX_HOME and rejects that value
+    # outright. Leaving CODEX_HOME at the image default is all that is required.
     #
     # This is the one hole in "nothing but the workdir is mounted", so it is narrow by
     # construction and loud by design: read-only, one directory, reported in every Report.
