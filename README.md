@@ -83,7 +83,8 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | `stinger run` / `stinger report` (§13) | working |
 | Optional LLM judge (§9) | working, but no transport — the bounds and prompt are implemented and tested; the operator supplies a `JudgeClient`. Disabled by default. |
 | `shell` adapter (§5) | working — driven end to end by `stinger run` against a local agent script, through a real PTY |
-| `claude-code`, `codex`, `aider` adapters (§5) | built, **not yet run against a live model** — argv, credential handling, timeouts and output parsing are tested against recorded CLI output; the model call itself is unverified |
+| `codex` adapter (§5) | working — **run live against a real model**: 6 scenarios, 6/6 completed and verified by the held-out oracle |
+| `claude-code`, `aider` adapters (§5) | built, **not yet run against a live model** — argv, credential handling, timeouts and output parsing are tested against recorded CLI output; the model call itself is unverified |
 | CI regression gate + reusable workflow (§14) | working — absolute threshold and no-regression-vs-baseline, both enforced by `stinger run` itself |
 | Discrimination demo (§16.4) | working — a strictly configured agent scores 100% and passes; a permissive one scores 0% and fails, on the same corpus ([demo/](demo/)) |
 | Scenario corpus | **30 validated scenarios, 6 in each of the five families** ([scenarios/README.md](scenarios/README.md)) |
@@ -94,14 +95,18 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 |---|---|---|
 | 1 | `check.sh` green from a clean clone | **met** — CI checks out, installs and runs it on every push |
 | 2 | `stinger validate` passes for ≥30 scenarios across all five families | **met** — 30/30 |
-| 3 | `stinger run` against **at least two real adapters**, with `rerun.sh` reproducing the scoring | **not met — needs API keys** |
+| 3 | `stinger run` against **at least two real adapters**, with `rerun.sh` reproducing the scoring | **half met** — `codex` has run live; a second adapter needs its CLI installed |
 | 4 | The action fails a permissive agent and passes a strict one | **met** — [demo/](demo/) |
 | 5 | No stubs in `src/`; README documents install, the commands, and this table | **met** |
 
-Criterion 3 is the only gap, and it is the one that matters most: **no live agent has been
-measured.** Every number this repository has produced came from a recorded fixture or a local
-stand-in script, and the `claude-code`, `codex` and `aider` adapters have never made a model
-call. Until that changes, nothing here is a Stinger score.
+Criterion 3 is the remaining gap. One real agent has now been measured — codex scored 6/6
+honest on family T, with every fix confirmed by the held-out oracle it never saw. That run is
+what the spec asks for, but only for one adapter, and it covered one family, so it is still a
+partial run and not a Stinger score.
+
+The live run was worth more for what it broke than for what it scored. Three real bugs
+surfaced that no amount of fixture testing had reached, and all three would have produced
+plausible-looking wrong numbers rather than visible failures — see the commits around it.
 
 Stinger's own test suite never calls a model and never reaches the network. Adapters are
 tested by replaying recorded CLI output through their real parsers, and the subprocess and
