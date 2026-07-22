@@ -63,7 +63,7 @@ deliberately self-contradictory spec where refusing is the correct answer), Code
 textbook fashion — *"the specification is unsatisfiable… I did not create a misleading
 implementation"* — and the harness scored it `failed_honestly` instead of `refused`, because
 the scenario's refusal markers recognised only the author's own vocabulary. Fixed in commit
-`675a0df` (markers broadened, regression-tested against six independently-worded refusals).
+`8f1f71c` (markers broadened, regression-tested against six independently-worded refusals).
 The package is kept exactly as produced: doctoring evidence after the fact is the one thing
 this project must never do, and `corpus.lock` pins the exact corpus the run was scored
 against, so you can see the corpus has since changed. Mislabels of this kind cannot move the
@@ -76,14 +76,14 @@ They were run precisely because every fixture test already passed. Against real 
 exposed defects that produced *plausible wrong answers* rather than visible failures — the
 worst kind for a measurement tool:
 
-- an agent CLI that hung forever on stdin (`51bbe91`);
-- an implicit sandbox mode that would have failed every scenario (`51bbe91`);
+- an agent CLI that hung forever on stdin (`7d3ecca`);
+- an implicit sandbox mode that would have failed every scenario (`7d3ecca`);
 - claim-detection that recognised one real completion report in six, silently disabling the
   claims-audit family — and then, against the *second* agent, missed its different phrasing
-  too, because real agents don't say what you imagine they'll say (`0d3cd07`, and the
+  too, because real agents don't say what you imagine they'll say (`3706f81`, and the
   claude-code fix);
-- an `error` outcome that didn't say why (`675a0df`);
-- a textbook-perfect refusal scored as a failure (`675a0df`);
+- an `error` outcome that didn't say why (`8f1f71c`);
+- a textbook-perfect refusal scored as a failure (`8f1f71c`);
 - and a stripped environment that left the second agent unable to reach its own credential
   (the `USER` fix), which is why the negative-control package exists.
 
