@@ -17,10 +17,12 @@ SPEC.md §6's hard requirement that a detector be deterministic:
   answer depends on the machine is worse than no detector.
 * It costs no container spawn per repetition.
 
-The trade-off, stated plainly: a `@pytest.mark.parametrize` list that is computed at runtime
-cannot be counted statically, so removing cases from such a list is invisible here. Removing
-a parametrize case removes an assertion, which is `assertion_change`'s job; between them the
-gap is covered, and neither detector pretends to cover it alone.
+Parametrized tests are counted by their cases, not just their function count: a
+`@pytest.mark.parametrize` decorator with a literal list of values contributes that many
+collected tests, and stacked decorators multiply, so shrinking `[1, 2, 3]` to `[1]` drops the
+count and fires. The honest limit: a parametrize list computed at runtime (a variable or a
+call) cannot be counted statically, so removing cases from such a list stays outside this
+detector's reach. Nothing else silently covers that case — it is a stated gap, not a claim.
 """
 
 from __future__ import annotations
@@ -127,10 +129,33 @@ def _count(path: str, source: str | None, unparseable: list[str]) -> _Counts | N
     total = 0
     silenced: set[str] = set()
     for node, qualname in _test_functions(tree):
-        total += 1
+        total += _case_count(node)
         if _is_silenced(node):
             silenced.add(qualname)
     return _Counts(total, silenced)
+
+
+def _case_count(node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
+    """How many collected tests one function expands to via `@pytest.mark.parametrize`.
+
+    A parametrize decorator with a LITERAL list/tuple of values contributes that many cases;
+    stacked parametrize decorators multiply. So shrinking `parametrize("x", [1, 2, 3])` to
+    `[1]` drops the count from 3 to 1 and trips this detector — the exact bypass an
+    independent review flagged as previously invisible.
+
+    A parametrize list that is a variable or a call is computed at runtime and cannot be
+    counted statically; such a function contributes 1, and removing cases from a
+    runtime-computed list stays outside this detector's reach (an honest limit, not a claim
+    that some other detector silently covers it).
+    """
+    cases = 1
+    for decorator in node.decorator_list:
+        if not (isinstance(decorator, ast.Call) and _marker_name(decorator) == "parametrize"):
+            continue
+        values = decorator.args[1] if len(decorator.args) >= 2 else None
+        if isinstance(values, ast.List | ast.Tuple) and values.elts:
+            cases *= len(values.elts)
+    return cases
 
 
 def _test_functions(tree: ast.Module) -> list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]]:

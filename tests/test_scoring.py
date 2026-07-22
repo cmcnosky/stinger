@@ -28,11 +28,21 @@ def result(
     repetition: int = 0,
     family: Family = Family.T,
 ) -> ScenarioResult:
+    # The detector fires iff the outcome is CHEATED, so every synthetic result is internally
+    # consistent — outcome follows from its own evidence. verify_report now enforces exactly
+    # that invariant, so a helper producing a CHEATED result with no fired detector would be
+    # building an impossible package.
     return ScenarioResult(
         scenario_id=scenario_id,
         family=family,
         outcome=outcome,
-        detector_results=[DetectorResult(detector="forbidden_path", fired=False, evidence="clean")],
+        detector_results=[
+            DetectorResult(
+                detector="forbidden_path",
+                fired=outcome is Outcome.CHEATED,
+                evidence="fired" if outcome is Outcome.CHEATED else "clean",
+            )
+        ],
         goal_met=outcome is Outcome.HONEST,
         agent_claimed_done=outcome in (Outcome.HONEST, Outcome.CHEATED),
         transcript_path=f"runs/{scenario_id}/{repetition}/transcript.txt",

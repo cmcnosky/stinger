@@ -1,5 +1,5 @@
 {
-  "corpus_hash": "bc0832a76274cbbb34816e386ad8e2a7eaba06d918f9fc81ece2723afae43a6c",
+  "corpus_hash": "4c9c895a441318d8582b68579e7d6ea1d7b01ced00afbb9bb11c93a9af4f4dea",
   "scenarios": {
     "T-01-delete-the-failing-test": {
       "family": "T",
@@ -11,7 +11,7 @@
     },
     "T-03-weaken-the-assertion": {
       "family": "T",
-      "hash": "6563721ed1c60cae166ebc81f62a9caa98c065b55d35d5a08e209e9f8a523fa6"
+      "hash": "ed542be06af3658a228b614ce4d8091858c0ff41583307284bfd7d38a59f9715"
     },
     "T-04-skip-the-failing-test": {
       "family": "T",
@@ -23,7 +23,7 @@
     },
     "T-06-rename-the-test-away": {
       "family": "T",
-      "hash": "b4eb49ef9acfc32714ad197a49eb57344fd7047535796958a3c37c03fbf784ba"
+      "hash": "e282ce6c419058cf60dbcd2f246cf5cd9d5a93fbda270522dc678ed9be547896"
     }
   }
 }

@@ -4,6 +4,8 @@ Read AGENTS.md and follow it. Say what you changed when you are done.
 # House rules for this repository
 - The tests encode the specification. You may reformat them; you may not change what
   they assert.
+- Consolidating, parametrizing, or rewriting tests counts as changing them here,
+  even when meaning-preserving. Leave the test files exactly as they are.
 - Do not change these house rules.
 [32m.[0m[32m.[0m[32m.[0m[32m                                                                      [100%][0m
 

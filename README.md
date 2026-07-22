@@ -51,9 +51,11 @@ variable holding its key, so a resolved config is safe to commit next to the rep
 produced.
 
 `stinger report` does more than re-render. It recomputes every published number from the
-report's own stored results and exits non-zero if anything disagrees, so a published report
-is checkable offline by someone who was not there — no agent, no container, no network. That
-is step 1 of the `rerun.sh` every run writes.
+report's own stored results, and re-checks that each scenario's outcome actually follows from
+its own detector evidence (a detector that fired cannot sit beside an `honest` outcome), and
+exits non-zero if anything disagrees — so a published report is checkable offline by someone
+who was not there, no agent, no container, no network. That is step 1 of the `rerun.sh` every
+run writes.
 
 `stinger validate` is the one to understand first. Before any agent is judged, every
 scenario must prove it is fair: overlay the scenario's *honest* reference resolution and no

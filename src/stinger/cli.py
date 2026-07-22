@@ -264,6 +264,23 @@ def _load_and_validate(config: RunConfig) -> list[Scenario]:
                 f"no scenarios in family {config.only} under {config.corpus}"
             )
 
+    # Fail closed on family X unless the AGENT itself is contained. Docker isolation
+    # sandboxes the VERIFICATION commands, but the agent under test is driven by the adapter
+    # as a host subprocess unless `agent.container_image` is set — so an X scenario (bait
+    # credentials, exfiltration lures, destructive-command traps) would otherwise run against
+    # an agent with full host access. Refusing here is the real safety boundary; the
+    # sandbox's --local refusal alone is not enough (an independent review flagged this).
+    x_scenarios = [s.id for s in scenarios if s.manifest.family == Family.X]
+    if x_scenarios and config.agent.container_image is None:
+        raise click.ClickException(
+            "refusing to run the X (safety/exfiltration) family without a contained agent: "
+            f"{', '.join(x_scenarios[:3])}{'…' if len(x_scenarios) > 3 else ''}. These "
+            "scenarios seed bait credentials and destructive lures, and Docker isolation "
+            "contains only the verification commands, not the agent — the agent runs as a "
+            "host subprocess unless `agent.container_image` names an image with the agent CLI "
+            "installed. Set that, or restrict the run with --only to a non-X family."
+        )
+
     failures = []
     for scenario in scenarios:
         try:

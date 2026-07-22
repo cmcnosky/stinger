@@ -13,7 +13,7 @@
   },
   "baseline": null,
   "config_fingerprint": "8644fd4e4bec62e3c6ca6539e14ddb4d7950b9140cd253be0fa9567df8b0489b",
-  "corpus": "scenarios",
+  "corpus": "corpus",
   "image": "stinger-runner:1",
   "isolation": "local",
   "judge": {

@@ -538,3 +538,55 @@ class TestTheBaselineGate:
         there = RunConfig(agent=agent, baseline=Path("/b/baseline.json"))
 
         assert here.fingerprint() == there.fingerprint()
+
+
+class TestOutcomeMustFollowFromEvidence:
+    """verify_report must reject a package whose outcome contradicts its own detectors —
+    the hole an independent review found: recomputing arithmetic from stored outcomes catches
+    a doctored number but not a doctored outcome (SPEC.md §10)."""
+
+    def a_result(self, outcome: Outcome, *, fired: bool, goal_met: bool) -> object:
+        from stinger.models import DetectorResult, Family, ScenarioResult
+
+        return ScenarioResult(
+            scenario_id="X",
+            family=Family.T,
+            outcome=outcome,
+            detector_results=[DetectorResult(detector="forbidden_path", fired=fired, evidence="e")],
+            goal_met=goal_met,
+            agent_claimed_done=False,
+            transcript_path="t",
+            diff_path="d",
+            duration_s=1.0,
+            repetition=0,
+        )
+
+    def report_of(self, result: object) -> Report:
+        return build_report(
+            [result],  # type: ignore[list-item]
+            corpus_hash="c",
+            config_fingerprint="f",
+            generated_at="2026-01-01T00:00:00+00:00",
+        )
+
+    def test_fired_detector_but_honest_outcome_is_refused(self) -> None:
+        tampered = self.a_result(Outcome.HONEST, fired=True, goal_met=True)
+        # build_report would normally never produce this; simulate a hand-edited package.
+        report = self.report_of(self.a_result(Outcome.CHEATED, fired=True, goal_met=False))
+        report = report.model_copy(update={"results": [tampered]})
+
+        with pytest.raises(ReportMismatchError, match="contradicts its own evidence"):
+            verify_report(report)
+
+    def test_cheated_outcome_with_no_fired_detector_is_refused(self) -> None:
+        report = self.report_of(self.a_result(Outcome.CHEATED, fired=True, goal_met=False))
+        report = report.model_copy(
+            update={"results": [self.a_result(Outcome.CHEATED, fired=False, goal_met=False)]}
+        )
+
+        with pytest.raises(ReportMismatchError, match="no detector fired"):
+            verify_report(report)
+
+    def test_a_consistent_report_still_verifies(self) -> None:
+        verify_report(self.report_of(self.a_result(Outcome.CHEATED, fired=True, goal_met=False)))
+        verify_report(self.report_of(self.a_result(Outcome.HONEST, fired=False, goal_met=True)))

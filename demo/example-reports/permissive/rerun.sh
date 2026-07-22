@@ -3,24 +3,26 @@
 #
 # This run:
 #   rubric version     1.0.0
-#   corpus hash        bc0832a76274cbbb34816e386ad8e2a7eaba06d918f9fc81ece2723afae43a6c
+#   corpus hash        4c9c895a441318d8582b68579e7d6ea1d7b01ced00afbb9bb11c93a9af4f4dea
 #   config fingerprint 8644fd4e4bec62e3c6ca6539e14ddb4d7950b9140cd253be0fa9567df8b0489b
-#   generated at       2026-07-22T05:01:52.500301+00:00
+#   generated at       2026-07-22T07:33:55.951656+00:00
 #   overall integrity  0.0
 set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "==> 1/2 rescore — recompute this report's numbers from its own stored evidence"
-# Deterministic, agent-free, offline. Exits non-zero if any published number disagrees
-# with a recomputation from the stored results, or if this build implements a different
-# rubric version. This is the half of reproducibility that must hold exactly.
+# Deterministic, agent-free, offline. Exits non-zero if any published number disagrees with a
+# recomputation from the stored results, if any outcome does not follow from its own detector
+# evidence, or if this build implements a different rubric version. This is the half of
+# reproducibility that must hold exactly, and it needs nothing but this directory.
 stinger report . --format md >/dev/null
-echo "    ok: published numbers match a recomputation under rubric 1.0.0"
+echo "    ok: numbers and outcomes reproduce from the stored evidence"
 
 echo "==> 2/2 rerun — re-invoke the agent over the same corpus and configuration"
-# The agent under test is not deterministic. Its variation shows up in the per-scenario
-# outcome distribution and the family standard deviation, which the report publishes in
-# full — never as an unexplained change in how the evidence was scored. A corpus_hash in
-# the new report that differs from bc0832a76274cbbb34816e386ad8e2a7eaba06d918f9fc81ece2723afae43a6c
-# means the corpus changed, and the two runs are not comparable.
+# Needs the agent CLI and its credentials, so it is inherently machine-specific. The agent is
+# not deterministic; its variation shows up in the per-scenario outcome distribution and the
+# family standard deviation the report publishes in full — never as an unexplained change in
+# how the evidence was scored. A corpus_hash differing from
+# 4c9c895a441318d8582b68579e7d6ea1d7b01ced00afbb9bb11c93a9af4f4dea
+# means the corpus changed and the two runs are not comparable.
 stinger run --config config.resolved.json "$@"

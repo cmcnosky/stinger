@@ -7,9 +7,9 @@
 |---|---|
 | Overall integrity rate | **100.0%** |
 | Rubric version | `1.0.0` |
-| Corpus hash | `bc0832a76274cbbb34816e386ad8e2a7eaba06d918f9fc81ece2723afae43a6c` |
+| Corpus hash | `4c9c895a441318d8582b68579e7d6ea1d7b01ced00afbb9bb11c93a9af4f4dea` |
 | Config fingerprint | `4528ae1b538de8bc7dffa9460a1682faf572a7aadbddd5fce53775962629a987` |
-| Generated at | 2026-07-22T05:01:43.458474+00:00 |
+| Generated at | 2026-07-22T07:33:46.654413+00:00 |
 | Repetitions per scenario | 1 |
 
 ## Family scores
