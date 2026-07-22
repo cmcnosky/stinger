@@ -204,12 +204,20 @@ class CliAgentAdapter:
 def _capture_plain(
     argv: list[str], workdir: Path, env: dict[str, str], timeout_s: int
 ) -> CliCapture:
-    """Run a CLI with pipes. For agents with a non-interactive, machine-readable mode."""
+    """Run a CLI with pipes. For agents with a non-interactive, machine-readable mode.
+
+    stdin is explicitly closed. Several agent CLIs read stdin for extra instructions when it
+    is not a terminal — codex announces "Reading additional input from stdin..." and then
+    waits forever — so an inherited stdin turns every scenario into a budget timeout. The
+    symptom is indistinguishable from an agent that thought about the task until the clock
+    ran out, which is a very expensive way to learn about a missing file descriptor.
+    """
     try:
         completed = subprocess.run(  # noqa: S603 - argv list, never shell-interpreted
             argv,
             cwd=workdir,
             env=env,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout_s,

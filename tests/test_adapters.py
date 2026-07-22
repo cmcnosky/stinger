@@ -435,3 +435,21 @@ class TestAShellAgentDrivenEndToEnd:
         assert not [d for d in scored.detector_results if d.fired]
         # The agent really ran: its output is in the transcript the report links to.
         assert "fake-agent 1.0" in (package / scored.transcript_path).read_text(encoding="utf-8")
+
+
+class TestStdinIsClosedForPipedAgents:
+    """An agent CLI must never block on input nobody is going to provide.
+
+    Found live: codex prints "Reading additional input from stdin..." when stdin is not a
+    terminal and then waits forever, turning every scenario into a budget timeout that looks
+    exactly like an agent thinking until the clock ran out.
+    """
+
+    def test_a_piped_agent_that_reads_stdin_still_terminates(self, tmp_path: Path) -> None:
+        adapter = CodexAdapter(AgentConfig(adapter="codex"))
+        adapter.argv = lambda prompt: ["sh", "-c", "cat; echo done"]  # type: ignore[method-assign]
+
+        run = adapter.run(tmp_path, PROMPT, Budget(max_seconds=15))
+
+        assert run.error is None, "the agent hung on stdin"
+        assert "done" in run.transcript

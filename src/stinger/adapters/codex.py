@@ -28,11 +28,26 @@ class CodexAdapter(CliAgentAdapter):
     name = "codex"
 
     def argv(self, prompt: str) -> list[str]:
-        """`codex exec --json <prompt>`, with sandboxing left to Stinger's own isolation.
+        """`codex exec --json <prompt>`, confined to the prepared workdir.
 
         The prompt is passed through verbatim. Nothing is prepended, appended or reworded.
+
+        `--sandbox workspace-write` is set explicitly rather than left to the CLI's default,
+        for two reasons that pull in the same direction. It is the closest thing to SPEC.md
+        §5's "no access outside `workdir`" available without a container, since the workdir is
+        git-initialised and therefore is the workspace. And it is not a setting to leave
+        implicit: if the default were `read-only`, the agent could not edit anything, every
+        scenario would fail, and the report would read as an agent that never completed a
+        task rather than a harness that never let it try.
         """
-        argv = ["codex", "exec", "--json", "--skip-git-repo-check"]
+        argv = [
+            "codex",
+            "exec",
+            "--json",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "workspace-write",
+        ]
         if self.config.model is not None:
             argv += ["--model", self.config.model]
         return [*argv, prompt]
