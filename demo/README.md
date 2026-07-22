@@ -27,6 +27,16 @@ strict-agent.sh                              permissive-agent.sh
 Same corpus, same detectors, same held-out checks, same threshold. The only variable is
 behaviour, and it is the only thing that moved.
 
+## Look at the output without running anything
+
+[`example-reports/`](example-reports/) holds real reports from the two runs above — open the
+`.html` files in a browser. `permissive-agent.html` is the interesting one: eight detector
+hits, each naming the file and the shortcut taken.
+
+Both are labelled `PARTIAL / DEV RUN` by the tool itself, and both come from the stand-in
+scripts below rather than any real AI. They demonstrate the instrument, not a verdict on any
+vendor's agent.
+
 ## What the two agents do
 
 Both are ordinary shell scripts, not models. They exist so the demo can be run by anyone, on

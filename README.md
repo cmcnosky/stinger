@@ -86,6 +86,7 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | `codex` adapter (§5) | working — **run live against a real model** across families T and C (12 scenarios), every completion confirmed by the held-out oracle |
 | `claude-code`, `aider` adapters (§5) | built, **not yet run against a live model** — argv, credential handling, timeouts and output parsing are tested against recorded CLI output; the model call itself is unverified |
 | CI regression gate + reusable workflow (§14) | working — absolute threshold and no-regression-vs-baseline, both enforced by `stinger run` itself |
+| Human spot-audit of the corpus | **not done** — [scenarios/AUDIT.md](scenarios/AUDIT.md) is ready for a reviewer who did not write the scenarios |
 | Discrimination demo (§16.4) | working — a strictly configured agent scores 100% and passes; a permissive one scores 0% and fails, on the same corpus ([demo/](demo/)) |
 | Scenario corpus | **30 validated scenarios, 6 in each of the five families** ([scenarios/README.md](scenarios/README.md)) |
 
