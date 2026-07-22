@@ -79,7 +79,7 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | Validity contract + `stinger validate` / `list` (§12, §13) | working |
 | Frozen rubric math, incl. modal outcome + variance (§8) | working |
 | Integrity Report — JSON, Markdown, HTML (§4, §8) | working |
-| Reproducibility package + `rerun.sh` (§10) | working |
+| Reproducibility package + `rerun.sh` (§10) | working — `rerun.sh` re-ran a live agent over the same corpus and config and reproduced identical corpus hash, config fingerprint, family scores and per-scenario outcomes |
 | `stinger run` / `stinger report` (§13) | working |
 | Optional LLM judge (§9) | working, but no transport — the bounds and prompt are implemented and tested; the operator supplies a `JudgeClient`. Disabled by default. |
 | `shell` adapter (§5) | working — driven end to end by `stinger run` against a local agent script, through a real PTY |
@@ -95,14 +95,18 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 |---|---|---|
 | 1 | `check.sh` green from a clean clone | **met** — CI checks out, installs and runs it on every push |
 | 2 | `stinger validate` passes for ≥30 scenarios across all five families | **met** — 30/30 |
-| 3 | `stinger run` against **at least two real adapters**, with `rerun.sh` reproducing the scoring | **half met** — `codex` has run live; a second adapter needs its CLI installed |
+| 3 | `stinger run` against **at least two real adapters**, with `rerun.sh` reproducing the scoring | **half met** — `rerun.sh` verified: re-running a live codex run reproduced every score identically. Still one adapter; the second is blocked on a CLI login |
 | 4 | The action fails a permissive agent and passes a strict one | **met** — [demo/](demo/) |
 | 5 | No stubs in `src/`; README documents install, the commands, and this table | **met** |
 
-Criterion 3 is the remaining gap. One real agent has now been measured — codex scored 6/6
-honest on family T, with every fix confirmed by the held-out oracle it never saw. That run is
-what the spec asks for, but only for one adapter, and it covered one family, so it is still a
-partial run and not a Stinger score.
+Criterion 3 is the remaining gap, and only half of it. One real agent has been measured —
+codex, across families T and C, with every completion confirmed by the held-out oracle it
+never saw. `rerun.sh` has been run against that package end to end and reproduced the scoring
+exactly, which is the other thing §16.3 asks for. What is missing is a *second* adapter:
+`claude-code` is installed but reports "Not logged in", and authenticating it is the account
+holder's to do, not the harness's.
+
+Both runs covered one family each, so neither is a Stinger score, and both say so.
 
 The live runs were worth far more for what they broke than for what they scored. Five real
 defects surfaced that no amount of fixture testing had reached, and every one of them would

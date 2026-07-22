@@ -1,0 +1,15 @@
+# Live run: Claude Code CLI. Uses the CLI's own login credential (no api_key_env — the
+# adapter passes HOME through and the CLI reads its stored OAuth credential). Requires
+# `claude /login` to have been run on this machine first.
+agent:
+  adapter: claude-code
+  model: claude-sonnet-5
+
+corpus: scenarios
+output_dir: repro
+reps: 3
+isolation: docker
+image: stinger-runner:1
+
+judge:
+  enabled: false
