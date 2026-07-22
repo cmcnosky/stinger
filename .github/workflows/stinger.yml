@@ -11,6 +11,16 @@
 #       secrets:
 #         AGENT_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 #
+# Your config's `corpus:` is what gets validated and what gets run — including when it points
+# at scenarios you wrote rather than the ones Stinger ships. Both steps execute from
+# `working-directory`, so they cannot end up disagreeing about which corpus this job measured.
+# If your config lives in a subdirectory, set `working-directory` to it and keep `config`
+# relative to that directory:
+#
+#       with:
+#         working-directory: stinger
+#         config: stinger.yaml
+#
 # The job fails when integrity regresses. That decision is made by `stinger run` itself, from
 # the `regression_threshold` and `baseline` in your config — not by a shell comparison here —
 # so the same gate applies whether you run it in CI or on your laptop.
@@ -23,9 +33,15 @@ on:
   workflow_call:
     inputs:
       config:
-        description: Path to stinger.yaml in the caller repo
+        description: Path to stinger.yaml, relative to working-directory
         type: string
         default: stinger.yaml
+      working-directory:
+        description: >
+          Directory to run stinger from in the caller repo. Corpus paths in your config are
+          resolved relative to it, exactly as they are on your laptop.
+        type: string
+        default: "."
       stinger-ref:
         description: >
           Which Stinger to run. Pin this to a tag if you want comparable numbers over time:
@@ -71,11 +87,18 @@ jobs:
       - name: Prove the corpus is fair before judging anything by it
         # SPEC §12. A trap that fires on correct behaviour, or that misses the cheat it was
         # built for, invalidates the number this job is about to publish.
-        run: stinger validate .stinger/scenarios
+        #
+        # --config rather than a hard-coded path: the corpus this validates has to be the one
+        # the next step scores against. Pointing this at Stinger's bundled scenarios would
+        # publish a green fairness proof for a corpus a caller with their own scenarios never
+        # runs, and leave their actual traps checked only implicitly inside `stinger run`.
+        working-directory: ${{ inputs.working-directory }}
+        run: stinger validate --config "${{ inputs.config }}"
 
       - name: Run the integrity harness
         env:
           AGENT_API_KEY: ${{ secrets.AGENT_API_KEY }}
+        working-directory: ${{ inputs.working-directory }}
         run: stinger run --config "${{ inputs.config }}"
 
       - name: Upload the reproducibility package
@@ -83,11 +106,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: stinger-repro
-          path: repro/
+          # `output_dir` is resolved from the working directory too, so the package lands
+          # beside the config rather than at the repository root.
+          path: ${{ inputs.working-directory }}/repro/
           if-no-files-found: warn
 
       - name: Publish the report to the job summary
         if: always()
+        working-directory: ${{ inputs.working-directory }}
         run: |
           report="$(find repro -name report.md 2>/dev/null | sort | tail -1)"
           if [ -n "$report" ]; then

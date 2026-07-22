@@ -402,6 +402,76 @@ class TestValidateCommand:
         assert "no scenarios found" in result.output
 
 
+class TestValidateFromAConfig:
+    """`--config`, which is what makes a CI fairness gate cover the corpus the run scores.
+
+    The failure these guard against is quiet rather than loud: a gate pointed at the wrong
+    corpus reports a green proof, and the caller's own traps go unchecked until `stinger run`
+    validates them implicitly. Every test here therefore breaks the CALLER's corpus — a gate
+    reading Stinger's bundled scenarios instead would pass all of them.
+    """
+
+    @staticmethod
+    def _config(path: Path, corpus: str) -> Path:
+        """A minimal stinger.yaml naming a corpus."""
+        path.write_text(
+            f"agent:\n  adapter: recorded\ncorpus: {corpus}\nisolation: local\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_validates_the_corpus_the_config_names(self, scratch_t02: Path) -> None:
+        (scratch_t02 / CHEAT_TEST).unlink()
+        config = self._config(scratch_t02.parent.parent / "stinger.yaml", str(scratch_t02.parent))
+
+        result = CliRunner().invoke(main, ["validate", "--config", str(config)])
+
+        assert result.exit_code == 1
+        assert "FAIL  T-02-no-touch-tests" in result.output
+
+    def test_a_relative_corpus_resolves_against_the_working_directory(
+        self, scratch_t02: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Exactly how `stinger run` reads it, which is the point: both commands executed from
+        one directory cannot end up naming two different corpora."""
+        monkeypatch.chdir(scratch_t02.parent.parent)
+        self._config(Path("stinger.yaml"), scratch_t02.parent.name)
+
+        result = CliRunner().invoke(main, ["validate", "--config", "stinger.yaml"])
+
+        assert result.exit_code == 0, result.output
+        assert "1/1 scenario(s) valid" in result.output
+
+    def test_refuses_a_path_and_a_config_together(self, scratch_t02: Path) -> None:
+        config = self._config(scratch_t02.parent.parent / "stinger.yaml", str(scratch_t02.parent))
+
+        result = CliRunner().invoke(
+            main, ["validate", str(scratch_t02.parent), "--config", str(config)]
+        )
+
+        assert result.exit_code != 0
+        assert "not both" in result.output
+
+    def test_names_the_config_when_its_corpus_is_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A caller whose config sits in a subdirectory hits this first, so the message has to
+        say where the path came from rather than just that something was not found.
+
+        chdir'd deliberately: written without it, this test ran from the repository root,
+        `corpus: scenarios` resolved to Stinger's own corpus, and it passed while proving
+        nothing — the same confusion between two corpora that `--config` exists to remove.
+        """
+        monkeypatch.chdir(tmp_path)
+        config = self._config(tmp_path / "stinger.yaml", "no-such-corpus")
+
+        result = CliRunner().invoke(main, ["validate", "--config", str(config)])
+
+        assert result.exit_code != 0
+        assert str(config) in result.output
+        assert "relative to the current working directory" in result.output
+
+
 class TestListCommand:
     def test_lists_id_family_and_load_status(self, t02_dir: Path) -> None:
         result = CliRunner().invoke(main, ["list", str(t02_dir.parent)])

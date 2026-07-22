@@ -2,6 +2,7 @@
 
 stinger list                 # scenarios + families + validity status
 stinger validate [PATH]      # run the validity contract (SPEC.md §12)
+stinger validate --config …  # …over the corpus a stinger.yaml names, for CI
 stinger run --config …       # run the corpus against a configured agent, emit a Report
 stinger report REPRO_DIR     # re-render a report from a repro package
 """
@@ -80,9 +81,17 @@ def list_scenarios(path: Path, run_validation: bool, docker: bool) -> None:
 
 
 @main.command()
-@click.argument("path", type=click.Path(exists=True, path_type=Path), default="scenarios")
+@click.argument("path", type=click.Path(exists=True, path_type=Path), required=False, default=None)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="take the corpus path and isolation from a stinger.yaml, so the fairness gate covers "
+    "the corpus the run will actually use",
+)
 @click.option("--docker", is_flag=True, help="force container isolation for every scenario")
-def validate(path: Path, docker: bool) -> None:
+def validate(path: Path | None, config_path: Path | None, docker: bool) -> None:
     """Run the validity contract over the corpus (SPEC.md §12). Non-zero exit on any failure.
 
     For each scenario: overlay the honest reference and assert no detector fires and the
@@ -91,7 +100,41 @@ def validate(path: Path, docker: bool) -> None:
 
     Every scenario is reported, not just the first failure, so one broken trap does not hide
     another. The exit code is non-zero if any scenario failed.
+
+    `--config` exists for CI. A caller that ships its own scenarios points `corpus:` at them,
+    and a fairness gate hard-coded to Stinger's bundled corpus would report a green proof for
+    scenarios the run never touches — the caller's actual traps would be validated only
+    implicitly, inside `stinger run`. Reading the same config the run reads makes the two
+    agree by construction: `corpus` is used exactly as `run` uses it, relative to the current
+    working directory, so a CI job that runs both steps from one directory cannot validate one
+    corpus and score another.
     """
+    if path is not None and config_path is not None:
+        raise click.ClickException(
+            "pass either a corpus PATH or --config, not both: they name the corpus two "
+            "different ways and there is no correct answer when they disagree"
+        )
+
+    if config_path is not None:
+        try:
+            config = RunConfig.from_yaml(config_path)
+        except ConfigError as exc:
+            raise click.ClickException(str(exc)) from exc
+        path = config.corpus
+        docker = docker or config.isolation is Isolation.DOCKER
+    elif path is None:
+        path = Path("scenarios")
+
+    if not path.is_dir():
+        # Only reachable via --config: a bare PATH is checked by click. A caller whose config
+        # lives in a subdirectory hits this the moment they run from the repository root, so
+        # the message says where the path came from and what it is relative to.
+        raise click.ClickException(
+            f"corpus {path} named by {config_path} does not exist. Corpus paths are relative "
+            "to the current working directory, not to the config file — run from the "
+            "directory the config's `corpus:` is written against."
+        )
+
     try:
         scenarios = discover_scenarios(path)
     except ScenarioLoadError as exc:
