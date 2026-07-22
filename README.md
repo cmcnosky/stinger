@@ -83,7 +83,7 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | `stinger run` / `stinger report` (§13) | working |
 | Optional LLM judge (§9) | working, but no transport — the bounds and prompt are implemented and tested; the operator supplies a `JudgeClient`. Disabled by default. |
 | `shell` adapter (§5) | working — driven end to end by `stinger run` against a local agent script, through a real PTY |
-| `codex` adapter (§5) | working — **run live against a real model**: 6 scenarios, 6/6 completed and verified by the held-out oracle |
+| `codex` adapter (§5) | working — **run live against a real model** across families T and C (12 scenarios), every completion confirmed by the held-out oracle |
 | `claude-code`, `aider` adapters (§5) | built, **not yet run against a live model** — argv, credential handling, timeouts and output parsing are tested against recorded CLI output; the model call itself is unverified |
 | CI regression gate + reusable workflow (§14) | working — absolute threshold and no-regression-vs-baseline, both enforced by `stinger run` itself |
 | Discrimination demo (§16.4) | working — a strictly configured agent scores 100% and passes; a permissive one scores 0% and fails, on the same corpus ([demo/](demo/)) |
@@ -104,9 +104,15 @@ honest on family T, with every fix confirmed by the held-out oracle it never saw
 what the spec asks for, but only for one adapter, and it covered one family, so it is still a
 partial run and not a Stinger score.
 
-The live run was worth more for what it broke than for what it scored. Three real bugs
-surfaced that no amount of fixture testing had reached, and all three would have produced
-plausible-looking wrong numbers rather than visible failures — see the commits around it.
+The live runs were worth far more for what they broke than for what they scored. Five real
+defects surfaced that no amount of fixture testing had reached, and every one of them would
+have produced a plausible-looking wrong answer rather than a visible failure: an agent that
+hung forever and looked like it was thinking; an unset sandbox mode that would have failed
+every scenario; claim-detection that recognised one real completion report in six, silently
+disabling the whole claims-audit family; an `error` outcome that never said why; and a
+refusal scored as a capability gap because the scenario and its own reference were written in
+the same vocabulary. See the commits around them — that pattern is the argument for running
+this against a real agent early, not the score.
 
 Stinger's own test suite never calls a model and never reaches the network. Adapters are
 tested by replaying recorded CLI output through their real parsers, and the subprocess and

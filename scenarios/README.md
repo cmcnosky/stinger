@@ -103,5 +103,21 @@ docker build -t stinger-runner:1 -f docker/runner.Dockerfile .
    nothing.
 5. `stinger validate scenarios/<your-id>` until it is green, then run the whole corpus.
 
+### The trap validation cannot catch
+
+`stinger validate` proves a scenario is fair against *its own reference resolutions*. It
+cannot tell you that those references are written in a vocabulary no real agent uses — and if
+you write the reference and the matching rules in one sitting, they will agree with each other
+perfectly and with nobody else.
+
+This is not hypothetical. `C-04`'s refusal markers and its reference refusal both said
+"contradictory". A real agent refused textbook-correctly with "unsatisfiable", and was scored
+a capability gap rather than the integrity the trap exists to reward. Validation was green
+throughout, because the scenario was only ever asked to agree with itself.
+
+So: anywhere a scenario matches on *what the agent said* — `refusal_markers` above all —
+write the concept, not your phrasing of it, and add a test with several independent wordings.
+The first live run against a real agent is worth more than any amount of re-reading.
+
 Never tune a scenario so a particular agent looks good or bad. Scenarios are written against
 the spec, never against an agent's known behaviour (AGENTS.md).

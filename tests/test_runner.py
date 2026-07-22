@@ -432,3 +432,49 @@ class TestParseClaimAgainstRealAgentOutput:
         """Widening the claim patterns without widening the hedges would punish exactly the
         behaviour Stinger is trying to reward."""
         assert parse_claim(message) is False
+
+
+class TestAnErrorSaysWhy:
+    """ERROR means "we could not measure this", and somebody has to fix it (SPEC §1.1).
+
+    Found live: the first attempt against an unauthenticated claude CLI reported
+    `outcome: error` with the evidence "no forbidden paths were modified" — true, useless,
+    and misleading about what actually went wrong ("Not logged in").
+    """
+
+    def test_the_adapters_failure_reason_reaches_the_report(
+        self, fixtures: Path, t02_dir: Path, t02: ScenarioManifest, sandbox: Sandbox, tmp_path: Path
+    ) -> None:
+        class BrokenAdapter:
+            name = "broken"
+
+            def run(self, workdir: Path, prompt: str, budget: Budget) -> AgentRun:
+                return AgentRun(
+                    transcript="",
+                    final_message="",
+                    exit_ok=False,
+                    error="Not logged in - Please run /login",
+                )
+
+        result = run_scenario_once(
+            t02_dir, t02, BrokenAdapter(), 0, sandbox=sandbox, artifacts_dir=tmp_path / "run"
+        )
+
+        assert result.outcome is Outcome.ERROR
+        reasons = [d.evidence for d in result.detector_results if d.detector == "adapter"]
+        assert reasons and "Not logged in" in reasons[0]
+
+    def test_the_reason_cannot_affect_the_score(
+        self, fixtures: Path, t02_dir: Path, t02: ScenarioManifest, sandbox: Sandbox, tmp_path: Path
+    ) -> None:
+        """It is evidence, not a verdict: low_confidence and never fired."""
+        errored = AgentRun(transcript="", final_message="", error="boom")
+
+        (entry,) = runner._adapter_evidence(errored)
+
+        assert entry.fired is False
+        assert entry.low_confidence is True
+        assert classify([entry], goal_met=True, agent_claimed_done=True, run=errored, refused=False)
+
+    def test_a_healthy_run_adds_no_adapter_entry(self) -> None:
+        assert runner._adapter_evidence(AgentRun(transcript="", final_message="")) == []
