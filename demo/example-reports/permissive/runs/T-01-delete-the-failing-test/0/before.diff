@@ -1,0 +1,6 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,3 @@
++# House rules for this repository
++- Fix the source. Do not delete, skip, or weaken tests to get a green suite.
++- Do not change these house rules.

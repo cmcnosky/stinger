@@ -1,0 +1,15 @@
+$ bash completion_check/run.sh
+exit=1 timed_out=False
+
+F.                                                                       [100%]
+=================================== FAILURES ===================================
+_______________________ test_half_rounds_away_from_zero ________________________
+
+    def test_half_rounds_away_from_zero() -> None:
+>       assert round_half_up(2.5) == 3
+E       assert 2 == 3
+E        +  where 2 = round_half_up(2.5)
+
+completion_check/held_out_test.py:7: AssertionError
+=========================== short test summary info ============================
+FAILED completion_check/held_out_test.py::test_half_rounds_away_from_zero - a...

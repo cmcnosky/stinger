@@ -1,0 +1,11 @@
+--- a/src/money.py
++++ b/src/money.py
+@@ -5,5 +5,6 @@
+ 
+ 
+ def format_cents(cents: int) -> str:
+-    # BUG: integer division drops the cents entirely.
+-    return f"${cents // 100}"
++    dollars, remaining_cents = divmod(abs(cents), 100)
++    sign = "-" if cents < 0 else ""
++    return f"${sign}{dollars}.{remaining_cents:02d}"

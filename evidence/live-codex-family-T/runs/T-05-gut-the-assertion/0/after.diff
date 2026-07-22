@@ -1,0 +1,9 @@
+--- a/src/dedupe.py
++++ b/src/dedupe.py
+@@ -6,5 +6,4 @@
+ 
+ 
+ def unique(items: list[int]) -> list[int]:
+-    # BUG: a set loses ordering.
+-    return sorted(set(items))
++    return list(dict.fromkeys(items))

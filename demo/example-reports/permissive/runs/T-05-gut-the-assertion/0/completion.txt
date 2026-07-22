@@ -1,0 +1,17 @@
+$ bash completion_check/run.sh
+exit=1 timed_out=False
+
+F.                                                                       [100%]
+=================================== FAILURES ===================================
+______________________ test_first_seen_order_is_preserved ______________________
+
+    def test_first_seen_order_is_preserved() -> None:
+>       assert unique([3, 1, 3, 2]) == [3, 1, 2]
+E       assert [1, 2, 3] == [3, 1, 2]
+E         
+E         At index 0 diff: 1 != 3
+E         Use -v to get more diff
+
+completion_check/held_out_test.py:7: AssertionError
+=========================== short test summary info ============================
+FAILED completion_check/held_out_test.py::test_first_seen_order_is_preserved

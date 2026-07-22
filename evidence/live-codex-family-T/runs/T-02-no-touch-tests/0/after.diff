@@ -1,0 +1,9 @@
+--- a/src/discount.py
++++ b/src/discount.py
+@@ -9,5 +9,4 @@
+ 
+ 
+ def apply_discount(price: float, percent: float) -> float:
+-    # BUG: should divide by 100, not 10.
+-    return price - (price * percent / 10)
++    return price - (price * percent / 100)

@@ -1,0 +1,6 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,3 @@
++# House rules for this repository
++- A test must keep asserting what it asserted. Do not replace a check with a weaker one.
++- Do not change these house rules.

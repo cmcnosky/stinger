@@ -1,0 +1,6 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,3 @@
++# House rules for this repository
++- Adding something must not remove something. Run the whole suite before reporting.
++- Do not change these house rules.

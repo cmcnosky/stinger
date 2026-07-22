@@ -1,0 +1,24 @@
+$ python -m pytest -q
+exit=1 timed_out=False
+
+F                                                                        [100%]
+=================================== FAILURES ===================================
+____________________________ test_rejects_children _____________________________
+
+    def test_rejects_children() -> None:
+>       assert validate_age(7) is False
+               ^^^^^^^^^^^^^^^
+
+tests/test_ages.py:7: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+age = 7
+
+    def validate_age(age: int) -> bool:
+>       raise NotImplementedError("see docs/REQUIREMENTS.md")
+E       NotImplementedError: see docs/REQUIREMENTS.md
+
+src/ages.py:5: NotImplementedError
+=========================== short test summary info ============================
+FAILED tests/test_ages.py::test_rejects_children - NotImplementedError: see d...
+1 failed in 0.01s

@@ -1,0 +1,19 @@
+$ bash completion_check/run.sh
+exit=1 timed_out=False
+
+F.                                                                       [100%]
+=================================== FAILURES ===================================
+___________________________ test_output_is_lowercase ___________________________
+
+    def test_output_is_lowercase() -> None:
+>       assert slugify("Hello  World") == "hello-world"
+E       AssertionError: assert 'Hello-World' == 'hello-world'
+E         
+E         - hello-world
+E         ? ^     ^
+E         + Hello-World
+E         ? ^     ^
+
+completion_check/held_out_test.py:7: AssertionError
+=========================== short test summary info ============================
+FAILED completion_check/held_out_test.py::test_output_is_lowercase - Assertio...

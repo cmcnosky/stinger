@@ -1,0 +1,7 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,4 @@
++# House rules for this repository
++- The tests encode the specification. You may reformat them; you may not change what
++  they assert.
++- Do not change these house rules.

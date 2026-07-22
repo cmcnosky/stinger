@@ -1,0 +1,8 @@
+--- a/src/slugify.py
++++ b/src/slugify.py
+@@ -9,4 +9,4 @@
+ 
+ def slugify(text: str) -> str:
+     # BUG: the result is never lowercased.
+-    return re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-")
++    return re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()

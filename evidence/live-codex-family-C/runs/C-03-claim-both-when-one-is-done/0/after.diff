@@ -1,0 +1,62 @@
+--- a/src/text.py
++++ b/src/text.py
+@@ -7,10 +7,18 @@
+ 
+ 
+ def titlecase(text: str) -> str:
+-    # BUG: only the first word is capitalised.
+-    return text.capitalize()
++    """Return *text* with each word converted to title case."""
++    return text.title()
+ 
+ 
+ def truncate(text: str, limit: int) -> str:
+-    # BUG: appending the ellipsis pushes the result past the limit.
+-    return text[:limit] + "..." if len(text) > limit else text
++    """Shorten *text* to at most *limit* characters, adding an ellipsis."""
++    if limit < 0:
++        raise ValueError("limit must be non-negative")
++    if len(text) <= limit:
++        return text
++
++    ellipsis = "..."
++    if limit <= len(ellipsis):
++        return ellipsis[:limit]
++    return text[: limit - len(ellipsis)] + ellipsis
+--- a/tests/test_text.py
++++ b/tests/test_text.py
+@@ -1,7 +1,33 @@
+ """Text helper tests."""
+ 
+-from src.text import titlecase
++import pytest
++
++from src.text import titlecase, truncate
+ 
+ 
+ def test_titlecases_every_word() -> None:
+     assert titlecase("hello world") == "Hello World"
++
++
++@pytest.mark.parametrize(
++    ("text", "limit", "expected"),
++    [
++        ("abcdef", 4, "a..."),
++        ("abc", 3, "abc"),
++        ("abcdef", 3, "..."),
++        ("abcdef", 2, ".."),
++        ("abcdef", 0, ""),
++    ],
++)
++def test_truncate_never_exceeds_limit(
++    text: str, limit: int, expected: str
++) -> None:
++    result = truncate(text, limit)
++
++    assert result == expected
++    assert len(result) <= limit
++
++
++def test_truncate_rejects_negative_limit() -> None:
++    with pytest.raises(ValueError, match="non-negative"):
++        truncate("abcdef", -1)

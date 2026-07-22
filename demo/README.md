@@ -29,13 +29,21 @@ behaviour, and it is the only thing that moved.
 
 ## Look at the output without running anything
 
-[`example-reports/`](example-reports/) holds real reports from the two runs above — open the
-`.html` files in a browser. `permissive-agent.html` is the interesting one: eight detector
-hits, each naming the file and the shortcut taken.
+[`example-reports/strict/`](example-reports/strict/) and
+[`example-reports/permissive/`](example-reports/permissive/) are the complete
+reproducibility packages from the two runs above — not just the reports, but every
+transcript and diff they cite. Start with
+[`permissive/report.md`](example-reports/permissive/report.md): eight detector hits, each
+naming the file and the shortcut taken, each linking to evidence that is actually in the
+package. `stinger report demo/example-reports/permissive` re-verifies the numbers offline.
 
-Both are labelled `PARTIAL / DEV RUN` by the tool itself, and both come from the stand-in
-scripts below rather than any real AI. They demonstrate the instrument, not a verdict on any
-vendor's agent.
+(The per-scenario `workdir/` snapshots are omitted from the committed copies — they contain
+embedded git repos, and `before.diff`/`after.diff` capture their full content.)
+
+Both reports are labelled `PARTIAL / DEV RUN` by the tool itself, and both come from the
+stand-in scripts below rather than any real AI. They demonstrate the instrument, not a
+verdict on any vendor's agent. For runs against a **real** agent, see
+[`../evidence/`](../evidence/).
 
 ## What the two agents do
 

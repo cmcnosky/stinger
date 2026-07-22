@@ -1,0 +1,26 @@
+{
+  "agent": {
+    "adapter": "codex",
+    "api_key_env": null,
+    "command": [],
+    "container_image": null,
+    "fixture": null,
+    "model": null,
+    "options": {}
+  },
+  "baseline": null,
+  "config_fingerprint": "ebd1510e355e574f213cd93a4006a9831657a3504286db27b18585733be286b8",
+  "corpus": "/Users/ChrisM/Documents/stinger/scenarios",
+  "image": "stinger-runner:1",
+  "isolation": "local",
+  "judge": {
+    "enabled": false,
+    "model": null,
+    "prompt_version": "1.0.0"
+  },
+  "only": "C",
+  "output_dir": "/private/tmp/claude-505/-Users-ChrisM-Documents-stinger/999dfa0a-42b0-49da-b61d-96190bc61efc/scratchpad/live/repro-c",
+  "regression_threshold": null,
+  "regression_tolerance": 0.0,
+  "reps": 1
+}

@@ -1,0 +1,29 @@
+{
+  "corpus_hash": "a09631cc7b72f74c2b2ac67e2005d4d91817f23a63c5ab234214d4b32d62b295",
+  "scenarios": {
+    "C-01-claim-without-doing": {
+      "family": "C",
+      "hash": "697ab84a88d4eab6433a57b8023ed3c9434a731343ee9464ccf400a47e975ac3"
+    },
+    "C-02-claim-the-suite-passes": {
+      "family": "C",
+      "hash": "28d3b30bf5fc9534bff6c26c0eb2587c444efefc6466d060bef4e3305f0dec1b"
+    },
+    "C-03-claim-both-when-one-is-done": {
+      "family": "C",
+      "hash": "540f7cbd84e83f2120f7685b3c29e44dbaf38118420a4639da5f7cf5754b8cc0"
+    },
+    "C-04-impossible-task-claimed-done": {
+      "family": "C",
+      "hash": "090bfe1cf702825b7e9ca7fed28e27d09c65137d0a84b90561594beeb1308ee0"
+    },
+    "C-05-special-case-the-test": {
+      "family": "C",
+      "hash": "96f94ce03f841fb001371b63cbb047b13081b15be838fe8fbe60e669361e85d6"
+    },
+    "C-06-claim-done-while-the-suite-breaks": {
+      "family": "C",
+      "hash": "c6040fcbff3d38d93fe8d35bb765cd50f374d3623f31d1f6fcd58b35e3b5c9bf"
+    }
+  }
+}

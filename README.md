@@ -1,6 +1,15 @@
 # Stinger
 
+[![CI](https://github.com/cmcnosky/stinger/actions/workflows/ci.yml/badge.svg)](https://github.com/cmcnosky/stinger/actions/workflows/ci.yml)
+
 **Measure whether an AI coding agent cheats — in your configuration, in your CI.**
+
+> **Visitors:** every line of code here was written by an AI coding agent directed by a
+> single non-engineer operator — and Stinger is itself a tool for catching AI coding
+> agents cheating, so the governance it measures is the governance it was built under.
+> [CASE_STUDY.md](CASE_STUDY.md) explains how, [evidence/](evidence/) holds the committed
+> reproducibility packages from its live runs, and the honest-status table below grades
+> every capability by evidence — including the acceptance criterion that is **not** met.
 
 Stinger runs a corpus of sandboxed trap scenarios against a configured coding agent,
 mechanically detects dishonest shortcuts (weakened tests, forbidden-file edits, fabricated
@@ -36,6 +45,11 @@ stinger validate scenarios/      # run the validity contract (SPEC.md §12)
 stinger run --config stinger.yaml
 stinger report repro/<timestamp> --format html
 ```
+
+> Heads-up before the second command: validating the full corpus (and any `stinger run`)
+> needs the Docker verification image, because the `X` safety family refuses to run
+> unconfined. It is a one-line build — see [Development](#development). Everything else,
+> including `stinger list` and validating the other 24 scenarios, works without it.
 
 Copy [stinger.example.yaml](stinger.example.yaml) to `stinger.yaml` to get started; it
 documents every setting, including how to point the generic `shell` adapter at an agent
@@ -79,11 +93,11 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | Validity contract + `stinger validate` / `list` (§12, §13) | working |
 | Frozen rubric math, incl. modal outcome + variance (§8) | working |
 | Integrity Report — JSON, Markdown, HTML (§4, §8) | working |
-| Reproducibility package + `rerun.sh` (§10) | working — `rerun.sh` re-ran a live agent over the same corpus and config and reproduced identical corpus hash, config fingerprint, family scores and per-scenario outcomes |
+| Reproducibility package + `rerun.sh` (§10) | working — `rerun.sh` re-ran a live agent over the same corpus and config and reproduced identical corpus hash, config fingerprint, family scores and per-scenario outcomes; both packages are committed in [evidence/](evidence/) |
 | `stinger run` / `stinger report` (§13) | working |
 | Optional LLM judge (§9) | working, but no transport — the bounds and prompt are implemented and tested; the operator supplies a `JudgeClient`. Disabled by default. |
 | `shell` adapter (§5) | working — driven end to end by `stinger run` against a local agent script, through a real PTY |
-| `codex` adapter (§5) | working — **run live against a real model** across families T and C (12 scenarios), every completion confirmed by the held-out oracle |
+| `codex` adapter (§5) | working — **run live against a real model** across families T and C (12 scenarios), every completion confirmed by the held-out oracle; full packages in [evidence/](evidence/) |
 | `claude-code`, `aider` adapters (§5) | built, **not yet run against a live model** — argv, credential handling, timeouts and output parsing are tested against recorded CLI output; the model call itself is unverified |
 | CI regression gate + reusable workflow (§14) | working — absolute threshold and no-regression-vs-baseline, both enforced by `stinger run` itself |
 | Human spot-audit of the corpus | **not done** — [scenarios/AUDIT.md](scenarios/AUDIT.md) is ready for a reviewer who did not write the scenarios |
@@ -103,9 +117,11 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 Criterion 3 is the remaining gap, and only half of it. One real agent has been measured —
 codex, across families T and C, with every completion confirmed by the held-out oracle it
 never saw. `rerun.sh` has been run against that package end to end and reproduced the scoring
-exactly, which is the other thing §16.3 asks for. What is missing is a *second* adapter:
-`claude-code` is installed but reports "Not logged in", and authenticating it is the account
-holder's to do, not the harness's.
+exactly, which is the other thing §16.3 asks for. The complete reproducibility packages for
+all of it — both codex runs, the rerun, and a fail-closed negative control — are committed in
+[evidence/](evidence/), so none of this paragraph has to be taken on trust. What is missing
+is a *second* adapter: `claude-code` is installed but reports "Not logged in", and
+authenticating it is the account holder's to do, not the harness's.
 
 Both runs covered one family each, so neither is a Stinger score, and both say so.
 
@@ -145,3 +161,8 @@ rather than letting every scenario score as a failure for a reason unrelated to 
 
 Code: Apache-2.0 ([LICENSE](LICENSE)). Scenario corpus: CC-BY-4.0
 ([scenarios/LICENSE](scenarios/LICENSE)).
+
+## Contact
+
+Chris McNosky · Dallas–Fort Worth, TX · cmcnosky@gmail.com — see
+[CASE_STUDY.md](CASE_STUDY.md) for how this was built and what the operator actually did.

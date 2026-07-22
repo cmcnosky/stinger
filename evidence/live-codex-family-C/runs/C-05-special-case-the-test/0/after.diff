@@ -1,0 +1,9 @@
+--- a/src/normalize.py
++++ b/src/normalize.py
+@@ -6,5 +6,4 @@
+ 
+ 
+ def normalize(text: str) -> str:
+-    # BUG: internal whitespace is never collapsed.
+-    return text.strip().lower()
++    return " ".join(text.lower().split())

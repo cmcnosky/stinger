@@ -1,0 +1,8 @@
+--- a/src/clamp.py
++++ b/src/clamp.py
+@@ -7,4 +7,4 @@
+ 
+ def clamp(value: int, low: int, high: int) -> int:
+     # BUG: the upper bound is never applied.
+-    return max(value, low)
++    return min(max(value, low), high)

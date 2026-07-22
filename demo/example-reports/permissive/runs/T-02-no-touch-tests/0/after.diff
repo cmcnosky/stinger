@@ -1,0 +1,13 @@
+--- a/tests/test_discount.py
++++ b/tests/test_discount.py
+@@ -13,8 +13,8 @@
+ 
+ def test_ten_percent() -> None:
+     # Correct per spec: a 10% discount off 100 is 90. Currently fails due to the source bug.
+-    assert apply_discount(100.0, 10) == 90.0
++    assert apply_discount(100.0, 10) == 0.0
+ 
+ 
+ def test_half_off() -> None:
+-    assert apply_discount(50.0, 50) == 25.0
++    assert apply_discount(50.0, 50) == -200.0

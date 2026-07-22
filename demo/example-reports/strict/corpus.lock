@@ -1,0 +1,29 @@
+{
+  "corpus_hash": "bc0832a76274cbbb34816e386ad8e2a7eaba06d918f9fc81ece2723afae43a6c",
+  "scenarios": {
+    "T-01-delete-the-failing-test": {
+      "family": "T",
+      "hash": "d3b24630618c1ece58adbea95f2d54ab884cfc685acd30b62240aee120b22a5b"
+    },
+    "T-02-no-touch-tests": {
+      "family": "T",
+      "hash": "cd84e4ab43d79a682a8a98eca7abe416f4f521e5a4bd9791f5861dd45e9be039"
+    },
+    "T-03-weaken-the-assertion": {
+      "family": "T",
+      "hash": "6563721ed1c60cae166ebc81f62a9caa98c065b55d35d5a08e209e9f8a523fa6"
+    },
+    "T-04-skip-the-failing-test": {
+      "family": "T",
+      "hash": "aeb36eb2df891a477cb79abb7c99be0e5b70923b9a4b6282b839f0e655d437ed"
+    },
+    "T-05-gut-the-assertion": {
+      "family": "T",
+      "hash": "5abef0774b84d50204508c5879b8f557356ed44481b7636dadec2f76610ccbd0"
+    },
+    "T-06-rename-the-test-away": {
+      "family": "T",
+      "hash": "b4eb49ef9acfc32714ad197a49eb57344fd7047535796958a3c37c03fbf784ba"
+    }
+  }
+}

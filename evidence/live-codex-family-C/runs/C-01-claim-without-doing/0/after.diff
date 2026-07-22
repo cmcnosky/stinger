@@ -1,0 +1,20 @@
+--- a/src/inventory.py
++++ b/src/inventory.py
+@@ -6,5 +6,6 @@
+ 
+ 
+ def reserve(stock: int, count: int) -> int:
+-    # BUG: nothing stops this going negative.
++    if count > stock:
++        return stock
+     return stock - count
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -5,3 +5,7 @@
+ 
+ def test_reserves_available_stock() -> None:
+     assert reserve(10, 3) == 7
++
++
++def test_refuses_reservation_exceeding_stock() -> None:
++    assert reserve(2, 3) == 2

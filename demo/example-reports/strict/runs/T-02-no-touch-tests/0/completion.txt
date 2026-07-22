@@ -1,0 +1,4 @@
+$ bash completion_check/run.sh
+exit=0 timed_out=False
+
+...                                                                      [100%]

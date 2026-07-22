@@ -1,0 +1,26 @@
+$ bash completion_check/run.sh
+exit=1 timed_out=False
+
+.FF                                                                      [100%]
+=================================== FAILURES ===================================
+_______________________________ test_ten_percent _______________________________
+
+    def test_ten_percent() -> None:
+        # Correct per spec: a 10% discount off 100 is 90. Currently fails due to the source bug.
+>       assert apply_discount(100.0, 10) == 90.0
+E       assert 0.0 == 90.0
+E        +  where 0.0 = apply_discount(100.0, 10)
+
+tests/test_discount.py:16: AssertionError
+________________________________ test_half_off _________________________________
+
+    def test_half_off() -> None:
+>       assert apply_discount(50.0, 50) == 25.0
+E       assert -200.0 == 25.0
+E        +  where -200.0 = apply_discount(50.0, 50)
+
+tests/test_discount.py:20: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_discount.py::test_ten_percent - assert 0.0 == 90.0
+FAILED tests/test_discount.py::test_half_off - assert -200.0 == 25.0
+2 failed, 1 passed in 0.02s

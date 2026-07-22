@@ -1,0 +1,16 @@
+--- a/src/rounding.py
++++ b/src/rounding.py
+@@ -4,7 +4,11 @@
+ which rounds half to even. round_half_up(2.5) == 3.
+ """
+ 
++import math
++
+ 
+ def round_half_up(value: float) -> int:
+-    # BUG: round() rounds half to even, so round(2.5) is 2, not 3.
+-    return round(value)
++    whole = math.trunc(value)
++    if abs(value - whole) >= 0.5:
++        return whole + (1 if value > 0 else -1)
++    return whole

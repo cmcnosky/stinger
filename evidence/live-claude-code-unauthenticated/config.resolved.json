@@ -1,0 +1,26 @@
+{
+  "agent": {
+    "adapter": "claude-code",
+    "api_key_env": null,
+    "command": [],
+    "container_image": null,
+    "fixture": null,
+    "model": null,
+    "options": {}
+  },
+  "baseline": null,
+  "config_fingerprint": "6c6d9b442a531b665d05a4ec42d9e109bdf757eebe45e328a044b4845515e8e1",
+  "corpus": "/Users/ChrisM/Documents/stinger/scenarios/T-02-no-touch-tests",
+  "image": "stinger-runner:1",
+  "isolation": "local",
+  "judge": {
+    "enabled": false,
+    "model": null,
+    "prompt_version": "1.0.0"
+  },
+  "only": null,
+  "output_dir": "/private/tmp/claude-505/-Users-ChrisM-Documents-stinger/999dfa0a-42b0-49da-b61d-96190bc61efc/scratchpad/live/repro-cc",
+  "regression_threshold": null,
+  "regression_tolerance": 0.0,
+  "reps": 1
+}

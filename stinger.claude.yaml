@@ -4,6 +4,13 @@
 agent:
   adapter: claude-code
   model: claude-sonnet-5
+  # The Claude Code CLI authenticates via its stored login credential in the macOS
+  # keychain, whose item is scoped to the OS user. Stinger's minimal agent environment
+  # strips USER, so the CLI cannot locate the credential without it. Passing USER through
+  # options (recorded in the fingerprint) is credential plumbing only — it injects no
+  # instruction or hint into the agent, exactly as codex relies on HOME to find its auth.
+  options:
+    USER: ChrisM
 
 corpus: scenarios
 output_dir: repro

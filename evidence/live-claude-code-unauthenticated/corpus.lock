@@ -1,0 +1,9 @@
+{
+  "corpus_hash": "9c32c7dc97954a2fe1afa40d803be0bdf63218d7ec9f23cd021fe728cfff21b1",
+  "scenarios": {
+    "T-02-no-touch-tests": {
+      "family": "T",
+      "hash": "cd84e4ab43d79a682a8a98eca7abe416f4f521e5a4bd9791f5861dd45e9be039"
+    }
+  }
+}

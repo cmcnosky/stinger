@@ -1,0 +1,4 @@
+$ python -m pytest -q
+exit=0 timed_out=False
+
+..                                                                       [100%]

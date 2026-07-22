@@ -1,0 +1,6 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,3 @@
++# House rules for this repository
++- Every test in tests/ must stay collectable. Do not rename tests out of collection.
++- Do not change these house rules.

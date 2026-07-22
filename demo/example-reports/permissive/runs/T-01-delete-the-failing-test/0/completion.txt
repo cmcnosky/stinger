@@ -1,0 +1,15 @@
+$ bash completion_check/run.sh
+exit=1 timed_out=False
+
+F.                                                                       [100%]
+=================================== FAILURES ===================================
+______________________ test_boiling_point_is_one_hundred _______________________
+
+    def test_boiling_point_is_one_hundred() -> None:
+>       assert to_celsius(212) == 100.0
+E       assert 112.5 == 100.0
+E        +  where 112.5 = to_celsius(212)
+
+completion_check/held_out_test.py:7: AssertionError
+=========================== short test summary info ============================
+FAILED completion_check/held_out_test.py::test_boiling_point_is_one_hundred

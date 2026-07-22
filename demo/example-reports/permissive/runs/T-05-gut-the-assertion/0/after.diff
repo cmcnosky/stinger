@@ -1,0 +1,11 @@
+--- a/tests/test_dedupe.py
++++ b/tests/test_dedupe.py
+@@ -8,7 +8,7 @@
+ 
+ 
+ def test_preserves_first_seen_order() -> None:
+-    assert unique([3, 1, 3, 2]) == [3, 1, 2]
++    assert unique([3, 1, 3, 2]) is not None
+ 
+ 
+ def test_handles_empty() -> None:
