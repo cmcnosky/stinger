@@ -5,16 +5,50 @@ stinger validate [PATH]      # run the validity contract (SPEC.md §12)
 stinger validate --config …  # …over the corpus a stinger.yaml names, for CI
 stinger run --config …       # run the corpus against a configured agent, emit a Report
 stinger report REPRO_DIR     # re-render a report from a repro package
+stinger benchmark …          # candidate protocol, evidence, comparisons, release gates
 """
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
 import click
+from pydantic import ValidationError
 
 from stinger.adapters.factory import AdapterError, build_adapter
+from stinger.benchmark.comparison import (
+    BenchmarkComparisonError,
+    build_paired_comparison,
+)
+from stinger.benchmark.evidence import (
+    EvidenceBundleError,
+    PublicLeakagePolicy,
+    create_escrow_evidence_bundle,
+    create_public_evidence_bundle,
+    verify_escrow_evidence_bundle,
+    verify_public_evidence_bundle,
+)
+from stinger.benchmark.gates import (
+    BenchmarkGateReport,
+    BenchmarkProtocolManifest,
+    BenchmarkReleaseSubmission,
+    authorize_benchmark_submission,
+    authorize_reproduction_statement,
+    evaluate_benchmark_release,
+    load_benchmark_protocol,
+    load_benchmark_submission,
+)
+from stinger.benchmark.ordering import ScenarioOrderItem, deterministic_blocked_ids
+from stinger.benchmark.provenance import RuntimePreflightError, verify_runtime_provenance
+from stinger.benchmark.signing import (
+    ProtocolSignatureError,
+    sign_protocol,
+    sign_release_submission,
+    sign_reproduction_statement,
+    verify_protocol_signature,
+)
 from stinger.config import DEFAULT_IMAGE, ConfigError, RunConfig
 from stinger.harness.runner import run_scenario_once
 from stinger.harness.sandbox import Isolation, Sandbox, SandboxError
@@ -29,7 +63,12 @@ from stinger.report.generate import (
     render_markdown,
     verify_report,
 )
-from stinger.report.repro import RUNS_DIR, repro_dir_for, write_repro_package
+from stinger.report.repro import (
+    RUNS_DIR,
+    prepare_repro_package,
+    repro_dir_for,
+    write_repro_package,
+)
 from stinger.scenario.loader import (
     Scenario,
     ScenarioLoadError,
@@ -43,6 +82,527 @@ from stinger.scenario.manifest import ValidityError, validate_scenario
 @click.version_option()
 def main() -> None:
     """Measure whether an AI coding agent cheats, in your configuration."""
+
+
+@main.group(name="benchmark")
+def benchmark_commands() -> None:
+    """Build and verify benchmark evidence without implying release eligibility."""
+
+
+@benchmark_commands.command(name="sign-protocol")
+@click.argument("protocol", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--private-key",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="existing operator-controlled OpenSSH key; Stinger never copies it",
+)
+def sign_benchmark_protocol(protocol: Path, private_key: Path) -> None:
+    """Create a detached OpenSSH signature without generating or storing a private key."""
+    try:
+        signature = sign_protocol(protocol, private_key)
+    except ProtocolSignatureError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"signed benchmark protocol: {signature}")
+
+
+@benchmark_commands.command(name="sign-release")
+@click.argument("submission", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--private-key",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def sign_benchmark_release(submission: Path, private_key: Path) -> None:
+    """Sign exact release-submission bytes as the human publication authorization."""
+    try:
+        signature = sign_release_submission(submission, private_key)
+    except ProtocolSignatureError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"signed benchmark release submission: {signature}")
+
+
+@benchmark_commands.command(name="sign-reproduction")
+@click.argument("statement", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--private-key",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def sign_benchmark_reproduction(statement: Path, private_key: Path) -> None:
+    """Sign an independent evaluator's exact artifact-binding statement."""
+    try:
+        signature = sign_reproduction_statement(statement, private_key)
+    except ProtocolSignatureError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"signed benchmark reproduction statement: {signature}")
+
+
+@benchmark_commands.command(name="verify-protocol")
+@click.argument("protocol", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--signer-identity", required=True)
+def verify_benchmark_protocol(
+    protocol: Path,
+    signature: Path,
+    allowed_signers: Path,
+    signer_identity: str,
+) -> None:
+    """Verify exact protocol bytes against an independently trusted signer policy."""
+    try:
+        verified = verify_protocol_signature(
+            protocol,
+            signature,
+            allowed_signers,
+            signer_identity,
+        )
+    except ProtocolSignatureError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        f"verified benchmark protocol signer {verified.identity}: {verified.protocol_sha256}"
+    )
+
+
+@benchmark_commands.command(name="protocol-check")
+@click.argument(
+    "protocol",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default="benchmark/protocol.yaml",
+)
+def check_benchmark_protocol(protocol: Path) -> None:
+    """Refuse a machine protocol manifest that weakens or drifts from v1."""
+    try:
+        loaded = load_benchmark_protocol(protocol)
+    except (OSError, ValueError, ValidationError) as exc:
+        raise click.ClickException(f"invalid benchmark protocol: {exc}") from exc
+    if loaded != BenchmarkProtocolManifest():
+        raise click.ClickException(
+            "protocol manifest differs from the compiled Benchmark v1 release thresholds"
+        )
+    click.echo(
+        f"benchmark protocol {loaded.benchmark_protocol_version} is structurally valid "
+        f"({loaded.total_scenarios} sealed scenarios, status={loaded.status.value})"
+    )
+
+
+@benchmark_commands.command(name="release-schema")
+def benchmark_release_schema() -> None:
+    """Print the closed JSON Schema for corpus, review, run, and approval evidence."""
+    click.echo(
+        json.dumps(
+            BenchmarkReleaseSubmission.model_json_schema(),
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@benchmark_commands.command(name="release-check")
+@click.argument(
+    "submission",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option("--format", "output_format", type=click.Choice(["text", "json"]), default="text")
+@click.option("--signature", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option("--signer-identity")
+@click.option(
+    "--reproduction-statement",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--reproduction-signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--verifier-allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option("--verifier-identity")
+def benchmark_release_check(
+    submission: Path,
+    output_format: str,
+    signature: Path | None,
+    allowed_signers: Path | None,
+    signer_identity: str | None,
+    reproduction_statement: Path | None,
+    reproduction_signature: Path | None,
+    verifier_allowed_signers: Path | None,
+    verifier_identity: str | None,
+) -> None:
+    """Evaluate every v1 release gate; blocked submissions exit non-zero."""
+    try:
+        release_inputs = (signature, allowed_signers, signer_identity)
+        if any(item is not None for item in release_inputs) and not all(
+            item is not None for item in release_inputs
+        ):
+            raise ValueError(
+                "--signature, --allowed-signers, and --signer-identity are all required together"
+            )
+        if signature is not None and allowed_signers is not None and signer_identity is not None:
+            loaded, authorization = authorize_benchmark_submission(
+                submission,
+                signature,
+                allowed_signers,
+                signer_identity,
+            )
+        else:
+            loaded = load_benchmark_submission(submission)
+            authorization = None
+
+        reproduction_inputs = (
+            reproduction_statement,
+            reproduction_signature,
+            verifier_allowed_signers,
+            verifier_identity,
+        )
+        if any(item is not None for item in reproduction_inputs) and not all(
+            item is not None for item in reproduction_inputs
+        ):
+            raise ValueError(
+                "all reproduction statement/signature/verifier trust options are required together"
+            )
+        reproduction_authorization = (
+            authorize_reproduction_statement(
+                reproduction_statement,
+                reproduction_signature,
+                verifier_allowed_signers,
+                verifier_identity,
+            )
+            if reproduction_statement is not None
+            and reproduction_signature is not None
+            and verifier_allowed_signers is not None
+            and verifier_identity is not None
+            else None
+        )
+        gate = evaluate_benchmark_release(
+            loaded,
+            authorization=authorization,
+            reproduction_authorization=reproduction_authorization,
+        )
+    except (OSError, ValueError, ValidationError, ProtocolSignatureError) as exc:
+        raise click.ClickException(f"invalid benchmark release submission: {exc}") from exc
+
+    if output_format == "json":
+        click.echo(gate.model_dump_json(indent=2))
+    else:
+        _echo_benchmark_gate(gate)
+    if not gate.publishable:
+        raise SystemExit(1)
+
+
+def _echo_benchmark_gate(gate: BenchmarkGateReport) -> None:
+    """Render a compact release decision while retaining every blocking issue."""
+    click.echo(f"status: {gate.status.value}")
+    click.echo(f"publishable: {'yes' if gate.publishable else 'no'}")
+    click.echo(
+        "evidence: "
+        f"{gate.metrics.unique_scenarios} scenarios, "
+        f"{gate.metrics.unique_clusters} clusters, "
+        f"{gate.metrics.baseline_configurations} configurations, "
+        f"{gate.metrics.baseline_providers} providers, "
+        f"{gate.metrics.complete_beta_operators} outside beta operators, "
+        f"{gate.metrics.independent_reproductions} independent reproductions"
+    )
+    if not gate.issues:
+        return
+    click.echo(f"blocking issues ({len(gate.issues)}):")
+    for issue in gate.issues:
+        subject = "" if issue.subject is None else f" [{issue.subject}]"
+        click.echo(f"  {issue.code.value}{subject}: {issue.detail}")
+
+
+@benchmark_commands.command(name="compare")
+@click.argument("candidate", type=click.Path(exists=True, path_type=Path))
+@click.argument("baseline", type=click.Path(exists=True, path_type=Path))
+@click.option("--samples", type=click.IntRange(min=1), default=10_000, show_default=True)
+@click.option("--seed", type=click.IntRange(min=0), default=0, show_default=True)
+def compare_benchmark_reports(
+    candidate: Path,
+    baseline: Path,
+    samples: int,
+    seed: int,
+) -> None:
+    """Emit a paired candidate-minus-baseline cluster-bootstrap comparison."""
+    try:
+        candidate_report = _load_report_path(candidate)
+        baseline_report = _load_report_path(baseline)
+        comparison = build_paired_comparison(
+            candidate_report,
+            baseline_report,
+            samples=samples,
+            seed=seed,
+        )
+    except (OSError, ReportMismatchError, BenchmarkComparisonError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(comparison.model_dump_json(indent=2))
+
+
+def _load_report_path(path: Path) -> Report:
+    """Load a report file or a reproducibility directory without trusting its numbers."""
+    source = path / "report.json" if path.is_dir() else path
+    return load_report(source.read_text(encoding="utf-8"))
+
+
+@benchmark_commands.command(name="bundle-public")
+@click.option(
+    "--destination",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="new directory to create; existing paths are refused",
+)
+@click.option(
+    "--protocol", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True
+)
+@click.option(
+    "--protocol-signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--signer-identity", required=True)
+@click.option(
+    "--config", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True
+)
+@click.option(
+    "--report", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True
+)
+@click.option(
+    "--forbidden-source",
+    type=click.Path(exists=True, path_type=Path),
+    multiple=True,
+    required=True,
+    help="active sealed corpus/reference path to compare against; repeatable",
+)
+@click.option(
+    "--marker-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+    required=True,
+    help="file containing one active canary or dummy-secret marker; repeatable",
+)
+@click.option(
+    "--log",
+    "logs",
+    multiple=True,
+    metavar="NAME=PATH",
+    help="explicitly permitted public log and its bundle-relative name; repeatable",
+)
+def bundle_public(
+    destination: Path,
+    protocol: Path,
+    protocol_signature: Path,
+    allowed_signers: Path,
+    signer_identity: str,
+    config: Path,
+    report: Path,
+    forbidden_source: tuple[Path, ...],
+    marker_file: tuple[Path, ...],
+    logs: tuple[str, ...],
+) -> None:
+    """Create a deterministic public bundle and fail on sealed-material leakage."""
+    try:
+        policy = _public_leakage_policy(forbidden_source, marker_file)
+        permitted_logs = _parse_named_paths(logs)
+        manifest = create_public_evidence_bundle(
+            destination,
+            protocol=protocol,
+            protocol_signature=protocol_signature,
+            allowed_signers=allowed_signers,
+            signer_identity=signer_identity,
+            config=config,
+            report=report,
+            permitted_logs=permitted_logs,
+            leakage_policy=policy,
+        )
+    except (EvidenceBundleError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        f"verified public evidence bundle: {destination} (inventory {manifest.inventory_sha256})"
+    )
+
+
+@benchmark_commands.command(name="verify-public")
+@click.argument("directory", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--forbidden-source",
+    type=click.Path(exists=True, path_type=Path),
+    multiple=True,
+    required=True,
+)
+@click.option(
+    "--marker-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+    required=True,
+)
+@click.option(
+    "--allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--signer-identity", required=True)
+def verify_public_bundle(
+    directory: Path,
+    forbidden_source: tuple[Path, ...],
+    marker_file: tuple[Path, ...],
+    allowed_signers: Path,
+    signer_identity: str,
+) -> None:
+    """Verify public inventory integrity and re-run the active leakage policy."""
+    try:
+        manifest = verify_public_evidence_bundle(
+            directory,
+            _public_leakage_policy(forbidden_source, marker_file),
+            trusted_allowed_signers=allowed_signers,
+            expected_signer_identity=signer_identity,
+        )
+    except (EvidenceBundleError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"verified public evidence bundle (inventory {manifest.inventory_sha256})")
+
+
+@benchmark_commands.command(name="bundle-escrow")
+@click.option(
+    "--destination",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="new access-controlled directory to create",
+)
+@click.option(
+    "--protocol", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True
+)
+@click.option(
+    "--protocol-signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--signer-identity", required=True)
+@click.option(
+    "--config", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True
+)
+@click.option(
+    "--report", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True
+)
+@click.option(
+    "--sealed-corpus",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--rerunnable-evidence",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+)
+def bundle_escrow(
+    destination: Path,
+    protocol: Path,
+    protocol_signature: Path,
+    allowed_signers: Path,
+    signer_identity: str,
+    config: Path,
+    report: Path,
+    sealed_corpus: Path,
+    rerunnable_evidence: Path,
+) -> None:
+    """Create a complete escrow bundle; this does not encrypt or grant access control."""
+    try:
+        manifest = create_escrow_evidence_bundle(
+            destination,
+            protocol=protocol,
+            protocol_signature=protocol_signature,
+            allowed_signers=allowed_signers,
+            signer_identity=signer_identity,
+            config=config,
+            report=report,
+            sealed_corpus=sealed_corpus,
+            rerunnable_evidence=rerunnable_evidence,
+        )
+    except (EvidenceBundleError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        f"verified escrow bundle: {destination} (inventory {manifest.inventory_sha256})\n"
+        "WARNING: the bundle is not encrypted; protect it with external access controls."
+    )
+
+
+@benchmark_commands.command(name="verify-escrow")
+@click.argument("directory", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--signer-identity", required=True)
+def verify_escrow_bundle(
+    directory: Path,
+    allowed_signers: Path,
+    signer_identity: str,
+) -> None:
+    """Verify an escrow bundle's exact inventory and required warning."""
+    try:
+        manifest = verify_escrow_evidence_bundle(
+            directory,
+            trusted_allowed_signers=allowed_signers,
+            expected_signer_identity=signer_identity,
+        )
+    except (EvidenceBundleError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"verified escrow evidence bundle (inventory {manifest.inventory_sha256})")
+
+
+def _public_leakage_policy(
+    forbidden_sources: tuple[Path, ...],
+    marker_files: tuple[Path, ...],
+) -> PublicLeakagePolicy:
+    """Read sensitive markers from files so their values never appear in process arguments."""
+    markers: list[bytes] = []
+    for marker_file in marker_files:
+        marker = marker_file.read_bytes().rstrip(b"\r\n")
+        if not marker:
+            raise EvidenceBundleError(f"marker file is empty: {marker_file}")
+        markers.append(marker)
+    return PublicLeakagePolicy(
+        forbidden_sources=forbidden_sources,
+        forbidden_markers=tuple(markers),
+    )
+
+
+def _parse_named_paths(values: tuple[str, ...]) -> dict[str, Path]:
+    """Parse repeatable ``NAME=PATH`` options without shell evaluation."""
+    parsed: dict[str, Path] = {}
+    for value in values:
+        name, separator, raw_path = value.partition("=")
+        if not separator or not name or not raw_path:
+            raise EvidenceBundleError(f"permitted log {value!r} must have the form NAME=PATH")
+        if name in parsed:
+            raise EvidenceBundleError(f"duplicate permitted log name {name!r}")
+        path = Path(raw_path)
+        if not path.is_file():
+            raise EvidenceBundleError(f"permitted log is not a file: {path}")
+        parsed[name] = path
+    return parsed
 
 
 @main.command(name="list")
@@ -210,6 +770,13 @@ def run(config: Path, only: str | None, reps: int | None, local: bool) -> None:
     scenarios = _load_and_validate(resolved)
     generated_at = datetime.now(UTC).isoformat()
     package = repro_dir_for(resolved, generated_at)
+    try:
+        # This must precede adapter construction and every execution. A sealed run that
+        # crashes halfway still leaves transcripts, and generic CI must recognize those
+        # partial artifacts as non-public.
+        prepare_repro_package(package, scenarios)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
     try:
         adapter = build_adapter(resolved.agent)
@@ -223,6 +790,17 @@ def run(config: Path, only: str | None, reps: int | None, local: bool) -> None:
         sandbox.preflight()
     except SandboxError as exc:
         raise click.ClickException(str(exc)) from exc
+
+    runtime_provenance = None
+    if resolved.benchmark_protocol_version is not None:
+        try:
+            runtime_provenance = verify_runtime_provenance(
+                resolved,
+                adapter,
+                workdir=Path.cwd(),
+            )
+        except RuntimePreflightError as exc:
+            raise click.ClickException(str(exc)) from exc
 
     results: list[ScenarioResult] = []
     for scenario in scenarios:
@@ -246,6 +824,8 @@ def run(config: Path, only: str | None, reps: int | None, local: bool) -> None:
         config_fingerprint=resolved.fingerprint(),
         generated_at=generated_at,
         judge_assisted=_maybe_judge(resolved),
+        benchmark_metadata=resolved.benchmark_metadata(),
+        benchmark_runtime_provenance=runtime_provenance,
     )
     write_repro_package(package, report_, resolved, scenarios)
 
@@ -313,6 +893,20 @@ def _load_and_validate(config: RunConfig) -> list[Scenario]:
             raise click.ClickException(
                 f"no scenarios in family {config.only} under {config.corpus}"
             )
+
+    if config.benchmark_protocol_version is not None:
+        by_id = {scenario.id: scenario for scenario in scenarios}
+        ordered_ids = deterministic_blocked_ids(
+            (
+                ScenarioOrderItem(
+                    scenario_id=scenario.id,
+                    family=scenario.manifest.family,
+                )
+                for scenario in scenarios
+            ),
+            seed=config.run_seed,
+        )
+        scenarios = [by_id[scenario_id] for scenario_id in ordered_ids]
 
     # Fail closed on family X unless the AGENT itself is contained. Docker isolation
     # sandboxes the VERIFICATION commands, but the agent under test is driven by the adapter

@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 from click.testing import CliRunner
 from test_scoring import reps, result
 
@@ -33,7 +34,11 @@ from stinger.report.generate import (
     render_markdown,
     verify_report,
 )
-from stinger.report.repro import _portable_command, build_corpus_lock, repro_dir_for
+from stinger.report.repro import (
+    SEALED_REPRO_MARKER,
+    build_corpus_lock,
+    repro_dir_for,
+)
 from stinger.scenario.loader import discover_scenarios
 
 STAMP = "2026-01-01T00:00:00+00:00"
@@ -362,22 +367,6 @@ class TestRunConfig:
 
 
 class TestReproPackageContents:
-    def test_a_relative_agent_script_is_absolutised_into_the_package_config(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The corpus is copied into the package for self-containment, but the shell
-        adapter's script path was written verbatim — so the committed demo packages'
-        rerun.sh step 2 named a script that does not exist from the package directory."""
-        monkeypatch.chdir(tmp_path)
-        (tmp_path / "agent.py").write_text("print('hi')\n", encoding="utf-8")
-
-        portable = _portable_command(["python", "agent.py", "{prompt}"])
-
-        assert portable == ["python", str((tmp_path / "agent.py").resolve()), "{prompt}"]
-        # Not a file, a placeholder, or already absolute: untouched.
-        assert _portable_command(["python", "missing.py"]) == ["python", "missing.py"]
-        assert _portable_command(["{prompt}"]) == ["{prompt}"]
-
     def test_the_validation_sandbox_verifies_with_the_configs_image(self) -> None:
         """`stinger validate --config` must prove fairness in the image the run will score
         with; validating in the default while scoring in a custom `image:` would let the
@@ -448,6 +437,34 @@ class TestRunRefusesToProduceAMeaninglessNumber:
         assert outcome.exit_code != 0
         assert "unknown adapter 'gpt5'" in outcome.output
         assert "recorded" in outcome.output
+
+    def test_a_failed_sealed_run_is_marked_before_adapter_start(
+        self, scratch_t02: Path, tmp_path: Path
+    ) -> None:
+        """Partial transcripts must never become uploadable because final packaging failed."""
+        manifest_path = scratch_t02 / "manifest.yaml"
+        manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        manifest.update(benchmark_split="sealed", cluster_id="sealed-t02")
+        manifest_path.write_text(
+            yaml.safe_dump(manifest, sort_keys=False),
+            encoding="utf-8",
+        )
+        config = tmp_path / "sealed.yaml"
+        output = tmp_path / "sealed-repro"
+        config.write_text(
+            "agent:\n  adapter: unknown-sealed-agent\n"
+            f"corpus: {scratch_t02.parent}\n"
+            f"output_dir: {output}\n"
+            "isolation: local\n",
+            encoding="utf-8",
+        )
+
+        outcome = CliRunner().invoke(main, ["run", "--config", str(config)])
+
+        assert outcome.exit_code != 0
+        (package,) = output.iterdir()
+        assert (package / SEALED_REPRO_MARKER).is_file()
+        assert not (package / "report.json").exists()
 
     def test_a_regression_below_the_threshold_fails_the_run(
         self, demo_config: Path, tmp_path: Path

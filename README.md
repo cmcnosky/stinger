@@ -22,6 +22,32 @@ Two rules shape everything here:
 See [SPEC.md](SPEC.md) for the authoritative specification and [AGENTS.md](AGENTS.md) for
 the working agreements that bind every contributor, human or agent.
 
+## Benchmark status: candidate, not benchmark
+
+Stinger is currently a **benchmark candidate / instrument demonstration**. The 30 public
+scenarios are the development and conformance suite; because their prompts, oracles, and
+reference resolutions are public, they are not used for a headline benchmark claim.
+
+The separately versioned [benchmark protocol](BENCHMARK.md) specifies a sealed
+120-scenario scoring corpus, independent fairness and QA records, six pinned configurations
+across three providers, five repetitions, cluster-aware uncertainty, signed public evidence,
+three outside beta operators, and one unaffiliated full reproduction. The repository now
+implements the metadata, deterministic ordering, statistics, signed public/escrow bundles,
+and fail-closed master release gate. It does **not** claim that the sealed corpus or outside
+evidence already exists.
+
+The current state is executable:
+
+```bash
+stinger benchmark protocol-check benchmark/protocol.yaml
+stinger benchmark release-check benchmark/candidate-submission.yaml
+```
+
+The first command passes the frozen protocol structure. The second intentionally exits
+non-zero and enumerates every unearned release gate. Only a fully evidenced submission can
+produce `independently_reproduced`; “established benchmark” requires later sustained
+third-party use and a documented correction cycle.
+
 ## Install
 
 Requires Python 3.12+.
@@ -30,7 +56,7 @@ Requires Python 3.12+.
 pip install -e ".[dev]"
 ```
 
-## The four commands
+## Core commands
 
 ```bash
 stinger list                     # scenarios + families + validity status
@@ -38,6 +64,10 @@ stinger validate scenarios/      # run the validity contract (SPEC.md §12)
 stinger run --config stinger.yaml
 stinger report repro/<timestamp> --format html
 ```
+
+Benchmark operators additionally use `stinger benchmark --help` for protocol signing,
+release checks, paired candidate-minus-baseline intervals, and public/escrow evidence
+bundles. These commands never turn the public development suite into benchmark evidence.
 
 > Heads-up before the second command: validating the full corpus needs the Docker
 > verification image (the `X` safety family refuses to validate unconfined), and so does any
@@ -105,6 +135,14 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | `claude-code` adapter (§5) | working — **run live against a real model** (family T, 6 scenarios); `rerun.sh` reproduced the scoring; packages in [evidence/](evidence/) |
 | `aider` adapter (§5) | built, not yet run against a live model — argv, credential handling, timeouts and output parsing are tested against recorded CLI output |
 | CI regression gate + reusable workflow (§14) | working — absolute threshold and no-regression-vs-baseline, both enforced by `stinger run` itself |
+| Benchmark protocol + exact run/scenario metadata | working — separately versioned without changing `RUBRIC_VERSION`; legacy configs and reports remain readable |
+| Seeded family-blocked benchmark ordering | working — stable across input order and mechanically rechecked at the release gate |
+| Cluster-aware 95% bootstrap and paired differences | working — repetitions stay nested within scenarios; persisted intervals are recomputed by `stinger report` |
+| Signed public / escrow benchmark evidence | working — OpenSSH detached protocol signature, independently supplied trust policy, exact inventories, sealed-file/canary/secret leakage checks, and explicit unencrypted-escrow warning |
+| Benchmark master release gate | working — typed corpus/review/QA/baseline/external/approval evidence with stable fail-closed issue codes |
+| Sealed scoring corpus | **not done** — target is 120 independently designed scenarios, 24 per family; no active sealed corpus is claimed in this public repository |
+| Outside beta operators + independent reproduction | **not done** — no operator or evaluator record has been accepted |
+| Benchmark v1 release | **HOLD** — the checked-in candidate submission fails the master gate; only Chris can approve spending, publication, or a vendor comparison after all other gates pass |
 | Human spot-audit of the corpus | **not done** — [scenarios/AUDIT.md](scenarios/AUDIT.md) is ready for a reviewer who did not write the scenarios |
 | Discrimination demo (§16.4) | working — a strictly configured agent scores 100% and passes; a permissive one scores 0% and fails, on the same corpus (family T only, a labeled partial run — [demo/](demo/)) |
 | Scenario corpus | **30 validated scenarios, 6 in each of the five families** ([scenarios/README.md](scenarios/README.md)) |

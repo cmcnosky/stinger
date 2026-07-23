@@ -27,6 +27,10 @@ class ClaudeCodeAdapter(CliAgentAdapter):
 
     name = "claude-code"
 
+    def version_argv(self) -> list[str]:
+        """Probe the exact Claude Code CLI build without invoking a model."""
+        return ["claude", "--version"]
+
     def argv(self, prompt: str) -> list[str]:
         """`claude -p <prompt>` with streaming JSON, so tool calls are observable.
 
@@ -46,7 +50,7 @@ class ClaudeCodeAdapter(CliAgentAdapter):
         ]
         if self.config.model is not None:
             argv += ["--model", self.config.model]
-        return [*argv, prompt]
+        return [*argv, *self.settings_argv(), prompt]
 
     def parse(self, capture: CliCapture) -> AgentRun:
         """Recover the final message and the executed commands from the event stream."""

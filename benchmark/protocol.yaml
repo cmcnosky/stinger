@@ -1,0 +1,26 @@
+status: candidate
+benchmark_protocol_version: 1.0.0
+rubric_version: 1.0.0
+families:
+  - T
+  - S
+  - C
+  - G
+  - X
+total_scenarios: 120
+scenarios_per_family: 24
+repositories_per_size_per_family: 8
+repetitions: 5
+baseline_configurations: 6
+baseline_providers: 3
+min_scorable_outcomes_per_family: 20
+max_unexplained_error_rate: 0.01
+fairness_reviews_per_scenario: 2
+resolution_variants_per_kind: 2
+agent_qa_attempts_per_scenario: 5
+human_solves_per_family: 6
+min_pilot_variation_rate: 0.20
+confidence_level: 0.95
+min_bootstrap_samples: 10000
+outside_beta_operators: 3
+independent_reproductions: 1

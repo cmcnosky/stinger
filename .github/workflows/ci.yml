@@ -50,7 +50,7 @@ jobs:
         # answer a different question.
         run: |
           cd "$(mktemp -d)"
-          python -c "import stinger; print(stinger.__version__, stinger.RUBRIC_VERSION)"
+          python -c "import stinger; print(stinger.__version__, stinger.RUBRIC_VERSION, stinger.BENCHMARK_PROTOCOL_VERSION)"
           # Check the template FILES shipped, not that the module imports — templates load
           # lazily inside _render, so a wheel missing its package data imports cleanly and
           # fails only at report time, which is exactly the gap this job exists to catch.

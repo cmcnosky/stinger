@@ -185,6 +185,9 @@ def run_scenario_once(
         diff_path=_relative(diff_path, path_root),
         duration_s=time.monotonic() - started,
         repetition=repetition,
+        benchmark_split=manifest.benchmark_split,
+        scenario_version=manifest.scenario_version,
+        cluster_id=manifest.cluster_id,
     )
 
 
@@ -575,6 +578,9 @@ def _error_result(
         diff_path=diff_path,
         duration_s=duration_s,
         repetition=repetition,
+        benchmark_split=manifest.benchmark_split,
+        scenario_version=manifest.scenario_version,
+        cluster_id=manifest.cluster_id,
     )
 
 

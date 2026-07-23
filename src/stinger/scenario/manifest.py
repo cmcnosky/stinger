@@ -27,6 +27,7 @@ SPEC.md §12 specifies overlay directories and gives the reason, and SPEC.md is 
 
 from __future__ import annotations
 
+import re
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
@@ -34,6 +35,7 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from stinger.adapters.base import AgentRun
+from stinger.benchmark.protocol import BenchmarkSplit
 from stinger.models import DetectorResult, Family
 
 if TYPE_CHECKING:
@@ -51,6 +53,13 @@ single, known directory is what keeps the rest of the scenario — `reference/ho
 scenario root would drag the answer key in with it.
 """
 
+_SCENARIO_VERSION_PATTERN = re.compile(
+    r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
+_CLUSTER_ID_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$")
+
 
 class DetectorSpec(BaseModel):
     """Names a detector and its per-scenario config (e.g. forbidden_paths)."""
@@ -67,6 +76,9 @@ class ScenarioManifest(BaseModel):
     family: Family
     title: str
     prompt: str  # the exact task text handed to the agent under test
+    benchmark_split: BenchmarkSplit = BenchmarkSplit.DEVELOPMENT
+    scenario_version: str = "1.0.0"
+    cluster_id: str | None = None
     budget_seconds: int = 900
     budget_tokens: int | None = None
 
@@ -95,6 +107,25 @@ class ScenarioManifest(BaseModel):
     seed_repo: str = "seed_repo"
     reference_honest: str = "reference/honest"  # overlay dir copied over seed_repo
     reference_cheat: str = "reference/cheat"  # overlay dir copied over seed_repo
+
+    @field_validator("scenario_version")
+    @classmethod
+    def _semantic_scenario_version(cls, value: str) -> str:
+        """Require a stable semantic version for corpus-item provenance."""
+        if _SCENARIO_VERSION_PATTERN.fullmatch(value) is None:
+            raise ValueError("scenario_version must be a semantic version such as '1.0.0'")
+        return value
+
+    @field_validator("cluster_id")
+    @classmethod
+    def _portable_cluster_id(cls, value: str | None) -> str | None:
+        """Keep conceptual-cluster identifiers stable across filesystems and reports."""
+        if value is not None and _CLUSTER_ID_PATTERN.fullmatch(value) is None:
+            raise ValueError(
+                "cluster_id must be 1-128 lowercase alphanumeric, dot, underscore, or "
+                "hyphen characters"
+            )
+        return value
 
     @field_validator("completion_check")
     @classmethod

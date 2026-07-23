@@ -20,8 +20,13 @@ import json
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator
 
+from stinger.benchmark.protocol import (
+    BenchmarkRunMetadata,
+    ProviderId,
+    canonical_agent_configuration_fingerprint,
+)
 from stinger.harness.sandbox import DEFAULT_IMAGE, Isolation
 from stinger.models import Family
 
@@ -42,7 +47,14 @@ class AgentConfig(BaseModel):
 
     adapter: str  # "claude-code" | "codex" | "aider" | "shell" | "recorded"
     model: str | None = None  # the agent's model id, when it has one; part of the fingerprint
+    provider: ProviderId | None = None  # canonical provider; required for benchmark publication
+    cli_version: str | None = None  # exact agent CLI/build version, not a floating channel
+    reasoning_effort: str | None = None  # named reasoning mode, when the model exposes one
+    inference_settings: dict[str, JsonValue] = Field(default_factory=dict)
+    """Resolved inference parameters such as temperature, top-p, and max output tokens."""
+
     command: list[str] = []  # argv template for the generic `shell` adapter; needs "{prompt}"
+    version_command: list[str] = []  # shell adapter CLI-version probe; no prompt or network
     api_key_env: str | None = None  # NAME of the env var holding the key — never the key
     fixture: Path | None = None  # recorded-run fixture directory, for the `recorded` adapter
     options: dict[str, str] = {}  # extra environment for the agent process; in the fingerprint
@@ -52,6 +64,8 @@ class AgentConfig(BaseModel):
     # with its cwd set, which is weaker and is documented as such in adapters/cli_base.py. The
     # image must already contain the agent CLI, which is why Stinger cannot supply a default.
     container_image: str | None = None
+    container_image_digest: str | None = None
+    """Resolved immutable digest of ``container_image``; required for benchmark publication."""
 
     # A host directory holding the agent's credentials, mounted READ-ONLY at /credentials in
     # the container. For CLIs that authenticate from a credential file rather than from an
@@ -80,6 +94,20 @@ class AgentConfig(BaseModel):
         authentication failure would look like the agent misbehaving.
         """
         return None if value is None else Path(value).expanduser()
+
+    @field_validator("cli_version", "reasoning_effort")
+    @classmethod
+    def _nonempty_benchmark_pin(cls, value: str | None) -> str | None:
+        """Reject metadata values that are present but carry no identifying information."""
+        if value is not None and not value.strip():
+            raise ValueError("agent metadata pins must be non-empty when provided")
+        return value
+
+    @field_validator("container_image_digest")
+    @classmethod
+    def _immutable_agent_image(cls, value: str | None) -> str | None:
+        """Validate an agent image pin through the benchmark provenance contract."""
+        return BenchmarkRunMetadata(agent_container_digest=value).agent_container_digest
 
 
 class JudgeConfig(BaseModel):
@@ -112,6 +140,14 @@ class RunConfig(BaseModel):
     image: str = DEFAULT_IMAGE
     judge: JudgeConfig = JudgeConfig()
 
+    # Benchmark provenance is additive to the v1 run contract. Legacy and development runs
+    # may leave the protocol unset; `publication_pin_issues(benchmark_metadata())` then
+    # prevents such a run from being presented as benchmark evidence.
+    benchmark_protocol_version: str | None = None
+    stinger_commit: str | None = None
+    verification_image_digest: str | None = None
+    run_seed: int = Field(default=0, ge=0)
+
     # CI regression gates (SPEC.md §14). Either or both may be set; None gates nothing and
     # simply reports the number.
     #
@@ -129,6 +165,18 @@ class RunConfig(BaseModel):
     # you have chosen not to see. The report always publishes the per-family standard
     # deviation, which is the honest way to judge how much noise you actually have.
     regression_tolerance: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @field_validator("stinger_commit")
+    @classmethod
+    def _full_stinger_commit(cls, value: str | None) -> str | None:
+        """Validate the exact Stinger revision through the benchmark provenance contract."""
+        return BenchmarkRunMetadata(stinger_commit=value).stinger_commit
+
+    @field_validator("verification_image_digest")
+    @classmethod
+    def _immutable_verification_image(cls, value: str | None) -> str | None:
+        """Validate the verification image's immutable sha256 pin."""
+        return BenchmarkRunMetadata(verification_image_digest=value).verification_image_digest
 
     @classmethod
     def from_yaml(cls, path: Path) -> RunConfig:
@@ -188,8 +236,73 @@ class RunConfig(BaseModel):
             },
         )
         payload["agent"]["credential_mounted"] = self.agent.credential_mount is not None
+
+        # Additive benchmark metadata must not rewrite the identity of historical configs.
+        # When benchmark mode is absent, remove only fields at their legacy-compatible
+        # defaults. Any explicitly supplied pin still changes the fingerprint, as it should.
+        if self.benchmark_protocol_version is None:
+            payload.pop("benchmark_protocol_version")
+            if self.stinger_commit is None:
+                payload.pop("stinger_commit")
+            if self.verification_image_digest is None:
+                payload.pop("verification_image_digest")
+            if self.run_seed == 0:
+                payload.pop("run_seed")
+
+            agent_payload = payload["agent"]
+            for field in (
+                "provider",
+                "cli_version",
+                "reasoning_effort",
+                "container_image_digest",
+            ):
+                if agent_payload[field] is None:
+                    agent_payload.pop(field)
+            if not self.agent.inference_settings:
+                agent_payload.pop("inference_settings")
+            if not self.agent.version_command:
+                agent_payload.pop("version_command")
+
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def agent_configuration_fingerprint(self) -> str:
+        """Return the seed/corpus/order-independent identity used by the release matrix."""
+        return canonical_agent_configuration_fingerprint(
+            provider=self.agent.provider,
+            model_id=self.agent.model,
+            agent_adapter=self.agent.adapter,
+            agent_cli_version=self.agent.cli_version,
+            reasoning_effort=self.agent.reasoning_effort,
+            inference_settings=self.agent.inference_settings,
+            agent_container_digest=self.agent.container_image_digest,
+        )
+
+    def benchmark_metadata(self) -> BenchmarkRunMetadata | None:
+        """Resolve the report-ready provenance block for this run.
+
+        Returns:
+            ``None`` for an ordinary/legacy run that did not opt into a benchmark protocol;
+            otherwise structured benchmark metadata. Missing pins remain explicit ``None``
+            entries, and callers must inspect
+            :meth:`BenchmarkRunMetadata.publication_pin_issues` before publication.
+        """
+        if self.benchmark_protocol_version is None:
+            return None
+        return BenchmarkRunMetadata(
+            benchmark_protocol_version=self.benchmark_protocol_version,
+            provider=self.agent.provider,
+            model_id=self.agent.model,
+            agent_adapter=self.agent.adapter,
+            agent_cli_version=self.agent.cli_version,
+            reasoning_effort=self.agent.reasoning_effort,
+            inference_settings=self.agent.inference_settings,
+            stinger_commit=self.stinger_commit,
+            agent_container_digest=self.agent.container_image_digest,
+            verification_image_digest=self.verification_image_digest,
+            run_seed=self.run_seed,
+            agent_configuration_fingerprint=self.agent_configuration_fingerprint(),
+        )
 
     def resolved_json(self) -> str:
         """The full config, including paths, as it is written to `config.resolved.json`.

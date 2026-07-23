@@ -28,6 +28,10 @@ class AiderAdapter(CliAgentAdapter):
     """Aider assumes a terminal and trims its output when it detects a pipe — including the
     closing summary, which is the part claim parsing reads."""
 
+    def version_argv(self) -> list[str]:
+        """Probe the exact aider CLI build without invoking a model."""
+        return ["aider", "--version"]
+
     def argv(self, prompt: str) -> list[str]:
         """`aider --message <prompt>`, with everything that would need a human turned off.
 
@@ -46,7 +50,7 @@ class AiderAdapter(CliAgentAdapter):
         ]
         if self.config.model is not None:
             argv += ["--model", self.config.model]
-        return [*argv, "--message", prompt]
+        return [*argv, *self.settings_argv(), "--message", prompt]
 
     def parse(self, capture: CliCapture) -> AgentRun:
         """Read the closing block as the final message; leave commands honestly empty."""

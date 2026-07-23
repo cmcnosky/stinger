@@ -40,7 +40,13 @@ from stinger.adapters.base import AgentRun, Budget
 from stinger.config import AgentConfig
 from stinger.harness.sandbox import docker_argv
 
-__all__ = ["CREDENTIAL_MOUNT_PATH", "CliAgentAdapter", "CliCapture", "last_paragraph"]
+__all__ = [
+    "CREDENTIAL_MOUNT_PATH",
+    "AdapterSettingsError",
+    "CliAgentAdapter",
+    "CliCapture",
+    "last_paragraph",
+]
 
 CREDENTIAL_MOUNT_PATH = "/credentials"
 """Where `AgentConfig.credential_mount` appears inside the agent container, always."""
@@ -48,6 +54,10 @@ CREDENTIAL_MOUNT_PATH = "/credentials"
 _READ_CHUNK = 65536
 _POLL_INTERVAL_S = 0.2
 _REAP_TIMEOUT_S = 10
+
+
+class AdapterSettingsError(Exception):
+    """Raised when declared inference settings cannot be applied by an adapter."""
 
 
 class CliCapture:
@@ -103,6 +113,31 @@ class CliAgentAdapter:
         """
         raise AssertionError(f"{type(self).__name__} must implement parse()")
 
+    def version_argv(self) -> list[str]:
+        """Return the non-network CLI version probe for runtime provenance."""
+        raise AssertionError(f"{type(self).__name__} must implement version_argv()")
+
+    def settings_argv(self) -> list[str]:
+        """Translate declared reasoning/inference settings into actual CLI arguments.
+
+        Adapters inherit a fail-closed implementation. A concrete adapter may override this
+        only when its CLI has a real, testable representation for the settings.
+        """
+        if self.config.reasoning_effort is not None or self.config.inference_settings:
+            raise AdapterSettingsError(
+                f"adapter {self.name!r} cannot apply declared reasoning/inference settings; "
+                "use a supported adapter or a shell wrapper with explicit placeholders"
+            )
+        return []
+
+    def resolved_invocation_template(self) -> tuple[str, ...]:
+        """Return the exact inner argv with a non-secret prompt placeholder."""
+        return tuple(self.argv("{prompt}"))
+
+    def resolved_environment_names(self) -> tuple[str, ...]:
+        """Return environment names forwarded to the agent, never their secret values."""
+        return tuple(self._container_env_names())
+
     #: Whether this adapter needs a pseudo-terminal. CLIs that offer a machine-readable,
     #: non-interactive mode do not; ones that only ever expect a human at a terminal do.
     uses_pty = False
@@ -127,7 +162,10 @@ class CliAgentAdapter:
         except KeyError as exc:
             return self._failed(f"required environment variable {exc.args[0]!r} is not set")
 
-        argv = self.argv(prompt)
+        try:
+            argv = self.argv(prompt)
+        except AdapterSettingsError as exc:
+            return self._failed(str(exc))
         container_name: str | None = None
         if self.config.container_image is not None:
             container_name = f"stinger-agent-{uuid4().hex[:12]}"

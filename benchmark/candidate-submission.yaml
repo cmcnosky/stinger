@@ -1,0 +1,31 @@
+# Checked-in truth about the current benchmark program. This is intentionally a blocked
+# release submission: it lets `stinger benchmark release-check` enumerate unearned gates
+# without fabricating sealed-corpus, external-review, or approval records.
+
+corpus:
+  corpus_version: 0.0.0
+  corpus_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  scenarios: []
+  stored_outside_public_repository: false
+  access_logging_enabled: false
+  canary_checks_passed: false
+  frozen_before_baselines: false
+
+baselines: []
+
+pilot:
+  candidate_pool: []
+  selection_protocol_sha256: null
+
+beta_operators: []
+independent_reproduction: null
+
+release_evidence:
+  protocol_signed: false
+  protocol_frozen_before_baselines: false
+  master_gate_passed_from_clean_state: false
+  technical_report_complete: false
+  correction_policy_documented: true
+  conflicts_of_interest_disclosed: false
+
+human_approval: null

@@ -38,7 +38,78 @@ Families with no scenarios in this run: {{ missing_families | join(", ") }}.</di
 <tr><th>Config fingerprint</th><td><code>{{ report.config_fingerprint }}</code></td></tr>
 <tr><th>Generated at</th><td>{{ report.generated_at }}</td></tr>
 <tr><th>Repetitions per scenario</th><td>{{ reps }}</td></tr>
+{% if report.benchmark_metadata %}
+<tr><th>Benchmark protocol</th><td><code>{{ report.benchmark_protocol_version }}</code></td></tr>
+<tr><th>Benchmark evidence status</th>
+<td>candidate run; master release gate still required</td></tr>
+{% endif %}
 </table></div>
+
+{% if report.benchmark_metadata %}
+<h2>Benchmark provenance and uncertainty</h2>
+<div class="warn">This run carries benchmark-protocol metadata, but this report alone does
+<strong>not</strong> establish benchmark publication eligibility. Corpus review,
+baseline-matrix, leakage, external reproduction, and human release gates are checked
+separately.</div>
+<div class="scroll"><table>
+<tr><th>Provider</th><td><code>{{ report.benchmark_metadata.provider or "missing" }}</code></td></tr>
+<tr><th>Model</th><td><code>{{ report.benchmark_metadata.model_id or "missing" }}</code></td></tr>
+<tr><th>Agent adapter / CLI</th><td><code>{{ report.benchmark_metadata.agent_adapter or "missing" }}
+/ {{ report.benchmark_metadata.agent_cli_version or "missing" }}</code></td></tr>
+<tr><th>Agent configuration fingerprint</th>
+<td><code>{{ report.benchmark_metadata.agent_configuration_fingerprint or "missing" }}</code></td></tr>
+<tr><th>Reasoning effort</th>
+<td><code>{{ report.benchmark_metadata.reasoning_effort or "missing" }}</code></td></tr>
+<tr><th>Inference settings</th>
+<td><code>{{ report.benchmark_metadata.inference_settings }}</code></td></tr>
+<tr><th>Stinger commit</th>
+<td><code>{{ report.benchmark_metadata.stinger_commit or "missing" }}</code></td></tr>
+<tr><th>Agent image digest</th>
+<td><code>{{ report.benchmark_metadata.agent_container_digest or "missing" }}</code></td></tr>
+<tr><th>Verification image digest</th>
+<td><code>{{ report.benchmark_metadata.verification_image_digest or "missing" }}</code></td></tr>
+<tr><th>Fixed run seed</th><td>{{ report.benchmark_metadata.run_seed }}</td></tr>
+{% if report.benchmark_runtime_provenance %}
+<tr><th>Runtime provenance</th>
+<td>{{ "mechanically verified" if report.benchmark_runtime_provenance.verified else "unverified" }}</td></tr>
+<tr><th>Observed CLI version</th>
+<td><code>{{ report.benchmark_runtime_provenance.agent_cli_version or "missing" }}</code></td></tr>
+<tr><th>Observed agent image ID</th>
+<td><code>{{ report.benchmark_runtime_provenance.agent_container_image_id or "missing" }}</code></td></tr>
+<tr><th>Observed verification image ID</th>
+<td><code>{{ report.benchmark_runtime_provenance.verification_image_id or "missing" }}</code></td></tr>
+{% else %}
+<tr><th>Runtime provenance</th><td>missing</td></tr>
+{% endif %}
+</table></div>
+<p><code>Provider</code> is the canonical provider requested by the local configuration,
+not a provider-side attestation. Runtime verification is local and performs no network
+call.</p>
+{% if benchmark_pin_issues %}
+<div class="warn"><strong>Publication pin gaps:</strong>
+<code>{{ benchmark_pin_issues | join(", ") }}</code>.</div>
+{% endif %}
+{% if report.benchmark_statistics %}
+<p>Cluster-aware uncertainty uses
+<code>{{ report.benchmark_statistics.method }}</code> with
+{{ report.benchmark_statistics.overall_interval.bootstrap_samples }} bootstrap samples.
+Repetitions remain nested within scenarios and are not counted as independent tasks.</p>
+<div class="scroll"><table>
+<tr><th>Scope</th><th>Estimate and interval</th><th>Defined draws</th><th>n/a draws</th></tr>
+<tr><td>Overall</td><td>{{ benchmark_overall_interval }}</td>
+<td>{{ report.benchmark_statistics.overall_interval.defined_bootstrap_samples }}</td>
+<td>{{ report.benchmark_statistics.overall_interval.n_a_bootstrap_samples }}</td></tr>
+{% for row in benchmark_family_intervals %}
+<tr><td>{{ row.family }}</td><td>{{ row.interval }}</td><td>{{ row.defined }}</td>
+<td>{{ row.not_applicable }}</td></tr>
+{% endfor %}
+</table></div>
+{% else %}
+<div class="warn"><strong>No benchmark confidence interval is reported.</strong> Every scored
+result must carry an explicit conceptual <code>cluster_id</code>; missing cluster metadata
+fails closed at the publication gate.</div>
+{% endif %}
+{% endif %}
 
 <h2>Family scores</h2>
 <p><code>integrity_rate = honest / (honest + cheated)</code>. Refusals, honest failures and

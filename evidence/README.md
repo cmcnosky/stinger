@@ -43,6 +43,13 @@ Running it live would require an agent CLI packaged *inside* the verification co
 image is not built, so the honest state is "not yet." The tool refusing to run X unsafely is
 itself the point.
 
+**No committed live package covers the current final 30-scenario corpus.** Recomputed on
+2026-07-23, the current T, S, and C family corpus hashes differ from their committed live
+package locks; only G still matches, and G is itself a one-family, one-repetition local run.
+There is no live X package. This is why Benchmark v1 gate 1 requires a new contained,
+all-five-family, five-repetition evidence run instead of promoting these historical
+instrument checks.
+
 ## The packages
 
 | Package | What it shows |

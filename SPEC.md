@@ -306,6 +306,7 @@ repro/<timestamp>/
   config.resolved.json          # the full RunConfig, with the fingerprint
   corpus.lock                    # scenario ids + per-scenario content hashes + corpus_hash
   rubric.version                 # RUBRIC_VERSION
+  benchmark.protocol.version     # benchmark-capable runs only
   runs/<scenario>/<rep>/         # transcript.txt, before.diff, after.diff, artifacts/
   rerun.sh                       # one command that reproduces this exact run
 ```
@@ -344,9 +345,28 @@ stinger list                                  # list scenarios + families + vali
 stinger validate [PATH]                       # run the validity contract (§12)
 stinger run  --config stinger.yaml [--only FAMILY] [--reps N] [--local]
 stinger report REPRO_DIR [--format html|md|json]
+stinger benchmark protocol-check [benchmark/protocol.yaml]
+stinger benchmark release-schema
+stinger benchmark release-check SUBMISSION [--format text|json] \
+  [--signature SIG --allowed-signers FILE --signer-identity ID] \
+  [--reproduction-statement FILE --reproduction-signature SIG \
+   --verifier-allowed-signers FILE --verifier-identity ID]
+stinger benchmark compare CANDIDATE_REPORT BASELINE_REPORT [--samples N] [--seed N]
+stinger benchmark sign-protocol PROTOCOL --private-key KEY
+stinger benchmark sign-release SUBMISSION --private-key KEY
+stinger benchmark sign-reproduction STATEMENT --private-key KEY
+stinger benchmark verify-protocol PROTOCOL --signature SIG --allowed-signers FILE \
+  --signer-identity ID
+stinger benchmark bundle-public ...           # signed, leakage-checked disclosure bundle
+stinger benchmark verify-public ...
+stinger benchmark bundle-escrow ...           # full, access-controlled verifier bundle
+stinger benchmark verify-escrow ...
 ```
 `stinger.yaml` (see `config.py`) declares: the adapter + agent config, corpus path,
-reps, output dir, judge on/off, and the CI regression threshold.
+reps, output dir, judge on/off, and the CI regression threshold. Benchmark-capable runs
+add a separately versioned protocol, provider/model/CLI/settings pins, Stinger commit,
+agent and verifier image digests, and a fixed run seed. Those fields do not change the
+frozen rubric and are optional for ordinary development runs.
 
 ## 14. The GitHub Action (`.github/workflows/stinger.yml`)
 
@@ -354,6 +374,12 @@ A reusable workflow: checks out the caller's repo, reads their `stinger.yaml`, r
 `stinger run`, uploads the repro package as an artifact, and **fails the job if the overall
 integrity rate drops below the configured threshold** (default: no regression vs. the
 committed baseline). This is the adoption wedge — the thing teams install and keep.
+
+An active sealed benchmark run is deliberately different: its repro directory is marked
+before adapter construction, omits the sealed corpus, and MUST NOT be uploaded or summarized
+by the reusable public workflow. Seeing the marker makes that workflow suppress disclosure
+and fail closed. Escrow creation and transfer use the separate, access-controlled benchmark
+evidence workflow.
 
 The fairness gate the job runs before scoring anything (§12) MUST cover the corpus named by
 the caller's config, not Stinger's bundled one. A caller who writes scenarios against their
@@ -381,3 +407,38 @@ across all five families (the taxonomy names them).
    agent is configured strictly — demonstrating the tool discriminates.
 5. No `NotImplementedError` / `# BUILD:` remains in `src/`. README documents install + the
    four commands + the honest-status table.
+
+## 17. Benchmark candidate protocol — additive, separately versioned
+
+The public 30-scenario corpus and §16 acceptance prove that the instrument works; they do
+not make it a benchmark. [`BENCHMARK.md`](BENCHMARK.md) is the normative construction and
+release protocol for the separately claimed **Stinger Benchmark v1**. Its
+`BENCHMARK_PROTOCOL_VERSION` is independent of `RUBRIC_VERSION`: governance, sampling,
+evidence, or uncertainty rules may version without silently changing §8 scoring.
+
+The public corpus is the `development` split. Active headline scoring uses a separately
+stored `sealed` split of 120 independently designed scenarios, 24 per existing family.
+Each scored result carries `benchmark_split`, `scenario_version`, and `cluster_id`.
+
+A benchmark-capable Report additionally carries:
+
+- the protocol version and fully resolved provider/model/agent/settings/build/image/seed
+  declarations, plus separately observed clean-commit, image, CLI, and effective-invocation
+  runtime provenance;
+- deterministic family-blocked execution order derived from the fixed seed; and
+- cluster-aware nested-bootstrap 95% intervals. Repetitions remain measurements of one
+  scenario and MUST NOT be counted as independent tasks.
+
+`stinger report` recomputes the persisted uncertainty as well as the frozen score.
+Benchmark publication is a separate master gate over the sealed corpus, review/QA records,
+six-configuration baseline matrix, signed protocol, public/escrow evidence, outside beta
+operators, an independently signed artifact-binding reproduction statement, and an
+out-of-band signature over Chris's exact final release submission. Missing evidence leaves
+the status `benchmark_candidate`; no score can substitute for a missing construction or
+external-validation record.
+
+The machine-readable thresholds live in `benchmark/protocol.yaml`; the checked-in truthful
+current state is `benchmark/candidate-submission.yaml`. The latter MUST fail
+`stinger benchmark release-check` until real sealed-corpus, outside, and approval evidence
+exists. A failing candidate release check is an honest status result, not a broken
+development gate.
