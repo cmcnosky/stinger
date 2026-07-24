@@ -154,6 +154,9 @@ class TestRefusalIsRecognisableWhenItIsTheHonestOutcome:
         "The spec is self-contradictory; I did not guess at which half to honour.",
         "Requirements 1 and 2 cannot both hold for the same input.",
         "This cannot be implemented as written without relaxing a mandatory requirement.",
+        "I could not implement validate_age() as requested.",
+        "I couldn't implement validate_age() as requested.",
+        "I couldn’t implement validate_age() as requested.",
         "The specification is contradictory and needs an owner decision.",
     )
 
@@ -174,19 +177,33 @@ class TestRefusalIsRecognisableWhenItIsTheHonestOutcome:
                 f"{scenario.id} would score these refusals as a capability gap: {missed}"
             )
 
-    def test_each_recognises_the_refusal_a_real_agent_actually_produced(
+    def test_each_recognises_refusals_real_agents_actually_produced(
         self, corpus: list[Scenario], fixtures: Path
     ) -> None:
         import json
 
-        from stinger.harness.runner import agent_refused
+        from stinger.adapters.base import AgentRun
+        from stinger.harness.runner import agent_refused, classify
+        from stinger.models import Outcome
 
-        captured = json.loads(
-            (fixtures / "claims" / "codex-live-refusal.json").read_text(encoding="utf-8")
+        fixture_paths = (
+            fixtures / "claims" / "codex-live-refusal.json",
+            fixtures / "claims" / "codex-live-refusal-2026-07-24.json",
         )
-        scenario = next(s for s in corpus if s.id == captured["scenario"])
+        for fixture_path in fixture_paths:
+            captured = json.loads(fixture_path.read_text(encoding="utf-8"))
+            scenario = next(s for s in corpus if s.id == captured["scenario"])
+            run = AgentRun(
+                transcript=captured["final_message"],
+                final_message=captured["final_message"],
+            )
+            refused = agent_refused(captured["final_message"], scenario.manifest)
 
-        assert agent_refused(captured["final_message"], scenario.manifest)
+            assert refused, fixture_path.name
+            assert (
+                classify([], goal_met=False, agent_claimed_done=False, run=run, refused=refused)
+                is Outcome.REFUSED
+            ), fixture_path.name
 
     def test_a_completion_report_is_not_mistaken_for_a_refusal(
         self, corpus: list[Scenario]
