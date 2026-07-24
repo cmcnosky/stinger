@@ -8,7 +8,13 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from stinger.benchmark.protocol import (
+    BenchmarkRunMetadata,
+    BenchmarkRuntimeProvenance,
+    BenchmarkSplit,
+)
 
 
 class Outcome(StrEnum):
@@ -74,6 +80,16 @@ class ScenarioResult(BaseModel):
     diff_path: str
     duration_s: float
     repetition: int
+    run_error: str | None = None
+    benchmark_split: BenchmarkSplit | None = None
+    scenario_version: str | None = None
+    cluster_id: str | None = None
+
+    @field_validator("run_error")
+    @classmethod
+    def _nonblank_run_error(cls, value: str | None) -> str | None:
+        """Treat empty adapter/harness text as absent evidence, never an ERROR reason."""
+        return None if value is not None and not value.strip() else value
 
 
 class FamilyScore(BaseModel):
@@ -97,6 +113,31 @@ class JudgeReport(BaseModel):
     needs_review: list[str]  # scenario ids the judge flagged despite a mechanical 'honest'
 
 
+class BenchmarkInterval(BaseModel):
+    """One cluster-bootstrap estimate stored in a benchmark-capable report."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    estimate: float | None
+    lower: float | None
+    upper: float | None
+    confidence_level: float = Field(gt=0.0, lt=1.0)
+    bootstrap_samples: int = Field(gt=0)
+    defined_bootstrap_samples: int = Field(ge=0)
+    n_a_bootstrap_samples: int = Field(ge=0)
+
+
+class BenchmarkStatistics(BaseModel):
+    """Cluster-aware uncertainty attached to one pinned benchmark run."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    method: str = "stratified_nested_cluster_bootstrap_v1"
+    seed: int = Field(ge=0)
+    family_intervals: dict[Family, BenchmarkInterval]
+    overall_interval: BenchmarkInterval
+
+
 class Report(BaseModel):
     """The Integrity Report (SPEC.md §4, §10)."""
 
@@ -109,3 +150,7 @@ class Report(BaseModel):
     overall_integrity_rate: float | None
     partial: bool = False  # True unless all five families are present
     judge_assisted: JudgeReport | None = None
+    benchmark_protocol_version: str | None = None
+    benchmark_metadata: BenchmarkRunMetadata | None = None
+    benchmark_runtime_provenance: BenchmarkRuntimeProvenance | None = None
+    benchmark_statistics: BenchmarkStatistics | None = None

@@ -37,6 +37,9 @@ if grep -rnE --exclude-dir=__pycache__ --binary-files=without-match "NotImplemen
   exit 1
 fi
 
+echo "==> benchmark protocol structure (BENCHMARK.md)"
+python -m stinger.cli benchmark protocol-check benchmark/protocol.yaml
+
 echo "==> validity contract over the corpus (SPEC.md §12)"
 python -m stinger.cli validate scenarios/
 

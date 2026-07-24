@@ -8,10 +8,16 @@ text when the stream is not JSON, with an empty command list rather than a guess
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from stinger.adapters.base import AgentRun
-from stinger.adapters.cli_base import CliAgentAdapter, CliCapture, last_paragraph
+from stinger.adapters.cli_base import (
+    AdapterSettingsError,
+    CliAgentAdapter,
+    CliCapture,
+    last_paragraph,
+)
 
 __all__ = ["CodexAdapter"]
 
@@ -21,11 +27,37 @@ name has moved between CLI versions and reading only the current one would silen
 command log on an older or newer build — which `command_scan` must never mistake for a clean
 run."""
 
+_CONFIG_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
+
 
 class CodexAdapter(CliAgentAdapter):
     """Drive the Codex CLI non-interactively over one scenario prompt."""
 
     name = "codex"
+
+    def version_argv(self) -> list[str]:
+        """Probe the exact Codex CLI build without invoking a model."""
+        return ["codex", "--version"]
+
+    def settings_argv(self) -> list[str]:
+        """Apply requested settings through Codex CLI config overrides."""
+        settings = dict(self.config.inference_settings)
+        if self.config.reasoning_effort is not None:
+            if "model_reasoning_effort" in settings:
+                raise AdapterSettingsError(
+                    "reasoning_effort duplicates inference_settings.model_reasoning_effort"
+                )
+            settings["model_reasoning_effort"] = self.config.reasoning_effort
+
+        argv: list[str] = []
+        for key in sorted(settings):
+            if _CONFIG_KEY.fullmatch(key) is None:
+                raise AdapterSettingsError(
+                    f"Codex inference setting key {key!r} is not a valid CLI config key"
+                )
+            value = json.dumps(settings[key], sort_keys=True, separators=(",", ":"))
+            argv += ["--config", f"{key}={value}"]
+        return argv
 
     def argv(self, prompt: str) -> list[str]:
         """`codex exec --json <prompt>`, confined to the prepared workdir.
@@ -65,7 +97,7 @@ class CodexAdapter(CliAgentAdapter):
         ]
         if self.config.model is not None:
             argv += ["--model", self.config.model]
-        return [*argv, prompt]
+        return [*argv, *self.settings_argv(), prompt]
 
     def parse(self, capture: CliCapture) -> AgentRun:
         """Recover the final message and executed commands from the JSONL event stream."""

@@ -13,6 +13,62 @@
 | Config fingerprint | `{{ report.config_fingerprint }}` |
 | Generated at | {{ report.generated_at }} |
 | Repetitions per scenario | {{ reps }} |
+{% if report.benchmark_metadata %}
+| Benchmark protocol | `{{ report.benchmark_protocol_version }}` |
+| Benchmark evidence status | candidate run; master release gate still required |
+{% endif %}
+
+{% if report.benchmark_metadata %}
+## Benchmark provenance and uncertainty
+
+This run carries benchmark-protocol metadata, but this report alone does **not** establish
+benchmark publication eligibility. Corpus review, baseline-matrix, leakage, external
+reproduction, and human release gates are checked separately.
+
+| Pin | Value |
+|---|---|
+| Provider | `{{ report.benchmark_metadata.provider or "missing" }}` |
+| Model | `{{ report.benchmark_metadata.model_id or "missing" }}` |
+| Agent adapter / CLI | `{{ report.benchmark_metadata.agent_adapter or "missing" }}` / `{{ report.benchmark_metadata.agent_cli_version or "missing" }}` |
+| Agent configuration fingerprint | `{{ report.benchmark_metadata.agent_configuration_fingerprint or "missing" }}` |
+| Reasoning effort | `{{ report.benchmark_metadata.reasoning_effort or "missing" }}` |
+| Inference settings | `{{ report.benchmark_metadata.inference_settings }}` |
+| Stinger commit | `{{ report.benchmark_metadata.stinger_commit or "missing" }}` |
+| Agent image digest | `{{ report.benchmark_metadata.agent_container_digest or "missing" }}` |
+| Verification image digest | `{{ report.benchmark_metadata.verification_image_digest or "missing" }}` |
+| Fixed run seed | {{ report.benchmark_metadata.run_seed }} |
+{% if report.benchmark_runtime_provenance %}
+| Runtime provenance | {{ "mechanically verified" if report.benchmark_runtime_provenance.verified else "unverified" }} |
+| Observed CLI version | `{{ report.benchmark_runtime_provenance.agent_cli_version or "missing" }}` |
+| Observed agent image ID | `{{ report.benchmark_runtime_provenance.agent_container_image_id or "missing" }}` |
+| Observed verification image ID | `{{ report.benchmark_runtime_provenance.verification_image_id or "missing" }}` |
+{% else %}
+| Runtime provenance | missing |
+{% endif %}
+
+`Provider` is the canonical provider requested by the local configuration, not a
+provider-side attestation. Runtime verification is local and performs no network call.
+
+{% if benchmark_pin_issues %}
+**Publication pin gaps:** `{{ benchmark_pin_issues | join("`, `") }}`.
+{% endif %}
+{% if report.benchmark_statistics %}
+Cluster-aware uncertainty uses `{{ report.benchmark_statistics.method }}` with
+{{ report.benchmark_statistics.overall_interval.bootstrap_samples }} bootstrap samples.
+Repetitions remain nested within scenarios and are not counted as independent tasks.
+
+| Scope | Estimate and interval | Defined draws | n/a draws |
+|---|---|---:|---:|
+| Overall | {{ benchmark_overall_interval }} | {{ report.benchmark_statistics.overall_interval.defined_bootstrap_samples }} | {{ report.benchmark_statistics.overall_interval.n_a_bootstrap_samples }} |
+{% for row in benchmark_family_intervals %}
+| {{ row.family }} | {{ row.interval }} | {{ row.defined }} | {{ row.not_applicable }} |
+{% endfor %}
+{% else %}
+**No benchmark confidence interval is reported.** Every scored result must carry an explicit
+conceptual `cluster_id`; missing cluster metadata fails closed at the publication gate.
+{% endif %}
+
+{% endif %}
 
 ## Family scores
 
@@ -50,6 +106,9 @@ Every outcome below links to the transcript and diff captured for it.
 {% for result in report.results %}
 - `{{ result.scenario_id }}` rep {{ result.repetition }} — **{{ result.outcome }}**
   (goal_met={{ result.goal_met }}, claimed_done={{ result.agent_claimed_done }})
+{% if result.run_error %}
+  - run error: {{ result.run_error }}
+{% endif %}
 {% for detector in result.detector_results %}
   - `{{ detector.detector }}`: {{ detector | verdict_word }} — {{ detector.evidence }}
 {% endfor %}

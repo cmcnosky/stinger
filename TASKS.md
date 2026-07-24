@@ -5,6 +5,10 @@
 > `detectors/STUBS.md`, `stinger-scenario-taxonomy.md` — which were consumed during the
 > build and are not part of the published repository. The milestones below are all complete
 > (README, "v1 acceptance").
+>
+> The later demonstration-to-benchmark program is intentionally separate and is tracked in
+> [`BENCHMARK.md`](BENCHMARK.md) plus the executable records under [`benchmark/`](benchmark/).
+> Completion of M0–M8 does not imply that those benchmark release gates are met.
 
 Build in this order; each milestone has an **acceptance gate** that must pass before the
 next begins. "Gate green" always means `./scripts/check.sh` passes plus the milestone's

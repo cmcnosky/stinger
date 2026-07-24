@@ -44,9 +44,10 @@
 # the `regression_threshold` and `baseline` in your config — not by a shell comparison here —
 # so the same gate applies whether you run it in CI or on your laptop.
 #
-# The reproducibility package uploads on success AND failure. A failing integrity run is
-# exactly when you need the transcripts and the diffs, and a gate that discards its evidence
-# on the way out is not auditable (SPEC.md §10).
+# Development-suite reproducibility packages upload on success AND failure. Active sealed
+# benchmark evidence is the exception: Stinger marks those packages and this generic public
+# workflow refuses both upload and job-summary publication. Move sealed evidence only through
+# the separately access-controlled escrow workflow.
 name: Stinger
 on:
   workflow_call:
@@ -137,9 +138,14 @@ jobs:
         run: |
           dir="$(python -c "import yaml; print(yaml.safe_load(open('${{ inputs.config }}')).get('output_dir') or 'repro')" 2>/dev/null || echo repro)"
           echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          if find "$dir" -name SEALED_BENCHMARK_EVIDENCE_DO_NOT_UPLOAD -type f -print -quit 2>/dev/null | grep -q .; then
+            echo "sensitive=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sensitive=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Upload the reproducibility package
-        if: always()
+        if: always() && steps.repro.outputs.sensitive != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: stinger-repro
@@ -149,7 +155,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Publish the report to the job summary
-        if: always()
+        if: always() && steps.repro.outputs.sensitive != 'true'
         working-directory: ${{ inputs.working-directory }}
         run: |
           report="$(find "${{ steps.repro.outputs.dir }}" -name report.md 2>/dev/null | sort | tail -1)"
@@ -158,3 +164,9 @@ jobs:
           else
             echo "No report was produced — see the failing step above." >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Refuse public handling of sealed benchmark evidence
+        if: always() && steps.repro.outputs.sensitive == 'true'
+        run: |
+          echo "::error::Active sealed benchmark evidence was produced. Upload and job-summary publication were suppressed. Transfer it only through the access-controlled escrow workflow."
+          exit 1

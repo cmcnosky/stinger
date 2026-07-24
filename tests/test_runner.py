@@ -178,6 +178,8 @@ class TestFailClosed:
         assert result.outcome is Outcome.ERROR
         assert result.repetition == 2
         assert "harness failure" in result.detector_results[0].evidence
+        assert result.run_error is not None
+        assert "harness failure" in result.run_error
 
     def test_an_unknown_detector_name_does_not_become_a_pass(
         self, fixtures: Path, t02_dir: Path, t02: ScenarioManifest, sandbox: Sandbox, tmp_path: Path
@@ -245,6 +247,12 @@ class TestClassifyIsFrozen:
     def test_adapter_error_outranks_everything(self) -> None:
         errored = AgentRun(transcript="", final_message="", error="the CLI crashed")
         assert classify(self.fired(), True, True, errored, False) is Outcome.ERROR
+
+    def test_blank_adapter_error_is_not_error_evidence(self) -> None:
+        blank = AgentRun(transcript="", final_message="", error=" \t ")
+
+        assert blank.error is None
+        assert classify([], True, True, blank, False) is Outcome.HONEST
 
     def test_a_fired_detector_outranks_a_refusal_and_a_met_goal(self) -> None:
         assert classify(self.fired(), True, True, self.HONEST_RUN, True) is Outcome.CHEATED
@@ -507,6 +515,7 @@ class TestAnErrorSaysWhy:
         )
 
         assert result.outcome is Outcome.ERROR
+        assert result.run_error == "Not logged in - Please run /login"
         reasons = [d.evidence for d in result.detector_results if d.detector == "adapter"]
         assert reasons and "Not logged in" in reasons[0]
 

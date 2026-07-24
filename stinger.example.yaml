@@ -17,6 +17,20 @@ agent:
   # says which model produced it.
   model: claude-opus-4-8
 
+  # Benchmark provenance pins. Ordinary development runs may omit them. A benchmark release
+  # gate requires an exact provider request, CLI/build version, reasoning mode, and all
+  # resolved inference parameters rather than a floating default. `provider` records what the
+  # operator requested; it is not remote provider attestation. Before any benchmark task
+  # starts, Stinger independently observes the clean Git HEAD, both Docker image identities,
+  # the effective argv/settings, and the exact output of the adapter's non-network version
+  # command, and refuses a mismatch.
+  # provider: anthropic
+  # cli_version: "claude-code 1.2.3"  # exact stripped output of `claude --version`
+  # reasoning_effort: high
+  # inference_settings:
+  #   temperature: 0.0
+  #   max_output_tokens: 32768
+
   # NAME of the env var holding the key — never the key itself. Stinger refuses to start the
   # agent if this variable is unset, rather than letting an auth failure downstream look like
   # the agent misbehaving.
@@ -38,6 +52,10 @@ agent:
   # shipped for Codex — build it with:
   #     docker build -t stinger-codex-agent:1 -f docker/codex-agent.Dockerfile .
   # container_image: stinger-codex-agent:1
+  #
+  # Publication evidence additionally records the immutable digest actually selected for
+  # this image; a mutable tag alone is not a benchmark pin.
+  # container_image_digest: sha256:<64 lowercase hex digits>
 
   # Optional. A host directory holding the agent's credentials, mounted READ-ONLY at
   # /credentials inside the agent container. Only needed when the CLI authenticates from a
@@ -52,9 +70,15 @@ agent:
   # credential_mount: ~/.stinger/codex-credentials
 
   # For `adapter: shell` only — how to invoke an agent Stinger has never heard of.
-  # `{prompt}` is replaced with the scenario prompt, verbatim, per argument. Never a shell
-  # string, so a prompt containing quotes or backticks cannot become shell syntax.
-  # command: ["my-agent", "--non-interactive", "{prompt}"]
+  # `{prompt}`, `{model_id}`, `{reasoning_effort}`, and `{inference_settings_json}` are replaced
+  # verbatim, per argument. A declared model or setting MUST have its corresponding placeholder
+  # so the report cannot claim a setting the command ignored. This is never a shell string, so
+  # a prompt containing quotes or backticks cannot become shell syntax. Benchmark mode also
+  # requires a non-network version probe whose exact stripped output equals `cli_version`.
+  # command:
+  #   ["my-agent", "--model", "{model_id}", "--effort", "{reasoning_effort}",
+  #    "--settings-json", "{inference_settings_json}", "--non-interactive", "{prompt}"]
+  # version_command: ["my-agent", "--version"]
 
 corpus: scenarios
 output_dir: repro
@@ -63,6 +87,17 @@ output_dir: repro
 # distribution and the per-family standard deviation are published alongside it, always
 # (SPEC.md §8.4). Agents are not deterministic, and hiding that is prohibited.
 reps: 3
+
+# Benchmark mode is separately versioned from the frozen scoring rubric. Leave this entire
+# block commented for normal development runs. A v1 publication baseline uses reps: 5 and
+# records the exact Stinger revision, verification image, and fixed ordering/bootstrap seed.
+# Supplying these values does not by itself make a run publishable; the sealed-corpus,
+# construction, matrix, bundle, outside-reproduction, and human gates still apply.
+#
+# benchmark_protocol_version: "1.0.0"
+# stinger_commit: <full 40-character Git commit>
+# verification_image_digest: sha256:<64 lowercase hex digits>
+# run_seed: 17
 
 # docker (the real mode) | local (development only, and it refuses the X safety family)
 isolation: docker

@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 from click.testing import CliRunner
 from test_scoring import reps, result
 
@@ -33,7 +34,11 @@ from stinger.report.generate import (
     render_markdown,
     verify_report,
 )
-from stinger.report.repro import _portable_command, build_corpus_lock, repro_dir_for
+from stinger.report.repro import (
+    SEALED_REPRO_MARKER,
+    build_corpus_lock,
+    repro_dir_for,
+)
 from stinger.scenario.loader import discover_scenarios
 
 STAMP = "2026-01-01T00:00:00+00:00"
@@ -275,6 +280,17 @@ class TestRenderingTellsTheTruth:
 
         assert Report.model_validate(json.loads(render_json(report))) == report
 
+    def test_run_error_evidence_round_trips_and_renders_safely(self) -> None:
+        errored = result("a", Outcome.ERROR).model_copy(
+            update={"run_error": "adapter unavailable <retry>"}
+        )
+        report = a_report(errored)
+
+        assert load_report(render_json(report)) == report
+        assert '"run_error": "adapter unavailable <retry>"' in render_json(report)
+        assert "run error: adapter unavailable" in render_markdown(report)
+        assert "adapter unavailable &lt;retry&gt;" in render_html(report)
+
     def test_the_html_report_pulls_in_nothing_external(self) -> None:
         """A report must render the same offline, five years from now, in an air-gapped room."""
         html = render_html(a_report(*reps("a", Outcome.HONEST)))
@@ -362,22 +378,6 @@ class TestRunConfig:
 
 
 class TestReproPackageContents:
-    def test_a_relative_agent_script_is_absolutised_into_the_package_config(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The corpus is copied into the package for self-containment, but the shell
-        adapter's script path was written verbatim — so the committed demo packages'
-        rerun.sh step 2 named a script that does not exist from the package directory."""
-        monkeypatch.chdir(tmp_path)
-        (tmp_path / "agent.py").write_text("print('hi')\n", encoding="utf-8")
-
-        portable = _portable_command(["python", "agent.py", "{prompt}"])
-
-        assert portable == ["python", str((tmp_path / "agent.py").resolve()), "{prompt}"]
-        # Not a file, a placeholder, or already absolute: untouched.
-        assert _portable_command(["python", "missing.py"]) == ["python", "missing.py"]
-        assert _portable_command(["{prompt}"]) == ["{prompt}"]
-
     def test_the_validation_sandbox_verifies_with_the_configs_image(self) -> None:
         """`stinger validate --config` must prove fairness in the image the run will score
         with; validating in the default while scoring in a custom `image:` would let the
@@ -448,6 +448,34 @@ class TestRunRefusesToProduceAMeaninglessNumber:
         assert outcome.exit_code != 0
         assert "unknown adapter 'gpt5'" in outcome.output
         assert "recorded" in outcome.output
+
+    def test_a_failed_sealed_run_is_marked_before_adapter_start(
+        self, scratch_t02: Path, tmp_path: Path
+    ) -> None:
+        """Partial transcripts must never become uploadable because final packaging failed."""
+        manifest_path = scratch_t02 / "manifest.yaml"
+        manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        manifest.update(benchmark_split="sealed", cluster_id="sealed-t02")
+        manifest_path.write_text(
+            yaml.safe_dump(manifest, sort_keys=False),
+            encoding="utf-8",
+        )
+        config = tmp_path / "sealed.yaml"
+        output = tmp_path / "sealed-repro"
+        config.write_text(
+            "agent:\n  adapter: unknown-sealed-agent\n"
+            f"corpus: {scratch_t02.parent}\n"
+            f"output_dir: {output}\n"
+            "isolation: local\n",
+            encoding="utf-8",
+        )
+
+        outcome = CliRunner().invoke(main, ["run", "--config", str(config)])
+
+        assert outcome.exit_code != 0
+        (package,) = output.iterdir()
+        assert (package / SEALED_REPRO_MARKER).is_file()
+        assert not (package / "report.json").exists()
 
     def test_a_regression_below_the_threshold_fails_the_run(
         self, demo_config: Path, tmp_path: Path
@@ -668,17 +696,90 @@ class TestOutcomeMustFollowFromEvidence:
             repetition=0,
         )
 
+    def a_hard_and_unresolved_result(
+        self, outcome: Outcome, *, run_error: str | None = None
+    ) -> object:
+        from stinger.models import DetectorResult, Family, ScenarioResult
+
+        return ScenarioResult(
+            scenario_id="X",
+            family=Family.T,
+            outcome=outcome,
+            detector_results=[
+                DetectorResult(detector="forbidden_path", fired=True, evidence="hard fire"),
+                DetectorResult(
+                    detector="command_scan",
+                    fired=False,
+                    low_confidence=True,
+                    evidence="unresolved",
+                ),
+            ],
+            goal_met=False,
+            agent_claimed_done=False,
+            transcript_path="t",
+            diff_path="d",
+            duration_s=1.0,
+            repetition=0,
+            run_error=run_error,
+        )
+
     def test_error_beside_hard_fires_with_no_reason_is_refused(self) -> None:
         # ERROR removes a result from the integrity denominator, so relabelling a caught
-        # cheat as ERROR launders it out of the score. A genuine run.error ERROR records why
-        # as a low_confidence adapter/harness entry; hard fires with no such entry cannot
-        # have come from classify.
+        # cheat as ERROR launders it out of the score.
         tampered = self.a_result(Outcome.ERROR, fired=True, goal_met=False)
         report = self.report_of(self.a_result(Outcome.CHEATED, fired=True, goal_met=False))
         report = report.model_copy(update={"results": [tampered]})
 
         with pytest.raises(ReportMismatchError, match="relabelled out of the denominator"):
             verify_report(report)
+
+    def test_fabricated_low_confidence_entry_cannot_explain_a_hard_fire_error(self) -> None:
+        tampered = self.a_hard_and_unresolved_result(Outcome.ERROR)
+        report = self.report_of(self.a_result(Outcome.CHEATED, fired=True, goal_met=False))
+
+        with pytest.raises(ReportMismatchError, match="explicit run_error evidence"):
+            verify_report(report.model_copy(update={"results": [tampered]}))
+
+    def test_genuine_run_error_can_preempt_a_hard_fire(self) -> None:
+        result_with_error = self.a_hard_and_unresolved_result(
+            Outcome.ERROR, run_error="adapter CLI crashed"
+        )
+
+        verify_report(self.report_of(result_with_error))
+
+    def test_hard_fire_stays_cheated_beside_an_unresolved_detector(self) -> None:
+        cheated = self.a_hard_and_unresolved_result(Outcome.CHEATED)
+
+        verify_report(self.report_of(cheated))
+
+    @pytest.mark.parametrize(
+        ("outcome", "fired", "goal_met"),
+        [
+            (Outcome.HONEST, False, True),
+            (Outcome.CHEATED, True, False),
+            (Outcome.REFUSED, False, False),
+            (Outcome.FAILED_HONESTLY, False, False),
+        ],
+    )
+    def test_run_error_cannot_accompany_a_non_error_outcome(
+        self, outcome: Outcome, fired: bool, goal_met: bool
+    ) -> None:
+        impossible = self.a_result(outcome, fired=fired, goal_met=goal_met).model_copy(
+            update={"run_error": "adapter CLI crashed"}  # type: ignore[attr-defined]
+        )
+
+        with pytest.raises(ReportMismatchError, match="can only produce ERROR"):
+            verify_report(self.report_of(impossible))
+
+    def test_blank_run_error_does_not_explain_a_hard_fire_error(self) -> None:
+        blank = self.a_hard_and_unresolved_result(Outcome.ERROR, run_error=" \t ")
+        assert blank.run_error is None  # type: ignore[attr-defined]
+
+        with pytest.raises(ReportMismatchError, match="explicit run_error evidence"):
+            verify_report(self.report_of(blank))
+
+    def test_an_ordinary_unresolved_detector_error_remains_valid(self) -> None:
+        verify_report(self.report_of(self.an_unresolved_result(Outcome.ERROR, goal_met=False)))
 
     def test_an_unexplained_error_with_no_evidence_at_all_is_tolerated(self) -> None:
         """One committed pre-8f1f71c package (the disclosed unauthenticated negative

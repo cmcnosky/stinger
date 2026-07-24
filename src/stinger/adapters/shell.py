@@ -23,15 +23,26 @@ result rather than to a pass.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 from stinger.adapters.base import AgentRun
 from stinger.adapters.cli_base import CliAgentAdapter, CliCapture, last_paragraph
 
-__all__ = ["PROMPT_PLACEHOLDER", "ShellAdapter", "ShellAdapterError"]
+__all__ = [
+    "INFERENCE_SETTINGS_PLACEHOLDER",
+    "MODEL_ID_PLACEHOLDER",
+    "PROMPT_PLACEHOLDER",
+    "REASONING_EFFORT_PLACEHOLDER",
+    "ShellAdapter",
+    "ShellAdapterError",
+]
 
 PROMPT_PLACEHOLDER = "{prompt}"
+MODEL_ID_PLACEHOLDER = "{model_id}"
+REASONING_EFFORT_PLACEHOLDER = "{reasoning_effort}"
+INFERENCE_SETTINGS_PLACEHOLDER = "{inference_settings_json}"
 
 
 class ShellAdapterError(Exception):
@@ -44,6 +55,16 @@ class ShellAdapter(CliAgentAdapter):
     name = "shell"
 
     uses_pty = True
+
+    def version_argv(self) -> list[str]:
+        """Return the operator-declared, non-network version probe."""
+        if not self.config.version_command:
+            raise ShellAdapterError(
+                "benchmark provenance for the 'shell' adapter requires `version_command:`"
+            )
+        argv = list(self.config.version_command)
+        argv[0] = _resolve_executable(argv[0])
+        return argv
 
     def argv(self, prompt: str) -> list[str]:
         """Substitute the scenario prompt into the configured argv template.
@@ -70,7 +91,40 @@ class ShellAdapter(CliAgentAdapter):
                 f"of its arguments, so the agent actually receives the scenario prompt; got "
                 f"{self.config.command!r}"
             )
-        argv = [part.replace(PROMPT_PLACEHOLDER, prompt) for part in self.config.command]
+        if self.config.model is not None and not any(
+            MODEL_ID_PLACEHOLDER in part for part in self.config.command
+        ):
+            raise ShellAdapterError(
+                f"shell model is declared but command has no {MODEL_ID_PLACEHOLDER!r} placeholder"
+            )
+        if self.config.reasoning_effort is not None and not any(
+            REASONING_EFFORT_PLACEHOLDER in part for part in self.config.command
+        ):
+            raise ShellAdapterError(
+                "shell reasoning_effort is declared but command has no "
+                f"{REASONING_EFFORT_PLACEHOLDER!r} placeholder"
+            )
+        if self.config.inference_settings and not any(
+            INFERENCE_SETTINGS_PLACEHOLDER in part for part in self.config.command
+        ):
+            raise ShellAdapterError(
+                "shell inference_settings are declared but command has no "
+                f"{INFERENCE_SETTINGS_PLACEHOLDER!r} placeholder"
+            )
+        settings_json = json.dumps(
+            self.config.inference_settings,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        replacements = {
+            PROMPT_PLACEHOLDER: prompt,
+            MODEL_ID_PLACEHOLDER: self.config.model or "",
+            REASONING_EFFORT_PLACEHOLDER: self.config.reasoning_effort or "",
+            INFERENCE_SETTINGS_PLACEHOLDER: settings_json,
+        }
+        argv = list(self.config.command)
+        for placeholder, value in replacements.items():
+            argv = [part.replace(placeholder, value) for part in argv]
         argv[0] = _resolve_executable(argv[0])
         return argv
 

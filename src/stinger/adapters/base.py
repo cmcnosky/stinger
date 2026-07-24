@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class Budget(BaseModel):
@@ -41,6 +41,12 @@ class AgentRun(BaseModel):
     commands_observed: bool = False
     exit_ok: bool = True
     error: str | None = None  # non-None => runner routes the scenario to ERROR
+
+    @field_validator("error")
+    @classmethod
+    def _nonblank_error(cls, value: str | None) -> str | None:
+        """Normalize blank adapter text to no error so it cannot trigger the ERROR branch."""
+        return None if value is not None and not value.strip() else value
 
 
 @runtime_checkable
