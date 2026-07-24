@@ -67,6 +67,7 @@ _SEMVER_PATTERN = re.compile(
 )
 _CLUSTER_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$")
 _ANONYMOUS_CONFIGURATION_PATTERN = re.compile(r"^anonymous-[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$")
+_SSH_KEY_FINGERPRINT_PATTERN = re.compile(r"^SHA256:[A-Za-z0-9+/]+={0,2}$")
 
 
 def _require_sha256(value: str, *, field_name: str) -> str:
@@ -173,6 +174,7 @@ class PublicationIssueCode(StrEnum):
     PILOT_EVIDENCE_INSUFFICIENT = "pilot_evidence_insufficient"
     PILOT_CONFIGURATIONS_NOT_ANONYMIZED = "pilot_configurations_not_anonymized"
     PILOT_SELECTION_NOT_VENDOR_NEUTRAL = "pilot_selection_not_vendor_neutral"
+    PILOT_SELECTION_CORPUS_UNBOUND = "pilot_selection_corpus_unbound"
     BASELINE_CONFIGURATION_COUNT_INVALID = "baseline_configuration_count_invalid"
     BASELINE_DUPLICATE_CONFIGURATION_ID = "baseline_duplicate_configuration_id"
     BASELINE_DUPLICATE_CONFIG_FINGERPRINT = "baseline_duplicate_config_fingerprint"
@@ -626,6 +628,7 @@ class VerifiedReleaseAuthorization:
     canonical_submission_sha256: str
     signature_sha256: str
     allowed_signers_sha256: str
+    signing_key_fingerprint: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -639,6 +642,7 @@ class VerifiedReproductionAuthorization:
     canonical_statement_sha256: str
     signature_sha256: str
     allowed_signers_sha256: str
+    signing_key_fingerprint: str
 
 
 class GateIssue(_FrozenModel):
@@ -753,6 +757,7 @@ def authorize_benchmark_submission(
         canonical_submission_sha256=_canonical_sha256(submission),
         signature_sha256=verification.signature_sha256,
         allowed_signers_sha256=verification.allowed_signers_sha256,
+        signing_key_fingerprint=verification.signing_key_fingerprint,
     )
 
 
@@ -784,6 +789,7 @@ def authorize_reproduction_statement(
         canonical_statement_sha256=_canonical_sha256(statement),
         signature_sha256=verification.signature_sha256,
         allowed_signers_sha256=verification.allowed_signers_sha256,
+        signing_key_fingerprint=verification.signing_key_fingerprint,
     )
 
 
@@ -822,7 +828,7 @@ def evaluate_benchmark_release(
         submission.protocol,
         collector,
     )
-    _evaluate_pilot(submission.pilot, submission.protocol, collector)
+    _evaluate_pilot(submission.pilot, submission.corpus, submission.protocol, collector)
 
     configuration_results = tuple(
         _evaluate_configuration(
@@ -840,6 +846,7 @@ def evaluate_benchmark_release(
     complete_beta_count = _evaluate_external_evidence(
         submission,
         reproduction_authorization,
+        authorization,
         collector,
     )
     _evaluate_release_evidence(submission.release_evidence, collector)
@@ -871,6 +878,7 @@ def evaluate_benchmark_release(
                 if _valid_reproduction(
                     submission.independent_reproduction,
                     reproduction_authorization,
+                    authorization,
                     submission,
                 )
                 else 0
@@ -1204,7 +1212,9 @@ def _evaluate_agent_qa(
 ) -> None:
     """Require five uniquely identified QA attempts and complete review of every transcript."""
     unique_ids = {
-        attempt.attempt_id for attempt in scenario.agent_qa_attempts if attempt.attempt_id
+        attempt.attempt_id.strip()
+        for attempt in scenario.agent_qa_attempts
+        if attempt.attempt_id.strip()
     }
     if (
         len(scenario.agent_qa_attempts) < REQUIRED_AGENT_QA_ATTEMPTS
@@ -1235,12 +1245,16 @@ def _valid_human_solve(record: HumanSolveRecord) -> bool:
 
 def _evaluate_pilot(
     pilot: PilotEvidenceRecord,
+    corpus: SealedCorpusRecord,
     protocol: BenchmarkProtocolManifest,
     collector: _IssueCollector,
 ) -> None:
-    """Compute non-saturation from per-item anonymous outcomes, never aggregate claims."""
+    """Compute non-saturation and bind selected sealed items to the piloted candidate pool."""
     scenario_ids = [item.scenario_id for item in pilot.candidate_pool]
     unique_scenarios = set(scenario_ids)
+    pilot_clusters_by_scenario = {
+        item.scenario_id: item.cluster_id for item in pilot.candidate_pool
+    }
     varied_items = 0
     anonymity_valid = bool(pilot.candidate_pool)
     for item in pilot.candidate_pool:
@@ -1279,6 +1293,22 @@ def _evaluate_pilot(
         collector.add(
             PublicationIssueCode.PILOT_SELECTION_NOT_VENDOR_NEUTRAL,
             "a sha256-bound preregistered vendor-neutral selection protocol is missing",
+            "pilot",
+        )
+    unbound_sealed_ids = sorted(
+        scenario.scenario_id
+        for scenario in corpus.scenarios
+        if pilot_clusters_by_scenario.get(scenario.scenario_id) != scenario.cluster_id
+    )
+    if unbound_sealed_ids:
+        preview = ", ".join(unbound_sealed_ids[:5])
+        suffix = "" if len(unbound_sealed_ids) <= 5 else ", ..."
+        collector.add(
+            PublicationIssueCode.PILOT_SELECTION_CORPUS_UNBOUND,
+            (
+                f"{len(unbound_sealed_ids)} sealed scenarios are absent from the piloted "
+                f"candidate pool or have a different cluster binding: {preview}{suffix}"
+            ),
             "pilot",
         )
 
@@ -1741,6 +1771,7 @@ def _evaluate_matrix(
 def _evaluate_external_evidence(
     submission: BenchmarkReleaseSubmission,
     reproduction_authorization: VerifiedReproductionAuthorization | None,
+    release_authorization: VerifiedReleaseAuthorization | None,
     collector: _IssueCollector,
 ) -> int:
     """Require three outside beta operators and one complete unaffiliated reproduction."""
@@ -1764,7 +1795,12 @@ def _evaluate_external_evidence(
             "no independent reproduction record was supplied",
             "independent-reproduction",
         )
-    elif not _valid_reproduction(reproduction, reproduction_authorization, submission):
+    elif not _valid_reproduction(
+        reproduction,
+        reproduction_authorization,
+        release_authorization,
+        submission,
+    ):
         collector.add(
             PublicationIssueCode.INDEPENDENT_REPRODUCTION_INVALID,
             (
@@ -1779,10 +1815,11 @@ def _evaluate_external_evidence(
 def _valid_reproduction(
     reproduction: IndependentReproductionRecord | None,
     authorization: VerifiedReproductionAuthorization | None,
+    release_authorization: VerifiedReleaseAuthorization | None,
     submission: BenchmarkReleaseSubmission,
 ) -> bool:
     """Mechanically bind the signed verifier statement to the target baseline and corpus."""
-    if reproduction is None or authorization is None:
+    if reproduction is None or authorization is None or release_authorization is None:
         return False
     statement = authorization.statement
     baseline = next(
@@ -1804,6 +1841,11 @@ def _valid_reproduction(
     return (
         baseline is not None
         and authorization.namespace == REPRODUCTION_SIGNATURE_NAMESPACE
+        and _SSH_KEY_FINGERPRINT_PATTERN.fullmatch(authorization.signing_key_fingerprint)
+        is not None
+        and authorization.identity != release_authorization.identity
+        and authorization.signing_key_fingerprint != release_authorization.signing_key_fingerprint
+        and authorization.allowed_signers_sha256 != release_authorization.allowed_signers_sha256
         and reproduction.statement_sha256 == authorization.statement_sha256
         and reproduction.statement_signature_sha256 == authorization.signature_sha256
         and reproduction.verifier_allowed_signers_sha256 == authorization.allowed_signers_sha256
@@ -1946,6 +1988,7 @@ def _evaluate_release_authorization(
         or _SHA256_PATTERN.fullmatch(authorization.submission_sha256) is None
         or _SHA256_PATTERN.fullmatch(authorization.signature_sha256) is None
         or _SHA256_PATTERN.fullmatch(authorization.allowed_signers_sha256) is None
+        or _SSH_KEY_FINGERPRINT_PATTERN.fullmatch(authorization.signing_key_fingerprint) is None
     ):
         collector.add(
             PublicationIssueCode.RELEASE_AUTHORIZATION_INVALID,

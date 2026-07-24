@@ -93,6 +93,7 @@ class TestProtocolSigning:
         assert len(verification.protocol_sha256) == 64
         assert len(verification.signature_sha256) == 64
         assert len(verification.allowed_signers_sha256) == 64
+        assert verification.signing_key_fingerprint.startswith("SHA256:")
 
     def test_tampered_protocol_and_wrong_identity_fail_closed(
         self, signing_material: dict[str, Path]
@@ -179,11 +180,11 @@ class TestProtocolSigning:
         assert f"signer {IDENTITY}" in outcome.output
 
 
-def test_release_and_reproduction_use_distinct_exact_byte_signature_domains(
+def test_signature_namespaces_are_distinct_while_the_signing_key_remains_visible(
     signing_material: dict[str, Path],
     tmp_path: Path,
 ) -> None:
-    """Ephemeral keys prove release approval and verifier evidence cannot be interchanged."""
+    """Namespaces prevent artifact substitution but do not impersonate signer independence."""
     release = tmp_path / "release.yaml"
     release.write_text("human_approval:\n  operator_id: Chris\n", encoding="utf-8")
     statement = tmp_path / "reproduction.yaml"
@@ -209,6 +210,10 @@ def test_release_and_reproduction_use_distinct_exact_byte_signature_domains(
 
     assert release_verification.namespace == RELEASE_SIGNATURE_NAMESPACE
     assert statement_verification.namespace == REPRODUCTION_SIGNATURE_NAMESPACE
+    assert (
+        release_verification.signing_key_fingerprint
+        == statement_verification.signing_key_fingerprint
+    )
     with pytest.raises(ProtocolSignatureError, match="verification failed"):
         verify_reproduction_statement_signature(
             release,

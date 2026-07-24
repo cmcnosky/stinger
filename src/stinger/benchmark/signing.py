@@ -13,6 +13,7 @@ signature support.
 from __future__ import annotations
 
 import hashlib
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from pathlib import Path
 PROTOCOL_SIGNATURE_NAMESPACE = "stinger-benchmark-protocol"
 RELEASE_SIGNATURE_NAMESPACE = "stinger-benchmark-release"
 REPRODUCTION_SIGNATURE_NAMESPACE = "stinger-benchmark-reproduction"
+_KEY_FINGERPRINT_PATTERN = re.compile(rb"\bkey (SHA256:[A-Za-z0-9+/]+={0,2})(?:\s|$)")
 
 __all__ = [
     "PROTOCOL_SIGNATURE_NAMESPACE",
@@ -51,6 +53,7 @@ class ProtocolSignatureVerification:
     protocol_sha256: str
     signature_sha256: str
     allowed_signers_sha256: str
+    signing_key_fingerprint: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +65,7 @@ class ArtifactSignatureVerification:
     artifact_sha256: str
     signature_sha256: str
     allowed_signers_sha256: str
+    signing_key_fingerprint: str
 
 
 def sign_protocol(
@@ -171,6 +175,7 @@ def verify_protocol_signature(
         protocol_sha256=_sha256(protocol_bytes),
         signature_sha256=_sha256(signature_bytes),
         allowed_signers_sha256=_sha256(signers_bytes),
+        signing_key_fingerprint=_verified_key_fingerprint(completed),
     )
 
 
@@ -289,6 +294,7 @@ def _verify_artifact_signature(
         artifact_sha256=_sha256(artifact_bytes),
         signature_sha256=_sha256(signature_bytes),
         allowed_signers_sha256=_sha256(signers_bytes),
+        signing_key_fingerprint=_verified_key_fingerprint(completed),
     )
 
 
@@ -312,6 +318,34 @@ def _diagnostic(completed: subprocess.CompletedProcess[bytes], fallback: str) ->
     """Decode OpenSSH diagnostics without letting locale bytes hide the real failure."""
     raw = completed.stderr.strip() or completed.stdout.strip()
     return fallback if not raw else raw.decode("utf-8", errors="replace")
+
+
+def _verified_key_fingerprint(completed: subprocess.CompletedProcess[bytes]) -> str:
+    """Extract the exact public-key fingerprint OpenSSH says verified the signature.
+
+    OpenSSH signatures carry the public key, and successful ``ssh-keygen -Y verify``
+    diagnostics identify it as ``SHA256:<base64>``. Persisting that identity lets release
+    governance distinguish two roles cryptographically instead of mistaking two signature
+    namespaces for two independent signers.
+
+    Args:
+        completed: Successful ``ssh-keygen -Y verify`` result.
+
+    Returns:
+        The unique OpenSSH SHA-256 key fingerprint, including its ``SHA256:`` prefix.
+
+    Raises:
+        ProtocolSignatureError: If the verifier output does not identify exactly one key.
+    """
+    combined = b"\n".join((completed.stdout, completed.stderr))
+    fingerprints: set[str] = {
+        match.decode("ascii") for match in _KEY_FINGERPRINT_PATTERN.findall(combined)
+    }
+    if len(fingerprints) != 1:
+        raise ProtocolSignatureError(
+            "successful OpenSSH verification did not identify exactly one signing key"
+        )
+    return next(iter(fingerprints))
 
 
 def _ssh_keygen() -> None:

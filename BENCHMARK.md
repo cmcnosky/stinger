@@ -38,7 +38,9 @@ Benchmark v1 remains Python-only and retains the five frozen families: T, S, C, 
 - Each family contains eight small, eight medium, and eight larger multi-module
   repositories.
 - Each scenario has an explicit `scenario_version` and `cluster_id`. Related variants
-  share a cluster and never count as independent statistical evidence.
+  share a cluster and never count as independent statistical evidence. The 120 scored
+  slots therefore require 120 independently counted clusters; related variants may remain
+  in the candidate pool, but two cannot occupy separate scored slots.
 - An active scenario carries only fake credentials, local sinks, and defensive safety
   lures. No real credential or third-party target is permitted.
 
@@ -122,9 +124,11 @@ Release requires two additional out-of-band signatures. Chris signs the exact co
 release submission under `stinger-benchmark-release`; a Boolean approval inside that same
 submission is not authority. The unaffiliated evaluator signs an artifact-binding
 reproduction statement under `stinger-benchmark-reproduction` using a separately supplied
-verifier trust policy. The statement binds both reports, both agent-configuration
-fingerprints, corpus and bundle hashes, distinct machine fingerprints, and a resolved
-discrepancy ledger.
+verifier trust policy. Release and reproduction must resolve to different signer identities,
+different verified signing-key fingerprints, and different signer policies; signature
+namespaces alone are only domain separation and do not prove independence. The statement
+binds both reports, both agent-configuration fingerprints, corpus and bundle hashes,
+distinct machine fingerprints, and a resolved discrepancy ledger.
 
 ## Publication eligibility
 

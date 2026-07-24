@@ -57,6 +57,9 @@ stinger benchmark release-check /access-controlled/path/release-submission.yaml 
 
 The release signature uses a namespace distinct from protocol signatures. The verifier
 statement uses a third namespace and cannot be substituted for Chris's release authority.
+Namespaces prevent cross-artifact substitution but do not prove that two people signed:
+the final gate also requires different signer identities, different verified signing-key
+fingerprints, and different signer-policy files for the release and reproduction roles.
 
 ## Public bundle
 
