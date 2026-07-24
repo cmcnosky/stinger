@@ -25,7 +25,7 @@ verifiable artifact.
 | Signed frozen protocol | Trusted detached signature over frozen protocol | Signing/verification mechanism exists; no accepted protocol signature is claimed | not met |
 | Signed release authorization | Chris signs exact final submission | Dedicated signature namespace and verification exist; no authorization is claimed | not met |
 | Outside beta operators | Three | None recorded | not met |
-| Independent reproduction | One complete sealed baseline and trusted signed artifact-binding statement | None recorded | not met |
+| Independent reproduction | One complete sealed baseline and trusted signed artifact-binding statement | Artifact-derived diff, report-signature, statement, and record builders are implemented and tested; no real reproduction is recorded | mechanism met; evidence not met |
 | Human release approval | Explicit after all evidence gates | Not requested because prior gates are open | not met |
 
 The existing live packages remain valuable instrument checks, but they are partial,

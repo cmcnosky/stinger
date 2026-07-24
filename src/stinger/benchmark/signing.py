@@ -25,19 +25,23 @@ from pathlib import Path
 PROTOCOL_SIGNATURE_NAMESPACE = "stinger-benchmark-protocol"
 RELEASE_SIGNATURE_NAMESPACE = "stinger-benchmark-release"
 REPRODUCTION_SIGNATURE_NAMESPACE = "stinger-benchmark-reproduction"
+REPRODUCED_REPORT_SIGNATURE_NAMESPACE = "stinger-benchmark-reproduced-report"
 _KEY_FINGERPRINT_PATTERN = re.compile(rb"\bkey (SHA256:[A-Za-z0-9+/]+={0,2})(?:\s|$)")
 
 __all__ = [
     "PROTOCOL_SIGNATURE_NAMESPACE",
     "RELEASE_SIGNATURE_NAMESPACE",
     "REPRODUCTION_SIGNATURE_NAMESPACE",
+    "REPRODUCED_REPORT_SIGNATURE_NAMESPACE",
     "ArtifactSignatureVerification",
     "ProtocolSignatureError",
     "ProtocolSignatureVerification",
     "sign_release_submission",
+    "sign_reproduced_report",
     "sign_reproduction_statement",
     "sign_protocol",
     "verify_release_submission_signature",
+    "verify_reproduced_report_signature",
     "verify_reproduction_statement_signature",
     "verify_protocol_signature",
 ]
@@ -118,6 +122,19 @@ def sign_reproduction_statement(
         private_key,
         namespace=REPRODUCTION_SIGNATURE_NAMESPACE,
         label="reproduction statement",
+    )
+
+
+def sign_reproduced_report(
+    report: Path,
+    private_key: Path,
+) -> Path:
+    """Sign exact reproduced-report bytes with the evaluator-report namespace."""
+    return _sign_artifact(
+        report,
+        private_key,
+        namespace=REPRODUCED_REPORT_SIGNATURE_NAMESPACE,
+        label="reproduced report",
     )
 
 
@@ -207,6 +224,23 @@ def verify_reproduction_statement_signature(
     )
 
 
+def verify_reproduced_report_signature(
+    report: Path,
+    signature: Path,
+    allowed_signers: Path,
+    identity: str,
+) -> ArtifactSignatureVerification:
+    """Verify exact reproduced-report bytes against the evaluator's external trust."""
+    return _verify_artifact_signature(
+        report,
+        signature,
+        allowed_signers,
+        identity,
+        namespace=REPRODUCED_REPORT_SIGNATURE_NAMESPACE,
+        label="reproduced report",
+    )
+
+
 def _sign_artifact(
     artifact: Path,
     private_key: Path,
@@ -214,8 +248,8 @@ def _sign_artifact(
     namespace: str,
     label: str,
 ) -> Path:
-    """Sign one existing governance artifact without reading private-key bytes."""
-    _require_regular_file(artifact, label)
+    """Sign one immutable artifact snapshot without reading private-key bytes."""
+    artifact_bytes = _require_regular_file(artifact, label)
     _require_regular_file(private_key, "private key")
     _validate_namespace(namespace)
     _ssh_keygen()
@@ -224,25 +258,60 @@ def _sign_artifact(
     if signature.exists() or signature.is_symlink():
         raise ProtocolSignatureError(f"refusing to overwrite existing signature: {signature}")
 
-    completed = _run(
-        [
-            "ssh-keygen",
-            "-Y",
-            "sign",
-            "-f",
-            str(private_key),
-            "-n",
-            namespace,
-            str(artifact),
-        ]
-    )
-    if completed.returncode != 0:
-        if signature.is_file() and not signature.is_symlink():
-            signature.unlink()
-        detail = _diagnostic(completed, "unknown OpenSSH error")
-        raise ProtocolSignatureError(f"{label} signing failed: {detail}")
-    _require_regular_file(signature, f"generated {label} signature")
+    with tempfile.TemporaryDirectory(prefix="stinger-signature-create-") as temporary:
+        snapshot = Path(temporary) / "artifact"
+        snapshot.write_bytes(artifact_bytes)
+        snapshot.chmod(0o600)
+        completed = _run(
+            [
+                "ssh-keygen",
+                "-Y",
+                "sign",
+                "-f",
+                str(private_key),
+                "-n",
+                namespace,
+                str(snapshot),
+            ]
+        )
+        snapshot_signature = Path(f"{snapshot}.sig")
+        if completed.returncode != 0:
+            detail = _diagnostic(completed, "unknown OpenSSH error")
+            raise ProtocolSignatureError(f"{label} signing failed: {detail}")
+        signature_bytes = _require_regular_file(
+            snapshot_signature,
+            f"generated {label} signature",
+        )
+    if _require_regular_file(artifact, label) != artifact_bytes:
+        raise ProtocolSignatureError(f"{label} changed while it was being signed")
+    _create_signature_file(signature, signature_bytes)
     return signature
+
+
+def _create_signature_file(destination: Path, content: bytes) -> None:
+    """Publish a detached signature exactly once without a check/use overwrite race."""
+    parent = destination.parent
+    if parent.is_symlink() or not parent.is_dir():
+        raise ProtocolSignatureError("signature parent must be an existing real directory")
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, destination)
+        except FileExistsError as exc:
+            raise ProtocolSignatureError(
+                f"refusing to overwrite existing signature: {destination}"
+            ) from exc
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _verify_artifact_signature(

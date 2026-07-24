@@ -17,6 +17,7 @@ from pathlib import Path
 from stinger.benchmark.evidence import (
     EvidenceBundleError,
     PublicLeakagePolicy,
+    VerifiedArtifactReceipt,
     verify_evidence_bundle_pair,
 )
 from stinger.benchmark.gates import (
@@ -82,6 +83,40 @@ def build_baseline_configuration_record(
     except (EvidenceBundleError, OSError, ValueError) as exc:
         raise BaselineRecordError("evidence bundle verification failed") from exc
 
+    return _build_baseline_configuration_record_from_receipt(
+        configuration_id,
+        corpus=corpus,
+        receipt=receipt,
+        machine_identity_artifact=machine_identity_artifact,
+        error_dispositions=error_dispositions,
+        sensitive_paths=(
+            public_bundle,
+            escrow_bundle,
+            protocol_allowed_signers,
+            machine_identity_artifact,
+            *leakage_policy.forbidden_sources,
+        ),
+        sensitive_markers=leakage_policy.forbidden_markers,
+    )
+
+
+def _build_baseline_configuration_record_from_receipt(
+    configuration_id: str,
+    *,
+    corpus: SealedCorpusRecord,
+    receipt: VerifiedArtifactReceipt,
+    machine_identity_artifact: Path,
+    error_dispositions: tuple[ErrorDispositionRecord, ...] = (),
+    sensitive_paths: tuple[Path, ...] = (),
+    sensitive_markers: tuple[str | bytes, ...] = (),
+) -> BaselineConfigurationRecord:
+    """Derive a baseline from one already verified, exact-byte artifact receipt."""
+    if (
+        not configuration_id.strip()
+        or configuration_id != configuration_id.strip()
+        or any(character.isspace() for character in configuration_id)
+    ):
+        raise BaselineRecordError("configuration_id must be a nonblank, whitespace-free identifier")
     report = receipt.report
     config = receipt.config
     try:
@@ -150,14 +185,8 @@ def build_baseline_configuration_record(
     )
     _reject_sensitive_content(
         record,
-        sensitive_paths=(
-            public_bundle,
-            escrow_bundle,
-            protocol_allowed_signers,
-            machine_identity_artifact,
-            *leakage_policy.forbidden_sources,
-        ),
-        sensitive_markers=leakage_policy.forbidden_markers,
+        sensitive_paths=(*sensitive_paths, machine_identity_artifact),
+        sensitive_markers=sensitive_markers,
     )
     try:
         gate_result = evaluate_baseline_configuration_record(
@@ -265,19 +294,20 @@ def _validate_error_dispositions(
 
 def _sha256_identity_artifact(path: Path) -> str:
     """Hash exact bytes from a nonempty, regular, nonsymlink identity attestation."""
+    return _sha256_regular_artifact(path, label="machine identity artifact")
+
+
+def _sha256_regular_artifact(path: Path, *, label: str) -> str:
+    """Hash exact bytes from one nonempty, regular, nonsymlink artifact."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
-        raise BaselineRecordError(
-            "machine identity artifact must be a readable regular nonsymlink file"
-        ) from exc
+        raise BaselineRecordError(f"{label} must be a readable regular nonsymlink file") from exc
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
-            raise BaselineRecordError(
-                "machine identity artifact must be a readable regular nonsymlink file"
-            )
+            raise BaselineRecordError(f"{label} must be a readable regular nonsymlink file")
         digest = hashlib.sha256()
         byte_count = 0
         while True:
@@ -289,7 +319,7 @@ def _sha256_identity_artifact(path: Path) -> str:
     finally:
         os.close(descriptor)
     if byte_count == 0:
-        raise BaselineRecordError("machine identity artifact must not be empty")
+        raise BaselineRecordError(f"{label} must not be empty")
     return digest.hexdigest()
 
 
