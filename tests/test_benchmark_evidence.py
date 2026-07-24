@@ -12,6 +12,7 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
+import stinger.benchmark.evidence as evidence_module
 from stinger import BENCHMARK_PROTOCOL_VERSION
 from stinger.benchmark.evidence import (
     BUNDLE_MANIFEST,
@@ -23,6 +24,7 @@ from stinger.benchmark.evidence import (
     create_escrow_evidence_bundle,
     create_public_evidence_bundle,
     verify_escrow_evidence_bundle,
+    verify_evidence_bundle_pair,
     verify_public_evidence_bundle,
 )
 from stinger.benchmark.signing import sign_protocol
@@ -194,6 +196,375 @@ def public_bundle(destination: Path, inputs: dict[str, Path]) -> tuple[Path, Pub
         leakage_policy=active_policy,
     )
     return destination, active_policy
+
+
+def escrow_bundle(destination: Path, inputs: dict[str, Path]) -> Path:
+    """Build one valid escrow bundle paired with :func:`public_bundle`."""
+    create_escrow_evidence_bundle(
+        destination,
+        protocol=inputs["protocol"],
+        **signature_kwargs(inputs),
+        config=inputs["config"],
+        report=inputs["report"],
+        sealed_corpus=inputs["corpus"],
+        rerunnable_evidence=inputs["evidence"],
+    )
+    return destination
+
+
+class TestVerifiedArtifactReceipt:
+    """Builders retain exact verified core bytes instead of reopening mutable paths."""
+
+    def test_cross_binds_pair_and_derives_exact_manifest_hashes(
+        self, tmp_path: Path, evidence_inputs: dict[str, Path]
+    ) -> None:
+        public, active_policy = public_bundle(tmp_path / "public", evidence_inputs)
+        escrow = escrow_bundle(tmp_path / "escrow", evidence_inputs)
+
+        receipt = verify_evidence_bundle_pair(
+            public,
+            escrow,
+            active_policy,
+            **verification_kwargs(evidence_inputs),
+        )
+
+        assert receipt.public_bundle.report == receipt.escrow_bundle.report
+        assert receipt.report == receipt.public_bundle.report
+        assert receipt.config.fingerprint() == receipt.report.config_fingerprint
+        assert (
+            receipt.public_bundle.manifest_sha256
+            == hashlib.sha256((public / BUNDLE_MANIFEST).read_bytes()).hexdigest()
+        )
+        assert (
+            receipt.escrow_bundle.manifest_sha256
+            == hashlib.sha256((escrow / BUNDLE_MANIFEST).read_bytes()).hexdigest()
+        )
+        assert (
+            receipt.public_bundle.manifest_sha256 != receipt.public_bundle.manifest.inventory_sha256
+        )
+
+    def test_detects_core_path_substitution_after_verification(
+        self,
+        tmp_path: Path,
+        evidence_inputs: dict[str, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        public, active_policy = public_bundle(tmp_path / "public", evidence_inputs)
+        escrow = escrow_bundle(tmp_path / "escrow", evidence_inputs)
+        original = evidence_module.verify_public_evidence_bundle
+
+        def verify_then_mutate(
+            directory: Path,
+            leakage_policy: PublicLeakagePolicy,
+            *,
+            trusted_allowed_signers: Path,
+            expected_signer_identity: str,
+        ) -> evidence_module.EvidenceBundleManifest:
+            manifest = original(
+                directory,
+                leakage_policy,
+                trusted_allowed_signers=trusted_allowed_signers,
+                expected_signer_identity=expected_signer_identity,
+            )
+            (directory / "report" / "report.json").write_bytes(b"substituted")
+            return manifest
+
+        monkeypatch.setattr(
+            evidence_module,
+            "verify_public_evidence_bundle",
+            verify_then_mutate,
+        )
+
+        with pytest.raises(EvidenceBundleError, match="changed after verification"):
+            verify_evidence_bundle_pair(
+                public,
+                escrow,
+                active_policy,
+                **verification_kwargs(evidence_inputs),
+            )
+
+    def test_detects_extra_file_added_after_verification(
+        self,
+        tmp_path: Path,
+        evidence_inputs: dict[str, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        public, active_policy = public_bundle(tmp_path / "public", evidence_inputs)
+        escrow = escrow_bundle(tmp_path / "escrow", evidence_inputs)
+        original = evidence_module.verify_public_evidence_bundle
+
+        def verify_then_add_file(
+            directory: Path,
+            leakage_policy: PublicLeakagePolicy,
+            *,
+            trusted_allowed_signers: Path,
+            expected_signer_identity: str,
+        ) -> evidence_module.EvidenceBundleManifest:
+            manifest = original(
+                directory,
+                leakage_policy,
+                trusted_allowed_signers=trusted_allowed_signers,
+                expected_signer_identity=expected_signer_identity,
+            )
+            (directory / "post-verification-extra.txt").write_text(
+                "not inventoried\n",
+                encoding="utf-8",
+            )
+            return manifest
+
+        monkeypatch.setattr(
+            evidence_module,
+            "verify_public_evidence_bundle",
+            verify_then_add_file,
+        )
+
+        with pytest.raises(EvidenceBundleError, match="inventory disagrees"):
+            verify_evidence_bundle_pair(
+                public,
+                escrow,
+                active_policy,
+                **verification_kwargs(evidence_inputs),
+            )
+
+    def test_detects_escrow_core_path_substitution_after_verification(
+        self,
+        tmp_path: Path,
+        evidence_inputs: dict[str, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        public, active_policy = public_bundle(tmp_path / "public", evidence_inputs)
+        escrow = escrow_bundle(tmp_path / "escrow", evidence_inputs)
+        original = evidence_module.verify_escrow_evidence_bundle
+
+        def verify_then_mutate(
+            directory: Path,
+            *,
+            trusted_allowed_signers: Path,
+            expected_signer_identity: str,
+        ) -> evidence_module.EvidenceBundleManifest:
+            manifest = original(
+                directory,
+                trusted_allowed_signers=trusted_allowed_signers,
+                expected_signer_identity=expected_signer_identity,
+            )
+            (directory / "report" / "report.json").write_bytes(b"substituted")
+            return manifest
+
+        monkeypatch.setattr(
+            evidence_module,
+            "verify_escrow_evidence_bundle",
+            verify_then_mutate,
+        )
+
+        with pytest.raises(EvidenceBundleError, match="changed after verification"):
+            verify_evidence_bundle_pair(
+                public,
+                escrow,
+                active_policy,
+                **verification_kwargs(evidence_inputs),
+            )
+
+    def test_rejects_policy_that_does_not_cover_the_paired_escrow_corpus(
+        self, tmp_path: Path, evidence_inputs: dict[str, Path]
+    ) -> None:
+        unrelated = tmp_path / "unrelated-policy-source"
+        unrelated.mkdir()
+        (unrelated / "markers.txt").write_text(
+            f"{CANARY}\n{BAIT_SECRET}\n",
+            encoding="utf-8",
+        )
+        unrelated_policy = PublicLeakagePolicy(
+            forbidden_sources=(unrelated,),
+            forbidden_markers=(CANARY, BAIT_SECRET),
+        )
+        public = tmp_path / "public"
+        create_public_evidence_bundle(
+            public,
+            protocol=evidence_inputs["protocol"],
+            **signature_kwargs(evidence_inputs),
+            config=evidence_inputs["config"],
+            report=evidence_inputs["report"],
+            permitted_logs={},
+            leakage_policy=unrelated_policy,
+        )
+        escrow = escrow_bundle(tmp_path / "escrow", evidence_inputs)
+
+        with pytest.raises(EvidenceBundleError, match="does not cover"):
+            verify_evidence_bundle_pair(
+                public,
+                escrow,
+                unrelated_policy,
+                **verification_kwargs(evidence_inputs),
+            )
+
+    def test_allows_stricter_policy_with_separately_stored_marker(
+        self, tmp_path: Path, evidence_inputs: dict[str, Path]
+    ) -> None:
+        separate = tmp_path / "separate-sensitive-source"
+        separate.mkdir()
+        extra_marker = "STINGER-SEPARATE-REFERENCE-CANARY-774a"
+        (separate / "reference-only.txt").write_text(
+            extra_marker + "\n",
+            encoding="utf-8",
+        )
+        stricter = PublicLeakagePolicy(
+            forbidden_sources=(evidence_inputs["corpus"], separate),
+            forbidden_markers=(CANARY, BAIT_SECRET, extra_marker),
+        )
+        public = tmp_path / "public"
+        create_public_evidence_bundle(
+            public,
+            protocol=evidence_inputs["protocol"],
+            **signature_kwargs(evidence_inputs),
+            config=evidence_inputs["config"],
+            report=evidence_inputs["report"],
+            permitted_logs={},
+            leakage_policy=stricter,
+        )
+        escrow = escrow_bundle(tmp_path / "escrow", evidence_inputs)
+
+        receipt = verify_evidence_bundle_pair(
+            public,
+            escrow,
+            stricter,
+            **verification_kwargs(evidence_inputs),
+        )
+
+        assert receipt.report.corpus_hash == receipt.escrow_bundle.report.corpus_hash
+
+    def test_detects_policy_source_change_after_public_verification(
+        self,
+        tmp_path: Path,
+        evidence_inputs: dict[str, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        public, active_policy = public_bundle(tmp_path / "public", evidence_inputs)
+        escrow = escrow_bundle(tmp_path / "escrow", evidence_inputs)
+        original = evidence_module.verify_public_evidence_bundle
+        marker_source = (
+            evidence_inputs["corpus"] / "T-02-no-touch-tests" / "seed_repo" / "benchmark-bait.env"
+        )
+
+        def verify_then_mutate(
+            directory: Path,
+            leakage_policy: PublicLeakagePolicy,
+            *,
+            trusted_allowed_signers: Path,
+            expected_signer_identity: str,
+        ) -> evidence_module.EvidenceBundleManifest:
+            manifest = original(
+                directory,
+                leakage_policy,
+                trusted_allowed_signers=trusted_allowed_signers,
+                expected_signer_identity=expected_signer_identity,
+            )
+            marker_source.write_text(
+                f"CANARY={CANARY}\nBAIT={BAIT_SECRET}\nCHANGED=yes\n",
+                encoding="utf-8",
+            )
+            return manifest
+
+        monkeypatch.setattr(
+            evidence_module,
+            "verify_public_evidence_bundle",
+            verify_then_mutate,
+        )
+
+        with pytest.raises(EvidenceBundleError, match="policy changed"):
+            verify_evidence_bundle_pair(
+                public,
+                escrow,
+                active_policy,
+                **verification_kwargs(evidence_inputs),
+            )
+
+    def test_rejects_escrow_inventory_role_substitution(
+        self, tmp_path: Path, evidence_inputs: dict[str, Path]
+    ) -> None:
+        public, active_policy = public_bundle(tmp_path / "public", evidence_inputs)
+        escrow = escrow_bundle(tmp_path / "escrow", evidence_inputs)
+        manifest_path = escrow / BUNDLE_MANIFEST
+        manifest = evidence_module.EvidenceBundleManifest.model_validate_json(
+            manifest_path.read_bytes()
+        )
+        files = dict(manifest.files)
+        sealed_path = next(
+            path
+            for path, entry in files.items()
+            if entry.role is evidence_module.EvidenceRole.SEALED_CORPUS
+        )
+        rerunnable_path = next(
+            path
+            for path, entry in files.items()
+            if entry.role is evidence_module.EvidenceRole.RERUNNABLE_EVIDENCE
+        )
+        files[sealed_path] = files[sealed_path].model_copy(
+            update={"role": evidence_module.EvidenceRole.RERUNNABLE_EVIDENCE}
+        )
+        files[rerunnable_path] = files[rerunnable_path].model_copy(
+            update={"role": evidence_module.EvidenceRole.SEALED_CORPUS}
+        )
+        changed = manifest.model_copy(
+            update={
+                "files": files,
+                "inventory_sha256": evidence_module._inventory_hash(
+                    files,
+                    manifest.directories,
+                ),
+            }
+        )
+        encoded = evidence_module._manifest_bytes(changed)
+        manifest_path.write_bytes(encoded)
+        (escrow / BUNDLE_MANIFEST_HASH).write_text(
+            f"{hashlib.sha256(encoded).hexdigest()}  {BUNDLE_MANIFEST}\n",
+            encoding="ascii",
+        )
+
+        with pytest.raises(EvidenceBundleError, match="path and inventory role"):
+            verify_evidence_bundle_pair(
+                public,
+                escrow,
+                active_policy,
+                **verification_kwargs(evidence_inputs),
+            )
+
+    def test_rejects_report_metadata_that_disagrees_with_escrow_manifests(
+        self, tmp_path: Path, evidence_inputs: dict[str, Path]
+    ) -> None:
+        original = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
+        changed_results = [
+            result.model_copy(update={"cluster_id": "different-cluster"})
+            for result in original.results
+        ]
+        changed = build_report(
+            changed_results,
+            corpus_hash=original.corpus_hash,
+            config_fingerprint=original.config_fingerprint,
+            generated_at=original.generated_at,
+            benchmark_metadata=original.benchmark_metadata,
+            benchmark_runtime_provenance=original.benchmark_runtime_provenance,
+            bootstrap_samples=20,
+        )
+        evidence_inputs["report"].write_text(render_json(changed), encoding="utf-8")
+        run_config = RunConfig.from_yaml(evidence_inputs["config"])
+        scenarios = discover_scenarios(evidence_inputs["corpus"])
+        write_repro_package(
+            evidence_inputs["evidence"],
+            changed,
+            run_config,
+            scenarios,
+        )
+
+        with pytest.raises(EvidenceBundleError, match="metadata disagrees"):
+            create_escrow_evidence_bundle(
+                tmp_path / "escrow",
+                protocol=evidence_inputs["protocol"],
+                **signature_kwargs(evidence_inputs),
+                config=evidence_inputs["config"],
+                report=evidence_inputs["report"],
+                sealed_corpus=evidence_inputs["corpus"],
+                rerunnable_evidence=evidence_inputs["evidence"],
+            )
 
 
 class TestPublicEvidence:

@@ -13,9 +13,12 @@ signature support.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shutil
+import stat
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -149,21 +152,12 @@ def verify_protocol_signature(
     _validate_namespace(namespace)
     _ssh_keygen()
 
-    completed = _run(
-        [
-            "ssh-keygen",
-            "-Y",
-            "verify",
-            "-f",
-            str(allowed_signers),
-            "-I",
-            identity,
-            "-n",
-            namespace,
-            "-s",
-            str(signature),
-        ],
-        stdin=protocol_bytes,
+    completed = _run_verification(
+        artifact_bytes=protocol_bytes,
+        signature_bytes=signature_bytes,
+        allowed_signers_bytes=signers_bytes,
+        identity=identity,
+        namespace=namespace,
     )
     if completed.returncode != 0:
         detail = _diagnostic(completed, "signature mismatch")
@@ -268,21 +262,12 @@ def _verify_artifact_signature(
     _validate_namespace(namespace)
     _ssh_keygen()
 
-    completed = _run(
-        [
-            "ssh-keygen",
-            "-Y",
-            "verify",
-            "-f",
-            str(allowed_signers),
-            "-I",
-            identity,
-            "-n",
-            namespace,
-            "-s",
-            str(signature),
-        ],
-        stdin=artifact_bytes,
+    completed = _run_verification(
+        artifact_bytes=artifact_bytes,
+        signature_bytes=signature_bytes,
+        allowed_signers_bytes=signers_bytes,
+        identity=identity,
+        namespace=namespace,
     )
     if completed.returncode != 0:
         detail = _diagnostic(completed, "signature mismatch")
@@ -296,6 +281,41 @@ def _verify_artifact_signature(
         allowed_signers_sha256=_sha256(signers_bytes),
         signing_key_fingerprint=_verified_key_fingerprint(completed),
     )
+
+
+def _run_verification(
+    *,
+    artifact_bytes: bytes,
+    signature_bytes: bytes,
+    allowed_signers_bytes: bytes,
+    identity: str,
+    namespace: str,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run OpenSSH only against private snapshots of the already-hashed inputs."""
+    with tempfile.TemporaryDirectory(prefix="stinger-signature-verify-") as temporary:
+        root = Path(temporary)
+        signature = root / "artifact.sig"
+        allowed_signers = root / "allowed_signers"
+        signature.write_bytes(signature_bytes)
+        allowed_signers.write_bytes(allowed_signers_bytes)
+        signature.chmod(0o600)
+        allowed_signers.chmod(0o600)
+        return _run(
+            [
+                "ssh-keygen",
+                "-Y",
+                "verify",
+                "-f",
+                str(allowed_signers),
+                "-I",
+                identity,
+                "-n",
+                namespace,
+                "-s",
+                str(signature),
+            ],
+            stdin=artifact_bytes,
+        )
 
 
 def _run(argv: list[str], *, stdin: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
@@ -358,12 +378,24 @@ def _ssh_keygen() -> None:
 
 def _require_regular_file(path: Path, label: str) -> bytes:
     """Read a real regular file while rejecting symlink substitution."""
-    if path.is_symlink() or not path.is_file():
-        raise ProtocolSignatureError(f"{label} must be a real regular file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        content = path.read_bytes()
+        descriptor = os.open(path, flags)
     except OSError as exc:
-        raise ProtocolSignatureError(f"{label} is not readable: {path}: {exc}") from exc
+        raise ProtocolSignatureError(f"{label} must be a real regular file: {path}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ProtocolSignatureError(f"{label} must be a real regular file: {path}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    content = b"".join(chunks)
     if not content:
         raise ProtocolSignatureError(f"{label} must not be empty: {path}")
     return content

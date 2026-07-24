@@ -89,3 +89,49 @@ Run `stinger benchmark bundle-escrow --help` for the complete argument list.
 The resulting public and escrow manifest hashes are referenced by the accepted baseline
 record. A successful bundle check is necessary but does not replace corpus reviews,
 outside reproduction, or human release approval.
+
+## Artifact-derived baseline records
+
+Accepted baseline records are constructed with the verifier-side builder, never by
+hand-entering hashes or favorable booleans:
+
+```bash
+stinger benchmark build-baseline-record \
+  --configuration-id pinned-configuration-id \
+  --corpus-record /access-controlled/path/sealed-corpus-record.json \
+  --public-bundle /verified/path/public-bundle \
+  --escrow-bundle /access-controlled/path/escrow-bundle \
+  --forbidden-source /access-controlled/path/active-sealed-corpus \
+  --marker-file /access-controlled/path/canary-value \
+  --marker-file /access-controlled/path/dummy-secret-value \
+  --allowed-signers /independently-obtained/path/allowed_signers \
+  --signer-identity stinger-release@example.org \
+  --machine-identity /verifier/path/machine-identity-attestation \
+  --output /new/path/baseline-record.json
+```
+
+The command re-verifies both bundles under independently obtained protocol trust, proves
+that the public leakage comparison set covers the paired escrow corpus, snapshots the
+verified core bytes, makes OpenSSH consume private snapshots of the exact signature and
+trust-policy bytes being hashed, and cross-binds the protocol, signature, trust policy, report,
+configuration fingerprint, corpus, and benchmark metadata. It then re-scores the report,
+checks publication pins, Docker isolation configuration and observed image/invocation
+provenance, recomputes deterministic blocked order, validates any error dispositions, and
+runs the release gate's exact per-configuration evaluator.
+
+`report_sha256` is the canonical typed-report hash. The two bundle hashes are SHA-256 over
+the exact verified `bundle.manifest.json` bytes, not the manifest's internal inventory
+hash. The builder creates canonical JSON at a new path and never copies or prints escrow
+contents. It also rejects a derived record that repeats any private corpus, escrow, trust,
+or machine-attestation input path, active canary, or dummy-secret marker.
+
+The machine-identity input is an out-of-band operator attestation. Binding its exact bytes
+detects disagreement between records, but does not prove physical hardware identity.
+Likewise, the derived `contained` field means the verified resolved configuration required
+Docker and the stored runtime provenance matched the pinned agent and verification images;
+it is not independent hardware telemetry for every process. These trust boundaries remain
+visible rather than being upgraded into claims the artifacts cannot prove.
+
+The public `release-check` interface does not use the active corpus, escrow bundle, marker
+files, or leakage policy. It consumes the already-derived record inside the signed release
+submission.

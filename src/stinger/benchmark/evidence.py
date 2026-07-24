@@ -35,14 +35,14 @@ from pathlib import Path, PurePosixPath
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from stinger.benchmark.gates import BenchmarkProtocolManifest, load_benchmark_protocol
+from stinger.benchmark.gates import BenchmarkProtocolManifest
 from stinger.benchmark.protocol import BenchmarkSplit
 from stinger.benchmark.signing import (
     PROTOCOL_SIGNATURE_NAMESPACE,
     ProtocolSignatureError,
     verify_protocol_signature,
 )
-from stinger.config import ConfigError, RunConfig
+from stinger.config import RunConfig
 from stinger.models import Report
 from stinger.report.generate import (
     ReportMismatchError,
@@ -60,10 +60,13 @@ __all__ = [
     "BundleKind",
     "EvidenceBundleError",
     "EvidenceBundleManifest",
+    "EvidenceBundleReceipt",
     "InventoryFile",
     "PublicLeakagePolicy",
+    "VerifiedArtifactReceipt",
     "create_escrow_evidence_bundle",
     "create_public_evidence_bundle",
+    "verify_evidence_bundle_pair",
     "verify_escrow_evidence_bundle",
     "verify_public_evidence_bundle",
 ]
@@ -196,6 +199,41 @@ class PublicLeakagePolicy:
 
     forbidden_sources: tuple[Path, ...]
     forbidden_markers: tuple[str | bytes, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceBundleReceipt:
+    """Exact core bytes and typed artifacts retained after bundle verification.
+
+    The ordinary verifier APIs intentionally return only the public manifest. Builders need
+    a stronger handoff: they must derive hashes from the exact bytes that survived
+    verification, rather than reopening caller-controlled paths later and trusting that the
+    files still name the same artifacts.
+    """
+
+    bundle_kind: BundleKind
+    manifest: EvidenceBundleManifest
+    manifest_bytes: bytes
+    manifest_sha256: str
+    protocol: BenchmarkProtocolManifest
+    protocol_bytes: bytes
+    protocol_signature_bytes: bytes
+    allowed_signers_bytes: bytes
+    config: RunConfig
+    config_bytes: bytes
+    report: Report
+    report_bytes: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedArtifactReceipt:
+    """Cross-bound public and escrow receipts for one benchmark run."""
+
+    public_bundle: EvidenceBundleReceipt
+    escrow_bundle: EvidenceBundleReceipt
+    protocol: BenchmarkProtocolManifest
+    config: RunConfig
+    report: Report
 
 
 @dataclass(frozen=True)
@@ -484,6 +522,189 @@ def verify_escrow_evidence_bundle(
     return manifest
 
 
+def verify_evidence_bundle_pair(
+    public_bundle: Path,
+    escrow_bundle: Path,
+    leakage_policy: PublicLeakagePolicy,
+    *,
+    trusted_allowed_signers: Path,
+    expected_signer_identity: str,
+) -> VerifiedArtifactReceipt:
+    """Verify and cross-bind one public/escrow pair using exact core snapshots.
+
+    Existing bundle verifiers still own inventory, signature, semantic, leakage, and escrow
+    checks. This receipt layer snapshots the verified manifest and core artifacts immediately
+    afterwards, checks those bytes against the in-memory manifest, and derives every later
+    builder value from the snapshots. A path substitution after verification therefore
+    cannot change what a builder records.
+
+    Args:
+        public_bundle: Public evidence bundle directory.
+        escrow_bundle: Corresponding complete escrow bundle directory.
+        leakage_policy: Active public leakage comparison set.
+        trusted_allowed_signers: Independently obtained protocol trust policy.
+        expected_signer_identity: Independently expected protocol signer.
+
+    Returns:
+        Exact-byte receipts cross-bound to the same run.
+
+    Raises:
+        EvidenceBundleError: If either bundle fails or the pair disagrees.
+    """
+    public_manifest = verify_public_evidence_bundle(
+        public_bundle,
+        leakage_policy,
+        trusted_allowed_signers=trusted_allowed_signers,
+        expected_signer_identity=expected_signer_identity,
+    )
+    public_receipt = _snapshot_verified_bundle(public_bundle, public_manifest)
+    _verify_actual_inventory(public_bundle, public_manifest)
+    escrow_manifest = verify_escrow_evidence_bundle(
+        escrow_bundle,
+        trusted_allowed_signers=trusted_allowed_signers,
+        expected_signer_identity=expected_signer_identity,
+    )
+    escrow_receipt = _snapshot_verified_bundle(escrow_bundle, escrow_manifest)
+    _verify_actual_inventory(escrow_bundle, escrow_manifest)
+    _verify_leakage_policy_covers_escrow(
+        escrow_bundle,
+        public_manifest,
+        escrow_manifest,
+        leakage_policy,
+    )
+
+    if public_receipt.protocol_bytes != escrow_receipt.protocol_bytes:
+        raise EvidenceBundleError("public and escrow bundles contain different protocols")
+    if public_receipt.protocol != escrow_receipt.protocol:
+        raise EvidenceBundleError("public and escrow protocol models disagree")
+    if public_receipt.protocol_signature_bytes != escrow_receipt.protocol_signature_bytes:
+        raise EvidenceBundleError("public and escrow protocol signatures disagree")
+    if public_receipt.allowed_signers_bytes != escrow_receipt.allowed_signers_bytes:
+        raise EvidenceBundleError("public and escrow protocol trust policies disagree")
+    if (
+        public_receipt.manifest.protocol_signer_identity
+        != escrow_receipt.manifest.protocol_signer_identity
+    ):
+        raise EvidenceBundleError("public and escrow protocol signer identities disagree")
+    if public_receipt.report_bytes != escrow_receipt.report_bytes:
+        raise EvidenceBundleError("public and escrow report bytes disagree")
+    if public_receipt.report != escrow_receipt.report:
+        raise EvidenceBundleError("public and escrow typed reports disagree")
+    if public_receipt.report.corpus_hash != escrow_receipt.report.corpus_hash:
+        raise EvidenceBundleError("public and escrow corpus bindings disagree")
+    if public_receipt.config.fingerprint() != escrow_receipt.config.fingerprint():
+        raise EvidenceBundleError("public and escrow configuration fingerprints disagree")
+    if public_receipt.config.benchmark_metadata() != escrow_receipt.config.benchmark_metadata():
+        raise EvidenceBundleError("public and escrow benchmark metadata disagree")
+
+    return VerifiedArtifactReceipt(
+        public_bundle=public_receipt,
+        escrow_bundle=escrow_receipt,
+        protocol=public_receipt.protocol,
+        config=escrow_receipt.config,
+        report=public_receipt.report,
+    )
+
+
+def _verify_leakage_policy_covers_escrow(
+    escrow_bundle: Path,
+    public_manifest: EvidenceBundleManifest,
+    escrow_manifest: EvidenceBundleManifest,
+    leakage_policy: PublicLeakagePolicy,
+) -> None:
+    """Prove the public comparison set covers the paired escrow corpus bytes.
+
+    The public verifier binds its leakage-policy fingerprint, but that policy is supplied
+    externally. Without this cross-check, an unrelated dummy directory could satisfy the
+    public scan while the paired sealed corpus was never compared. Extra forbidden sources
+    remain allowed, so separately stored sensitive material can make the policy stricter.
+    """
+    external = _snapshot_policy(leakage_policy)
+    if external.fingerprint != public_manifest.leakage_policy_sha256:
+        raise EvidenceBundleError("public leakage policy changed after bundle verification")
+    escrow_hashes: set[str] = set()
+    for relative, entry in sorted(escrow_manifest.files.items()):
+        under_sealed_corpus = relative.startswith("sealed-corpus/")
+        if under_sealed_corpus != (entry.role is EvidenceRole.SEALED_CORPUS):
+            raise EvidenceBundleError("escrow sealed-corpus path and inventory role disagree")
+        if not under_sealed_corpus:
+            continue
+        content = _read_regular_file(
+            escrow_bundle / relative,
+            "escrow sealed-corpus payload",
+        )
+        if len(content) != entry.size or _sha256(content) != entry.sha256:
+            raise EvidenceBundleError("escrow sealed corpus changed after verification")
+        escrow_hashes.add(entry.sha256)
+    if not escrow_hashes:
+        raise EvidenceBundleError("escrow bundle contains no sealed-corpus files")
+    if not escrow_hashes.issubset(external.forbidden_file_hashes):
+        raise EvidenceBundleError("public leakage policy does not cover the paired escrow corpus")
+
+
+def _snapshot_verified_bundle(
+    directory: Path,
+    manifest: EvidenceBundleManifest,
+) -> EvidenceBundleReceipt:
+    """Snapshot exact core bytes and prove they still match the verified manifest."""
+    manifest_bytes = _read_regular_file(directory / BUNDLE_MANIFEST, "bundle manifest")
+    if manifest_bytes != _manifest_bytes(manifest):
+        raise EvidenceBundleError("bundle manifest changed after verification")
+    sidecar = _read_regular_file(
+        directory / BUNDLE_MANIFEST_HASH,
+        "bundle manifest hash",
+    )
+    if sidecar != f"{_sha256(manifest_bytes)}  {BUNDLE_MANIFEST}\n".encode("ascii"):
+        raise EvidenceBundleError("bundle manifest sidecar changed after verification")
+
+    protocol_bytes = _snapshot_role(directory, manifest, EvidenceRole.PROTOCOL)
+    signature_bytes = _snapshot_role(
+        directory,
+        manifest,
+        EvidenceRole.PROTOCOL_SIGNATURE,
+    )
+    allowed_signers_bytes = _snapshot_role(
+        directory,
+        manifest,
+        EvidenceRole.SIGNER_POLICY,
+    )
+    config_bytes = _snapshot_role(directory, manifest, EvidenceRole.CONFIG)
+    report_bytes = _snapshot_role(directory, manifest, EvidenceRole.REPORT)
+    protocol, config, report = _validate_core_semantics_bytes(
+        protocol_bytes,
+        config_bytes,
+        report_bytes,
+    )
+    return EvidenceBundleReceipt(
+        bundle_kind=manifest.bundle_kind,
+        manifest=manifest,
+        manifest_bytes=manifest_bytes,
+        manifest_sha256=_sha256(manifest_bytes),
+        protocol=protocol,
+        protocol_bytes=protocol_bytes,
+        protocol_signature_bytes=signature_bytes,
+        allowed_signers_bytes=allowed_signers_bytes,
+        config=config,
+        config_bytes=config_bytes,
+        report=report,
+        report_bytes=report_bytes,
+    )
+
+
+def _snapshot_role(
+    directory: Path,
+    manifest: EvidenceBundleManifest,
+    role: EvidenceRole,
+) -> bytes:
+    """Read one verified core role and re-bind its exact bytes to the manifest."""
+    path = _single_role_path(manifest, role)
+    content = _read_regular_file(directory / path, f"bundle {role.value}")
+    entry = manifest.files[path]
+    if len(content) != entry.size or _sha256(content) != entry.sha256:
+        raise EvidenceBundleError(f"bundle {role.value} changed after verification")
+    return content
+
+
 def _core_sources(
     protocol: Path,
     protocol_signature: Path,
@@ -534,9 +755,25 @@ def _validate_core_semantics(
     the files are the artifacts they claim to be and all name the same protocol and
     behavioral configuration.
     """
+    return _validate_core_semantics_bytes(
+        _read_regular_file(protocol, "benchmark protocol"),
+        _read_regular_file(config, "resolved config"),
+        _read_regular_file(report, "report"),
+    )
+
+
+def _validate_core_semantics_bytes(
+    protocol_content: bytes,
+    config_content: bytes,
+    report_content: bytes,
+) -> tuple[BenchmarkProtocolManifest, RunConfig, Report]:
+    """Parse and cross-bind exact protocol, configuration, and report bytes."""
     try:
-        protocol_model = load_benchmark_protocol(protocol)
-    except (OSError, ValueError, ValidationError, yaml.YAMLError) as exc:
+        raw_protocol = yaml.safe_load(protocol_content.decode("utf-8"))
+        if not isinstance(raw_protocol, dict):
+            raise ValueError("benchmark protocol root must be a mapping")
+        protocol_model = BenchmarkProtocolManifest.model_validate(raw_protocol)
+    except (UnicodeDecodeError, ValueError, ValidationError, yaml.YAMLError) as exc:
         raise EvidenceBundleError(f"benchmark protocol is not valid: {exc}") from exc
     expected_protocol = BenchmarkProtocolManifest()
     if protocol_model != expected_protocol:
@@ -544,9 +781,9 @@ def _validate_core_semantics(
             "signed benchmark protocol does not match the frozen Benchmark v1 contract"
         )
 
-    config_model = _load_resolved_config(config)
+    config_model = _load_resolved_config_bytes(config_content)
     try:
-        report_model = load_report(_read_regular_file(report, "report").decode("utf-8"))
+        report_model = load_report(report_content.decode("utf-8"))
         verify_report(report_model)
     except (UnicodeDecodeError, ReportMismatchError) as exc:
         raise EvidenceBundleError(f"benchmark report does not verify: {exc}") from exc
@@ -578,7 +815,11 @@ def _validate_core_semantics(
 
 def _load_resolved_config(path: Path) -> RunConfig:
     """Load a resolved config and verify its embedded self-fingerprint."""
-    content = _read_regular_file(path, "resolved config")
+    return _load_resolved_config_bytes(_read_regular_file(path, "resolved config"))
+
+
+def _load_resolved_config_bytes(content: bytes) -> RunConfig:
+    """Load exact resolved-config bytes and verify their embedded fingerprint."""
     try:
         raw = json.loads(content)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -590,9 +831,10 @@ def _load_resolved_config(path: Path) -> RunConfig:
         raise EvidenceBundleError(
             "resolved benchmark configuration is missing its valid config_fingerprint"
         )
+    raw.pop("config_fingerprint", None)
     try:
-        config = RunConfig.from_yaml(path)
-    except ConfigError as exc:
+        config = RunConfig.model_validate(raw)
+    except ValidationError as exc:
         raise EvidenceBundleError(f"benchmark configuration does not validate: {exc}") from exc
     if embedded != config.fingerprint():
         raise EvidenceBundleError(
@@ -701,6 +943,19 @@ def _verify_escrow_semantics(
         raise EvidenceBundleError(
             "escrow report scenario ids do not exactly cover the sealed corpus"
         )
+    scenarios_by_id = {scenario.id: scenario for scenario in scenarios}
+    for result in report.results:
+        scenario = scenarios_by_id[result.scenario_id]
+        manifest = scenario.manifest
+        if (
+            result.family is not manifest.family
+            or result.benchmark_split is not manifest.benchmark_split
+            or result.scenario_version != manifest.scenario_version
+            or result.cluster_id != manifest.cluster_id
+        ):
+            raise EvidenceBundleError(
+                "escrow report scenario metadata disagrees with the sealed corpus"
+            )
 
     _require_directory(rerunnable_evidence, "rerunnable evidence")
     entries = _walk_tree(rerunnable_evidence)
