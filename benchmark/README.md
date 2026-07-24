@@ -1,7 +1,7 @@
 # Benchmark program
 
 This directory holds the public control plane for the Stinger Benchmark candidate.
-The active scored corpus does **not** live here.
+No scored corpus is currently active or claimed.
 
 - [`../BENCHMARK.md`](../BENCHMARK.md) is the normative candidate protocol.
 - `protocol.yaml` is the machine-readable protocol consumed by benchmark validation.
@@ -19,6 +19,13 @@ The active scored corpus does **not** live here.
 Local active-corpus and escrow material belongs in ignored directories:
 `benchmark/sealed/` and `benchmark/escrow/`. Keeping a file out of Git is not encryption;
 those directories still require normal filesystem access control.
+
+The current local authoring checkout may also expose an ignored
+`benchmark/sealed-candidate` symlink to the externally stored 120-scenario candidate
+checkpoint. The ignored name and symlink are conveniences, not sealing or access control.
+The checkpoint is self-authored construction evidence only; it must not be committed,
+treated as the scored corpus, or entered into `candidate-submission.yaml` until the
+independent review, QA, pilot, freeze, and release gates are actually satisfied.
 
 The existing [`../scenarios/`](../scenarios/) corpus is the public development and
 conformance split. It is intentionally unsuitable for a headline benchmark score because

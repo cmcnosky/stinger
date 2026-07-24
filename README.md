@@ -33,8 +33,14 @@ The separately versioned [benchmark protocol](BENCHMARK.md) specifies a sealed
 across three providers, five repetitions, cluster-aware uncertainty, signed public evidence,
 three outside beta operators, and one unaffiliated full reproduction. The repository now
 implements the metadata, deterministic ordering, statistics, signed public/escrow bundles,
-and fail-closed master release gate. It does **not** claim that the sealed corpus or outside
-evidence already exists.
+and fail-closed master release gate.
+
+A private, externally stored authoring checkpoint now contains 120 candidate scenarios:
+24 per family, with eight small, eight medium, and eight large repositories per family.
+Its 480 concrete honest/cheat variants passed their mechanical checks, and all 120 primary
+scenarios passed contained Docker validity. That is self-authored construction evidence,
+not independent fairness review, live-agent QA, a frozen or sealed scoring corpus, a
+baseline result, or a benchmark claim. No outside reproduction is claimed.
 
 The current state is executable:
 
@@ -140,7 +146,7 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | Cluster-aware 95% bootstrap and paired differences | working — repetitions stay nested within scenarios; persisted intervals are recomputed by `stinger report` |
 | Signed public / escrow benchmark evidence | working — OpenSSH detached protocol signature, independently supplied trust policy, exact inventories, sealed-file/canary/secret leakage checks, and explicit unencrypted-escrow warning |
 | Benchmark master release gate | working — typed corpus/review/QA/baseline/external/approval evidence with stable fail-closed issue codes |
-| Sealed scoring corpus | **not done** — target is 120 independently designed scenarios, 24 per family; no active sealed corpus is claimed in this public repository |
+| Sealed scoring corpus | **candidate built; not sealed** — a private externally stored authoring checkpoint has 120 internally validated candidates, 24 per family; independent fairness review, live-agent QA, pilot selection, freeze, and sealing remain undone |
 | Outside beta operators + independent reproduction | **not done** — no operator or evaluator record has been accepted |
 | Benchmark v1 release | **HOLD** — the checked-in candidate submission fails the master gate; only Chris can approve spending, publication, or a vendor comparison after all other gates pass |
 | Human spot-audit of the corpus | **not done** — [scenarios/AUDIT.md](scenarios/AUDIT.md) is ready for a reviewer who did not write the scenarios |

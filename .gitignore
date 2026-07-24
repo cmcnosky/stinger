@@ -26,6 +26,7 @@ repro/
 # filesystem access control. Public protocol/status/review records live elsewhere under
 # benchmark/ and remain tracked.
 benchmark/sealed/
+benchmark/sealed-candidate
 benchmark/escrow/
 benchmark/private/
 
