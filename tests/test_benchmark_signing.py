@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+import stinger.benchmark.signing as signing_module
 from stinger.benchmark.gates import (
     PublicationIssueCode,
     authorize_benchmark_submission,
@@ -178,6 +179,74 @@ class TestProtocolSigning:
 
         assert outcome.exit_code == 0, outcome.output
         assert f"signer {IDENTITY}" in outcome.output
+
+    def test_verification_uses_the_same_signature_and_trust_bytes_it_hashes(
+        self,
+        tmp_path: Path,
+        signing_material: dict[str, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Mutable caller paths cannot change what OpenSSH verifies after snapshotting."""
+        signature = sign_protocol(
+            signing_material["protocol"],
+            signing_material["private_key"],
+        )
+        expected = verify_protocol_signature(
+            signing_material["protocol"],
+            signature,
+            signing_material["allowed_signers"],
+            IDENTITY,
+        )
+
+        alternate_key = tmp_path / "alternate-key"
+        generated = subprocess.run(
+            [
+                "ssh-keygen",
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-f",
+                str(alternate_key),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if generated.returncode != 0:
+            pytest.fail(f"could not generate alternate test key: {generated.stderr}")
+        alternate_artifact = tmp_path / "alternate-protocol.yaml"
+        alternate_artifact.write_bytes(signing_material["protocol"].read_bytes())
+        alternate_signature = sign_protocol(alternate_artifact, alternate_key)
+        alternate_trust = (
+            f"{IDENTITY} {alternate_key.with_suffix('.pub').read_text(encoding='utf-8').strip()}\n"
+        ).encode()
+        original_run = signing_module._run
+
+        def replace_caller_paths_then_run(
+            argv: list[str],
+            *,
+            stdin: bytes | None = None,
+        ) -> subprocess.CompletedProcess[bytes]:
+            signature.write_bytes(alternate_signature.read_bytes())
+            signing_material["allowed_signers"].write_bytes(alternate_trust)
+            return original_run(argv, stdin=stdin)
+
+        monkeypatch.setattr(
+            signing_module,
+            "_run",
+            replace_caller_paths_then_run,
+        )
+
+        verification = verify_protocol_signature(
+            signing_material["protocol"],
+            signature,
+            signing_material["allowed_signers"],
+            IDENTITY,
+        )
+
+        assert verification == expected
 
 
 def test_signature_namespaces_are_distinct_while_the_signing_key_remains_visible(

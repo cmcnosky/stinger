@@ -7,9 +7,9 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from stinger.models import Family
+from stinger.models import Family, ScenarioResult
 
-__all__ = ["ScenarioOrderItem", "deterministic_blocked_ids"]
+__all__ = ["ScenarioOrderItem", "deterministic_blocked_ids", "observed_scenario_order"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +65,18 @@ def deterministic_blocked_ids(
         available = [family for family in Family if block < len(by_family.get(family, ()))]
         available.sort(key=lambda family: _key(seed, "block", str(block), family.value))
         ordered.extend(by_family[family][block] for family in available)
+    return tuple(ordered)
+
+
+def observed_scenario_order(results: Iterable[ScenarioResult]) -> tuple[str, ...]:
+    """Return scenario ids in first-observed order, ignoring later repetitions."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for result in results:
+        if result.scenario_id in seen:
+            continue
+        seen.add(result.scenario_id)
+        ordered.append(result.scenario_id)
     return tuple(ordered)
 
 

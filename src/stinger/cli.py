@@ -11,11 +11,14 @@ stinger benchmark …          # candidate protocol, evidence, comparisons, rele
 from __future__ import annotations
 
 import json
+import os
+import stat
 from datetime import UTC, datetime
 from pathlib import Path
 
 import click
-from pydantic import ValidationError
+import yaml
+from pydantic import TypeAdapter, ValidationError
 
 from stinger.adapters.factory import AdapterError, build_adapter
 from stinger.benchmark.comparison import (
@@ -34,6 +37,8 @@ from stinger.benchmark.gates import (
     BenchmarkGateReport,
     BenchmarkProtocolManifest,
     BenchmarkReleaseSubmission,
+    ErrorDispositionRecord,
+    SealedCorpusRecord,
     authorize_benchmark_submission,
     authorize_reproduction_statement,
     evaluate_benchmark_release,
@@ -42,6 +47,11 @@ from stinger.benchmark.gates import (
 )
 from stinger.benchmark.ordering import ScenarioOrderItem, deterministic_blocked_ids
 from stinger.benchmark.provenance import RuntimePreflightError, verify_runtime_provenance
+from stinger.benchmark.records import (
+    BaselineRecordError,
+    build_baseline_configuration_record,
+    write_baseline_configuration_record,
+)
 from stinger.benchmark.signing import (
     ProtocolSignatureError,
     sign_protocol,
@@ -572,21 +582,147 @@ def verify_escrow_bundle(
     click.echo(f"verified escrow evidence bundle (inventory {manifest.inventory_sha256})")
 
 
+@benchmark_commands.command(name="build-baseline-record")
+@click.option("--configuration-id", required=True)
+@click.option(
+    "--corpus-record",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option(
+    "--public-bundle",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option(
+    "--escrow-bundle",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option(
+    "--forbidden-source",
+    type=click.Path(path_type=Path),
+    multiple=True,
+    required=True,
+)
+@click.option(
+    "--marker-file",
+    type=click.Path(path_type=Path),
+    multiple=True,
+    required=True,
+)
+@click.option(
+    "--allowed-signers",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option("--signer-identity", required=True)
+@click.option(
+    "--machine-identity",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option(
+    "--error-dispositions",
+    type=click.Path(path_type=Path),
+)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def build_baseline_record(
+    configuration_id: str,
+    corpus_record: Path,
+    public_bundle: Path,
+    escrow_bundle: Path,
+    forbidden_source: tuple[Path, ...],
+    marker_file: tuple[Path, ...],
+    allowed_signers: Path,
+    signer_identity: str,
+    machine_identity: Path,
+    error_dispositions: Path | None,
+    output: Path,
+) -> None:
+    """Build a baseline record only from independently verified artifact bytes."""
+    try:
+        corpus = _load_sealed_corpus_record(corpus_record)
+        dispositions = _load_error_dispositions(error_dispositions)
+        policy = _public_leakage_policy(forbidden_source, marker_file)
+        record = build_baseline_configuration_record(
+            configuration_id,
+            corpus=corpus,
+            public_bundle=public_bundle,
+            escrow_bundle=escrow_bundle,
+            leakage_policy=policy,
+            protocol_allowed_signers=allowed_signers,
+            protocol_signer_identity=signer_identity,
+            machine_identity_artifact=machine_identity,
+            error_dispositions=dispositions,
+        )
+        write_baseline_configuration_record(output, record)
+    except (BaselineRecordError, EvidenceBundleError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    except (OSError, UnicodeDecodeError, ValidationError, ValueError, yaml.YAMLError) as exc:
+        raise click.ClickException("baseline record input is invalid") from exc
+    click.echo("baseline configuration record created from verified artifacts")
+
+
+def _load_sealed_corpus_record(path: Path) -> SealedCorpusRecord:
+    """Load a closed corpus record without echoing its storage path on failure."""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("corpus record is unavailable")
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("corpus record root must be a mapping")
+    return SealedCorpusRecord.model_validate(raw)
+
+
+def _load_error_dispositions(
+    path: Path | None,
+) -> tuple[ErrorDispositionRecord, ...]:
+    """Load an optional closed list of human error dispositions."""
+    if path is None:
+        return ()
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("error disposition record is unavailable")
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return TypeAdapter(tuple[ErrorDispositionRecord, ...]).validate_python(raw)
+
+
 def _public_leakage_policy(
     forbidden_sources: tuple[Path, ...],
     marker_files: tuple[Path, ...],
 ) -> PublicLeakagePolicy:
     """Read sensitive markers from files so their values never appear in process arguments."""
-    markers: list[bytes] = []
-    for marker_file in marker_files:
-        marker = marker_file.read_bytes().rstrip(b"\r\n")
-        if not marker:
-            raise EvidenceBundleError(f"marker file is empty: {marker_file}")
-        markers.append(marker)
+    markers = [_read_private_marker(marker_file) for marker_file in marker_files]
     return PublicLeakagePolicy(
         forbidden_sources=forbidden_sources,
         forbidden_markers=tuple(markers),
     )
+
+
+def _read_private_marker(path: Path) -> bytes:
+    """Read a regular nonsymlink marker without blocking on special files."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise EvidenceBundleError(
+            "a marker file must be a readable regular nonsymlink file"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise EvidenceBundleError("a marker file must be a readable regular nonsymlink file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    marker = b"".join(chunks).rstrip(b"\r\n")
+    if not marker:
+        raise EvidenceBundleError("a marker file is empty")
+    return marker
 
 
 def _parse_named_paths(values: tuple[str, ...]) -> dict[str, Path]:

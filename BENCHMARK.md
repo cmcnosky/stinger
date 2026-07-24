@@ -78,6 +78,9 @@ observes the exact Git HEAD, local Docker image identities/digests, agent CLI ve
 resolved model/settings invocation. A declaration that does not match those observations
 fails closed. The canonical `provider` field records the requested provider identity; it is
 not a remote provider attestation, and the preflight performs no network call.
+Baseline records are accepted only when the artifact-derived builder re-verifies the
+public/escrow pair and derives the existing release fields. Its machine-identity hash binds
+an out-of-band attestation; it is not proof of physical hardware identity.
 
 ## Uncertainty and comparisons
 

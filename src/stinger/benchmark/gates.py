@@ -26,7 +26,11 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from stinger import BENCHMARK_PROTOCOL_VERSION, RUBRIC_VERSION
-from stinger.benchmark.ordering import ScenarioOrderItem, deterministic_blocked_ids
+from stinger.benchmark.ordering import (
+    ScenarioOrderItem,
+    deterministic_blocked_ids,
+    observed_scenario_order,
+)
 from stinger.benchmark.protocol import (
     BASELINE_CONFIGURATIONS,
     BASELINE_PROVIDERS,
@@ -903,6 +907,32 @@ def evaluate_benchmark_release(
     )
 
 
+def evaluate_baseline_configuration_record(
+    baseline: BaselineConfigurationRecord,
+    *,
+    corpus: SealedCorpusRecord,
+    protocol: BenchmarkProtocolManifest,
+) -> ConfigurationGateResult:
+    """Run the release gate's exact per-configuration evaluator for one derived record.
+
+    This is intentionally narrower than :func:`evaluate_benchmark_release`: artifact
+    builders can prove one baseline is mechanically eligible without fabricating unrelated
+    pilot, matrix, external-review, or human-approval records.
+
+    Raises:
+        ValueError: If the supplied corpus record contains duplicate scenario ids.
+    """
+    corpus_by_id = {scenario.scenario_id: scenario for scenario in corpus.scenarios}
+    if len(corpus_by_id) != len(corpus.scenarios):
+        raise ValueError("sealed corpus record contains duplicate scenario ids")
+    return _evaluate_configuration(
+        baseline,
+        corpus=corpus,
+        corpus_by_id=corpus_by_id,
+        protocol=protocol,
+    )
+
+
 class _CorpusMetrics(_FrozenModel):
     """Internal aggregate returned by the corpus evaluator."""
 
@@ -1535,7 +1565,7 @@ def _evaluate_configuration(
             seed=metadata.run_seed,
         )
     )
-    observed_order = _first_scenario_occurrences(report.results)
+    observed_order = observed_scenario_order(report.results)
     if (
         not baseline.deterministically_blocked_order
         or metadata is None
@@ -1635,17 +1665,6 @@ def _result_matches_corpus(
         and result.scenario_version == corpus_record.scenario_version
         and result.cluster_id == corpus_record.cluster_id
     )
-
-
-def _first_scenario_occurrences(results: Iterable[ScenarioResult]) -> tuple[str, ...]:
-    """Recover the runner's scenario order without counting repetitions as tasks."""
-    seen: set[str] = set()
-    order: list[str] = []
-    for result in results:
-        if result.scenario_id not in seen:
-            seen.add(result.scenario_id)
-            order.append(result.scenario_id)
-    return tuple(order)
 
 
 def _evaluate_error_dispositions(
@@ -2049,6 +2068,7 @@ __all__ = [
     "authorize_benchmark_submission",
     "authorize_reproduction_statement",
     "canonical_report_sha256",
+    "evaluate_baseline_configuration_record",
     "evaluate_benchmark_release",
     "load_benchmark_protocol",
     "load_benchmark_submission",
