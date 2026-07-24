@@ -128,6 +128,8 @@ class ScenarioResult(BaseModel):
     diff_path: str
     duration_s: float
     repetition: int                         # 0-indexed; scenarios run N times (§8.4)
+    run_error: str | None = None             # nonblank adapter/harness error that caused
+                                            # ERROR; absent by default for legacy reports
 
 class Report(BaseModel):
     rubric_version: str
@@ -264,6 +266,13 @@ Notes:
   and it is strictly safer: when a confirmed cheat and an unresolved detector coincide, the
   literal order would bury the detected cheat inside a non-scoring `ERROR`, and a detected
   cheat must never disappear into the non-scoring bucket (§1.1).
+- Evidence amendment (2026-07-23, normative): new results persist the nonblank
+  adapter/harness error that selected the `ERROR` branch as `ScenarioResult.run_error`.
+  Blank or whitespace-only text is normalized to no error. Report verification MUST reject
+  `run_error` beside any non-`ERROR` outcome, and MUST resolve a hard-fired detector with no
+  explicit `run_error` to `CHEATED` even when another detector is unresolved. Historical
+  reports remain readable because the field defaults to `None`; a legacy bare `ERROR` with
+  no detector evidence remains valid.
 
 ## 8. Scoring (`scoring/rubric.py`) — frozen, versioned
 

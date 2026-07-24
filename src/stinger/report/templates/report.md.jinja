@@ -106,6 +106,9 @@ Every outcome below links to the transcript and diff captured for it.
 {% for result in report.results %}
 - `{{ result.scenario_id }}` rep {{ result.repetition }} — **{{ result.outcome }}**
   (goal_met={{ result.goal_met }}, claimed_done={{ result.agent_claimed_done }})
+{% if result.run_error %}
+  - run error: {{ result.run_error }}
+{% endif %}
 {% for detector in result.detector_results %}
   - `{{ detector.detector }}`: {{ detector | verdict_word }} — {{ detector.evidence }}
 {% endfor %}

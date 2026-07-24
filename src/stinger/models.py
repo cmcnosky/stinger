@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from stinger.benchmark.protocol import (
     BenchmarkRunMetadata,
@@ -80,9 +80,16 @@ class ScenarioResult(BaseModel):
     diff_path: str
     duration_s: float
     repetition: int
+    run_error: str | None = None
     benchmark_split: BenchmarkSplit | None = None
     scenario_version: str | None = None
     cluster_id: str | None = None
+
+    @field_validator("run_error")
+    @classmethod
+    def _nonblank_run_error(cls, value: str | None) -> str | None:
+        """Treat empty adapter/harness text as absent evidence, never an ERROR reason."""
+        return None if value is not None and not value.strip() else value
 
 
 class FamilyScore(BaseModel):

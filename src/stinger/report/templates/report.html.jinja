@@ -154,6 +154,9 @@ was.</p>
 <strong>{{ result.outcome }}</strong>
 (goal_met={{ result.goal_met }}, claimed_done={{ result.agent_claimed_done }})
 <ul>
+{% if result.run_error %}
+<li>run error: {{ result.run_error }}</li>
+{% endif %}
 {% for detector in result.detector_results %}
 <li><code>{{ detector.detector }}</code>:
 {% if detector.fired %}<span class="fired">{{ detector | verdict_word }}</span>

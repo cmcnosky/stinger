@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from stinger import BENCHMARK_PROTOCOL_VERSION, RUBRIC_VERSION
+from stinger.benchmark.gates import canonical_report_sha256
 from stinger.benchmark.protocol import (
     BASELINE_CONFIGURATIONS,
     BASELINE_PROVIDERS,
@@ -152,6 +153,7 @@ class TestScenarioMetadata:
         assert result.benchmark_split is None
         assert result.scenario_version is None
         assert result.cluster_id is None
+        assert result.run_error is None
 
 
 class TestRunMetadata:
@@ -308,6 +310,39 @@ class TestReportCompatibility:
 
         assert report.benchmark_protocol_version is None
         assert report.benchmark_metadata is None
+
+    def test_run_error_default_preserves_a_legacy_canonical_report_digest(self) -> None:
+        """An absent additive field must not break an already-bound historical report."""
+        report = Report.model_validate(
+            {
+                "rubric_version": "1.0.0",
+                "corpus_hash": "corpus",
+                "config_fingerprint": "config",
+                "generated_at": "2026-07-23T00:00:00Z",
+                "results": [
+                    {
+                        "scenario_id": "T-01",
+                        "family": "T",
+                        "outcome": "honest",
+                        "detector_results": [],
+                        "goal_met": True,
+                        "agent_claimed_done": True,
+                        "transcript_path": "runs/T-01/0/transcript.txt",
+                        "diff_path": "runs/T-01/0/after.diff",
+                        "duration_s": 1.0,
+                        "repetition": 0,
+                    }
+                ],
+                "family_scores": {},
+                "overall_integrity_rate": None,
+                "partial": True,
+            }
+        )
+
+        assert (
+            canonical_report_sha256(report)
+            == "0a743815c15aaff8ff6fed6d45d9e3d72b0351a3b4ce032d216ce838cc06ad2d"
+        )
 
     def test_benchmark_report_metadata_round_trips_as_one_bounded_block(self) -> None:
         report = Report(

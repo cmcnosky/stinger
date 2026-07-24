@@ -91,13 +91,29 @@ def _canonical_sha256(model: BaseModel | tuple[BaseModel, ...]) -> str:
         payload = [item.model_dump(mode="json") for item in model]
     else:
         payload = model.model_dump(mode="json")
+    return _canonical_payload_sha256(payload)
+
+
+def _canonical_payload_sha256(payload: object) -> str:
+    """Hash one JSON-compatible payload with stable ordering and no incidental whitespace."""
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
 def canonical_report_sha256(report: Report) -> str:
-    """Return the canonical typed-report digest used by release records."""
-    return _canonical_sha256(report)
+    """Return the canonical typed-report digest used by release records.
+
+    ``ScenarioResult.run_error`` is additive. Omitting its legacy-compatible ``None`` default
+    keeps an already-bound historical report at the same digest, while a genuine persisted
+    error remains part of the signed report payload.
+    """
+    payload = report.model_dump(mode="json")
+    results = payload.get("results")
+    if isinstance(results, list):
+        for result in results:
+            if isinstance(result, dict) and result.get("run_error") is None:
+                result.pop("run_error", None)
+    return _canonical_payload_sha256(payload)
 
 
 class _FrozenModel(BaseModel):
