@@ -84,6 +84,31 @@ canary values, or private paths. Its access-log hash chain is explicitly coopera
 kernel-enforced or independently anchored. The detached signature uses
 `stinger-benchmark-candidate-validation`.
 
+The current public package is committed at
+[`benchmark/receipts/candidate-validation-v2/`](receipts/candidate-validation-v2/).
+It verifies 120 machine-validated benchmark-candidate scenarios: 24 per family, with eight
+small, eight medium, and eight larger multi-module repositories per family. It binds
+Stinger merge commit `d34cc05af95c697d327de67dfe1162f6a3f1d2ae`, Protocol `2.0.0`,
+rubric `1.0.0`, the approved verifier identity, 120 unique clusters, 120 canaries, and
+120/120 contained validity results. Verify the committed bytes without access to the
+private candidate:
+
+```bash
+(cd benchmark/receipts/candidate-validation-v2 && shasum -a 256 -c SHA256SUMS)
+
+stinger benchmark verify-candidate-receipt \
+  benchmark/receipts/candidate-validation-v2/candidate-validation-receipt.json \
+  --signature \
+    benchmark/receipts/candidate-validation-v2/candidate-validation-receipt.json.sig \
+  --allowed-signers \
+    benchmark/receipts/candidate-validation-v2/candidate-validation.allowed_signers \
+  --signer-identity stinger-candidate-validation-v2
+```
+
+This receipt is candidate-validation evidence only. It is not a Protocol 2 construction
+receipt, accepted machine-review or QA evidence, a frozen or sealed scoring corpus, a
+baseline result, a cross-machine reproduction, or a benchmark release.
+
 ## Candidate promotion
 
 Promotion is the only permitted candidate-to-sealed mutation: it changes exactly the
