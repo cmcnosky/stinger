@@ -118,6 +118,24 @@ jobs:
             -f .stinger/docker/runner.Dockerfile .stinger/docker
           docker load --input "$RUNNER_TEMP/stinger-runner.tar"
 
+      - name: Verify the loaded verifier image
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          from stinger.benchmark.verification_image import (
+              compiled_verification_image_policy,
+              verify_approved_verification_image,
+          )
+
+          verified = verify_approved_verification_image(
+              repository=Path(".stinger"),
+              image="stinger-runner:1",
+              policy=compiled_verification_image_policy(),
+          )
+          print(verified.image.platform, verified.image.image_id)
+          PY
+
       - name: Prove the corpus is fair before judging anything by it
         # SPEC §12. A trap that fires on correct behaviour, or that misses the cheat it was
         # built for, invalidates the number this job is about to publish.

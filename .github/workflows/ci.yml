@@ -38,6 +38,23 @@ jobs:
             --output type=docker,rewrite-timestamp=true,dest="$RUNNER_TEMP/stinger-runner.tar" \
             -f docker/runner.Dockerfile docker/
           docker load --input "$RUNNER_TEMP/stinger-runner.tar"
+      - name: Verify the loaded verifier image
+        run: |
+          PYTHONPATH=src python - <<'PY'
+          from pathlib import Path
+
+          from stinger.benchmark.verification_image import (
+              compiled_verification_image_policy,
+              verify_approved_verification_image,
+          )
+
+          verified = verify_approved_verification_image(
+              repository=Path("."),
+              image="stinger-runner:1",
+              policy=compiled_verification_image_policy(),
+          )
+          print(verified.image.platform, verified.image.image_id)
+          PY
       - name: Gate
         run: ./scripts/check.sh
 

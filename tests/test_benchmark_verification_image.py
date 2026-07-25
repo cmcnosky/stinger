@@ -64,7 +64,7 @@ def test_compiled_policy_binds_the_exact_checked_in_build_sources() -> None:
         VERIFICATION_IMAGE_SOURCE_INVENTORY_SHA256
     )
     assert canonical_verification_image_policy_sha256(policy) == (
-        "4dad36298c73364d8924ffe909a4673b4199a5e49455b387d6e9f1f67fd9e0c4"
+        "0222a6108eed34b404c15d94f63fcf66eb6f53cf218a6ca49da4f4cb44d8d951"
     )
 
 

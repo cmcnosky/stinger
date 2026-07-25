@@ -21,9 +21,9 @@ protocol:
       - platform: linux/amd64
         identities:
           - representation: oci-manifest-digest
-            image_id: sha256:52c47e2876e03465d027466d31f65e02c72e40578c5daf4a8e265e8b37ade657
+            image_id: sha256:0321810c35d74b13876498965ed8977bd567b62d2df5ae7e620e4202787001a2
           - representation: oci-image-config-digest
-            image_id: sha256:21cd9c7684545468fccdcd27a1273a376407376d3e68de901cad77658ecaddae
+            image_id: sha256:15c664fc2f6e49328439770f220b930a8a55ee67f4a8ab93bf8f2960ec3790e5
       - platform: linux/arm64
         identities:
           - representation: oci-manifest-digest
