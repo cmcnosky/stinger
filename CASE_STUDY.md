@@ -1,9 +1,10 @@
 # How Stinger was built
 
 Stinger was built by directing AI coding agents under a strict governance regime — the same
-discipline the tool itself exists to measure. The code was written by an AI agent; the
-engineering judgment that made it *trustworthy* was the human's, and that is the part worth
-talking about, because it is the harder and rarer half.
+discipline the tool itself exists to measure. The code was written by AI agents; the
+operator supplied scope, frozen rules, release authority, and the insistence that claims be
+artifact-checkable. That governance made the implementation auditable. The separately
+claimed benchmark remains a candidate until its machine-only Protocol 2 gates are complete.
 
 The operator is not a career software engineer — a background in construction purchasing and
 small-scale manufacturing, not computer science. That is not the disclaimer it might read as.
@@ -13,7 +14,7 @@ it — the constitution the agents worked under, the gates nobody was allowed to
 the insistence on evidence over anyone's say-so, including the AI's, and including the
 operator's own.
 
-## What the human actually did
+## What the operator actually did
 
 "Prompted an AI" does not describe it. The contribution was governance:
 
@@ -27,11 +28,12 @@ operator's own.
   `stinger validate` re-proving all 30 traps fair on every commit. No self-report is trusted,
   least of all the AI's — which is, after all, the entire subject of the tool.
 - **Enforced honesty.** Every capability in the README is graded by evidence, and the
-  acceptance table publishes what is *not* done as prominently as what is. The corpus ships
-  with [scenarios/AUDIT.md](scenarios/AUDIT.md), a guide inviting an outside reviewer to
-  attack the traps' fairness — openly flagging that the scenarios and the detectors that
-  judge them share an author, which is a conflict of interest a serious reviewer should
-  probe.
+  acceptance table publishes what is *not* done as prominently as what is. The public
+  corpus ships its adversarial construct questions in
+  [scenarios/AUDIT.md](scenarios/AUDIT.md), while Benchmark Protocol 2 requires
+  artifact-bound variants, contained QA, provider-diverse machine veto reviews, blind agent
+  solves, signed receipts, and cross-machine reproduction for the separate sealed corpus.
+  Commentary cannot waive or relabel those mechanical gates.
 - **Spending the money to hit reality.** Every fixture test passed. The decision was to run
   it against live agents anyway — because a measurement instrument that has only ever been
   tested against its own fixtures has not been tested.
@@ -76,12 +78,13 @@ six independently-worded refusals — and the mislabelled package was committed 
 thing this project must never do. The lesson is written into the corpus docs as
 ["the trap validation cannot catch"](scenarios/README.md#the-trap-validation-cannot-catch).
 
-Before it was assembled for presentation, the whole repository was adversarially audited by
-six independent AI review agents — one instructed to be a hostile reviewer hunting for the
+Before it was assembled for presentation, the whole repository was adversarially audited in
+six role-separated AI review runs — one instructed to be a hostile reviewer hunting for the
 single most damaging thing. Their top finding was that the boldest claims were the least
-checkable, because the reproducibility packages had been left out of the commit. The response
-was not softer wording; it was committing the evidence. That is why [evidence/](evidence/)
-exists.
+checkable, because the reproducibility packages had been left out of the commit. The
+response was not softer wording; it was committing the evidence. That is why
+[evidence/](evidence/) exists. Role separation is useful adversarial coverage, not proof of
+organizational independence.
 
 ## What this is not
 
@@ -90,7 +93,9 @@ family, and the tool itself stamps every such report `PARTIAL / DEV RUN — this
 presented as a Stinger score`. It is not a verdict on any vendor's agent — a clean run on six
 scenarios, once, is an instrument check, not a leaderboard. The demo's strict-vs-permissive
 agents are deterministic shell scripts, not models: they prove the instrument discriminates,
-nothing more. The corpus's human spot-audit is prepared but not yet done, and the README says
-so. And none of this is a claim that AI replaces engineers — it is one datapoint about what a
-disciplined operator can now direct AI to build, with the receipts committed so the claim can
-be checked rather than trusted.
+nothing more. Protocol 2 does not use a human spot-audit as benchmark evidence. The separate
+120-scenario corpus cannot be described as a released benchmark until its signed candidate
+receipt, sealed freeze, full baseline matrix, conformance evidence, cross-machine
+reproduction, and final publication authorization all pass. And none of this is a claim that
+AI replaces engineers — it is one datapoint about what a disciplined operator can now direct
+AI to build, with receipts that let the claims be checked rather than trusted.

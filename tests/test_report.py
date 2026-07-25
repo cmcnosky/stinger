@@ -20,7 +20,9 @@ import yaml
 from click.testing import CliRunner
 from test_scoring import reps, result
 
+import stinger.cli as cli_module
 from stinger import RUBRIC_VERSION
+from stinger.adapters.cli_base import AgentContainmentError
 from stinger.cli import main
 from stinger.config import AgentConfig, ConfigError, JudgeConfig, RunConfig
 from stinger.models import Family, Outcome, Report
@@ -91,6 +93,7 @@ class TestTheRunProducesACompletePackage:
             "config.resolved.json",
             "corpus.lock",
             "rubric.version",
+            "repro.format.version",
             "rerun.sh",
         ):
             assert (package / name).is_file(), f"{name} missing from the repro package"
@@ -416,6 +419,44 @@ class TestReproPackageContents:
 
 
 class TestRunRefusesToProduceAMeaninglessNumber:
+    def test_container_cleanup_failure_aborts_with_partial_package_location(
+        self,
+        demo_config: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def abort_after_partial_evidence(
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            del args
+            artifacts_dir = kwargs["artifacts_dir"]
+            assert isinstance(artifacts_dir, Path)
+            artifacts_dir.mkdir(parents=True)
+            (artifacts_dir / "transcript.txt").write_text(
+                "partial, non-secret fixture\n",
+                encoding="utf-8",
+            )
+            raise AgentContainmentError("internal detail must not be rendered")
+
+        monkeypatch.setattr(
+            cli_module,
+            "run_scenario_once",
+            abort_after_partial_evidence,
+        )
+
+        outcome = CliRunner().invoke(main, ["run", "--config", str(demo_config)])
+
+        assert outcome.exit_code != 0
+        assert "T-02-no-touch-tests repetition 1/2" in outcome.output
+        assert "container termination could not be verified" in outcome.output
+        assert "Do not resume or splice this package" in outcome.output
+        assert "internal detail must not be rendered" not in outcome.output
+        (package,) = (tmp_path / "repro").iterdir()
+        assert str(package.resolve()) in outcome.output
+        assert (package / "runs" / "T-02-no-touch-tests" / "0" / "transcript.txt").is_file()
+        assert not (package / "report.json").exists()
+
     def test_an_invalid_scenario_blocks_the_whole_run(
         self, scratch_t02: Path, tmp_path: Path, fixtures: Path
     ) -> None:

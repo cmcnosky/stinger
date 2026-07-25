@@ -9,6 +9,7 @@ from click.testing import CliRunner
 
 from stinger.benchmark.comparison import (
     BenchmarkComparisonError,
+    ComparisonStatus,
     build_paired_comparison,
     verify_paired_comparison,
 )
@@ -19,21 +20,37 @@ from stinger.benchmark.protocol import (
     ProviderId,
     canonical_agent_configuration_fingerprint,
 )
+from stinger.benchmark.verification_image import (
+    APPROVED_LINUX_ARM64_VERIFICATION_IMAGE_ID,
+    canonical_verification_image_policy_sha256,
+    compiled_verification_image_policy,
+)
 from stinger.cli import main
+from stinger.docker_runtime import DOCKER_RUNTIME_CLAIM_BOUNDARY
 from stinger.models import DetectorResult, Family, Outcome, Report, ScenarioResult
 from stinger.report.generate import build_report
 
 DIGEST_A = f"sha256:{'a' * 64}"
-DIGEST_B = f"sha256:{'b' * 64}"
+DIGEST_B = APPROVED_LINUX_ARM64_VERIFICATION_IMAGE_ID
+
+
+def test_machine_reproduced_status_uses_protocol_2_claim_wording() -> None:
+    assert ComparisonStatus.MACHINE_REPRODUCED.value == "machine_reproduced"
+    assert "independently_reproduced" not in {status.value for status in ComparisonStatus}
 
 
 def metadata(provider: ProviderId, seed: int) -> BenchmarkRunMetadata:
     """Return a fully pinned test configuration."""
     model_id = f"{provider.value}-model"
+    adapter = {
+        ProviderId.OPENAI: "codex",
+        ProviderId.ANTHROPIC: "claude-code",
+        ProviderId.GOOGLE: "aider",
+    }[provider]
     fingerprint = canonical_agent_configuration_fingerprint(
         provider=provider,
         model_id=model_id,
-        agent_adapter="recorded",
+        agent_adapter=adapter,
         agent_cli_version="1.0.0",
         reasoning_effort="high",
         inference_settings={"temperature": 0.0},
@@ -42,7 +59,7 @@ def metadata(provider: ProviderId, seed: int) -> BenchmarkRunMetadata:
     return BenchmarkRunMetadata(
         provider=provider,
         model_id=model_id,
-        agent_adapter="recorded",
+        agent_adapter=adapter,
         agent_cli_version="1.0.0",
         reasoning_effort="high",
         inference_settings={"temperature": 0.0},
@@ -57,6 +74,11 @@ def metadata(provider: ProviderId, seed: int) -> BenchmarkRunMetadata:
 def runtime(provider: ProviderId) -> BenchmarkRuntimeProvenance:
     """Return observed provenance matching a test configuration."""
     model_id = f"{provider.value}-model"
+    executable = {
+        ProviderId.OPENAI: "codex",
+        ProviderId.ANTHROPIC: "claude",
+        ProviderId.GOOGLE: "aider",
+    }[provider]
     return BenchmarkRuntimeProvenance(
         requested_provider=provider,
         requested_model_id=model_id,
@@ -64,10 +86,16 @@ def runtime(provider: ProviderId) -> BenchmarkRuntimeProvenance:
         agent_cli_version="1.0.0",
         agent_container_image_id=DIGEST_A,
         verification_image_id=DIGEST_B,
-        resolved_agent_invocation=("recorded", "--model", model_id, "{prompt}"),
-        resolved_version_invocation=("recorded", "--version"),
+        verification_image_policy_sha256=(
+            canonical_verification_image_policy_sha256(compiled_verification_image_policy())
+        ),
+        resolved_agent_invocation=(executable, "--model", model_id, "{prompt}"),
+        resolved_version_invocation=(executable, "--version"),
         reasoning_effort="high",
         inference_settings={"temperature": 0.0},
+        docker_client_sha256="c" * 64,
+        docker_runtime_fingerprint_sha256="d" * 64,
+        docker_runtime_claim_boundary=DOCKER_RUNTIME_CLAIM_BOUNDARY,
         verified=True,
     )
 

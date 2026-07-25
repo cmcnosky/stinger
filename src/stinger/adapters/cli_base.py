@@ -29,8 +29,10 @@ be driven has not been measured, and must never look like one that behaved well.
 
 from __future__ import annotations
 
+import errno
 import os
 import select
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -38,10 +40,18 @@ from uuid import uuid4
 
 from stinger.adapters.base import AgentRun, Budget
 from stinger.config import AgentConfig
+from stinger.docker_runtime import (
+    DockerRuntimeError,
+    DockerRuntimeIdentity,
+    active_docker_runtime,
+    docker_environment,
+    terminate_docker_container,
+)
 from stinger.harness.sandbox import docker_argv
 
 __all__ = [
     "CREDENTIAL_MOUNT_PATH",
+    "AgentContainmentError",
     "AdapterSettingsError",
     "CliAgentAdapter",
     "CliCapture",
@@ -58,6 +68,10 @@ _REAP_TIMEOUT_S = 10
 
 class AdapterSettingsError(Exception):
     """Raised when declared inference settings cannot be applied by an adapter."""
+
+
+class AgentContainmentError(RuntimeError):
+    """Raised when a live agent container may still be running after an abnormal exit."""
 
 
 class CliCapture:
@@ -167,8 +181,13 @@ class CliAgentAdapter:
         except AdapterSettingsError as exc:
             return self._failed(str(exc))
         container_name: str | None = None
+        container_runtime: DockerRuntimeIdentity | None = None
         if self.config.container_image is not None:
+            container_runtime = active_docker_runtime()
+            if container_runtime is None:
+                return self._failed("contained agent runtime has not passed fixed Docker preflight")
             container_name = f"stinger-agent-{uuid4().hex[:12]}"
+            forwarded_names = self._container_env_names()
             # The agent needs the network to reach its model API. Verification commands never
             # do, and never get it (see harness.sandbox.run_command).
             #
@@ -184,31 +203,56 @@ class CliAgentAdapter:
                 workdir,
                 argv,
                 network=True,
-                forward_env=self._container_env_names(),
+                forward_env=forwarded_names,
                 read_only_mounts=self._credential_mounts(),
                 name=container_name,
+                runtime=container_runtime,
             )
+            try:
+                env = docker_environment(env, forwarded_names=forwarded_names)
+            except DockerRuntimeError as exc:
+                return self._failed(f"fixed Docker runtime is unavailable: {exc}")
 
         try:
             capture = self._capture(argv, workdir, env, budget.max_seconds)
         except FileNotFoundError:
+            _require_agent_container_absent(
+                container_name,
+                container_runtime,
+                context="agent launch failed",
+            )
             return self._failed(f"agent executable not found: {argv[0]!r}")
         except OSError as exc:
+            _require_agent_container_absent(
+                container_name,
+                container_runtime,
+                context="agent launch failed",
+            )
             return self._failed(f"could not launch {argv[0]!r}: {exc}")
+        except BaseException:
+            _require_agent_container_absent(
+                container_name,
+                container_runtime,
+                context="agent execution was interrupted",
+            )
+            raise
+
+        if capture.timed_out or capture.exit_code != 0:
+            # A timeout kills only the local Docker client, while a nonzero or negative
+            # client completion can mean the client crashed after asking the daemon to
+            # start the credentialed network container. Do not parse or retain that output
+            # as ordinary run evidence until exact-name absence has been proved.
+            _require_agent_container_absent(
+                container_name,
+                container_runtime,
+                context=(
+                    "agent exceeded its budget"
+                    if capture.timed_out
+                    else "agent Docker client ended abnormally"
+                ),
+            )
 
         if capture.timed_out:
-            if container_name is not None:
-                # The subprocess timeout killed only the local `docker run` CLIENT; without
-                # this, the agent's container keeps running — with network access — past its
-                # wall-clock ceiling. Stop it by the name it was launched under. Best-effort
-                # (the repetition is already non-scoring either way), but the attempt is what
-                # keeps "was stopped" in the error below an honest sentence.
-                subprocess.run(
-                    ["docker", "kill", container_name],
-                    capture_output=True,
-                    check=False,
-                    timeout=30,
-                )
             stopped = "its container was stopped" if container_name is not None else "it was killed"
             run = self.parse(capture)
             return run.model_copy(
@@ -305,6 +349,29 @@ class CliAgentAdapter:
         return AgentRun(transcript="", final_message="", exit_ok=False, error=message)
 
 
+def _require_agent_container_absent(
+    name: str | None,
+    runtime: DockerRuntimeIdentity | None,
+    *,
+    context: str,
+) -> None:
+    """Prove an abnormally ended contained invocation left no live container."""
+    if name is None:
+        return
+    assert runtime is not None
+    try:
+        terminate_docker_container(
+            name,
+            runtime=runtime,
+            timeout=30,
+        )
+    except DockerRuntimeError:
+        raise AgentContainmentError(
+            f"{context} and container termination could not be verified; "
+            "aborting contained execution"
+        ) from None
+
+
 def _capture_plain(
     argv: list[str], workdir: Path, env: dict[str, str], timeout_s: int
 ) -> CliCapture:
@@ -317,19 +384,40 @@ def _capture_plain(
     ran out, which is a very expensive way to learn about a missing file descriptor.
     """
     try:
-        completed = subprocess.run(
+        process: subprocess.Popen[str] = subprocess.Popen(
             argv,
             cwd=workdir,
             env=env,
             stdin=subprocess.DEVNULL,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_s,
-            check=False,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired as exc:
-        return CliCapture(_as_text(exc.stdout), _as_text(exc.stderr), exit_code=124, timed_out=True)
-    return CliCapture(completed.stdout, completed.stderr, completed.returncode)
+    except OSError:
+        raise
+    timed_out = False
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            stdout, stderr = _terminate_and_collect_plain_process_group(process)
+    except BaseException:
+        _terminate_and_reap_local_process_group(
+            process,
+            terminate_immediately=True,
+        )
+        raise
+    _kill_local_process_group(process)
+    if process.returncode is None:  # pragma: no cover - communicate plus cleanup sets it
+        raise AgentContainmentError("local agent subprocess did not produce an exit status")
+    return CliCapture(
+        stdout,
+        stderr,
+        exit_code=124 if timed_out else process.returncode,
+        timed_out=timed_out,
+    )
 
 
 def _capture_with_pty(
@@ -367,6 +455,7 @@ def _capture_with_pty(
     chunks: list[bytes] = []
     deadline = time.monotonic() + timeout_s
     timed_out = False
+    capture_completed = False
     try:
         while True:
             if time.monotonic() >= deadline:
@@ -376,25 +465,97 @@ def _capture_with_pty(
             if readable:
                 try:
                     data = os.read(master, _READ_CHUNK)
-                except OSError:
-                    break  # the child closed the terminal; EIO here is normal on Linux
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        break  # the child closed the terminal; EIO is normal on Linux
+                    raise
                 if not data:
                     break
                 chunks.append(data)
             elif process.poll() is not None:
                 break
+        capture_completed = True
     finally:
-        os.close(master)
-        if timed_out:
-            process.kill()
         try:
-            process.wait(timeout=_REAP_TIMEOUT_S)
-        except subprocess.TimeoutExpired:  # pragma: no cover - the child ignored SIGKILL
-            process.kill()
+            os.close(master)
+        finally:
+            _terminate_and_reap_local_process_group(
+                process,
+                terminate_immediately=timed_out or not capture_completed,
+            )
 
     output = b"".join(chunks).decode("utf-8", errors="replace")
     exit_code = 124 if timed_out else (process.returncode if process.returncode is not None else 1)
     return CliCapture(output, "", exit_code, timed_out=timed_out)
+
+
+def _terminate_and_reap_local_process_group(
+    process: subprocess.Popen[bytes] | subprocess.Popen[str],
+    *,
+    terminate_immediately: bool,
+) -> None:
+    """Bound and reap a host PTY process group after normal or abnormal capture.
+
+    Interrupts and I/O failures can escape from the PTY loop as ``BaseException``. The
+    process was started in a new session, so killing only its leader would let shell-spawned
+    descendants survive Stinger. Abnormal paths terminate the group immediately. Normal PTY
+    EOF gives the leader one bounded interval to flush file changes, then terminates anything
+    it left behind. A second bounded wait is required because signalling without waiting can
+    leave a zombie and is not proof that cleanup completed.
+    """
+    if terminate_immediately:
+        _kill_local_process_group(process)
+    try:
+        process.wait(timeout=_REAP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        _kill_local_process_group(process)
+        try:
+            process.wait(timeout=_REAP_TIMEOUT_S)
+        except subprocess.TimeoutExpired as exc:  # pragma: no cover - unkillable OS child
+            raise AgentContainmentError(
+                "local agent process group could not be reaped after termination"
+            ) from exc
+    else:
+        # A well-behaved leader may briefly continue after closing its PTY while it flushes
+        # file changes. Once it exits, terminate anything it left behind in the private
+        # session so a background descendant cannot outlive the invocation.
+        if not terminate_immediately:
+            _kill_local_process_group(process)
+
+
+def _kill_local_process_group(
+    process: subprocess.Popen[bytes] | subprocess.Popen[str],
+) -> None:
+    """Send an uncatchable signal to the private session created for one PTY run."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        # Darwin can report EPERM during the narrow transition where the session leader
+        # has exited but Popen has not reaped it yet. Re-polling distinguishes that benign
+        # no-group state from a live group Stinger could not terminate.
+        if process.poll() is None:
+            raise AgentContainmentError(
+                "local agent process group could not be terminated"
+            ) from None
+
+
+def _terminate_and_collect_plain_process_group(
+    process: subprocess.Popen[str],
+) -> tuple[str, str]:
+    """Terminate a timed-out pipe-backed run, collect partial output, and reap it."""
+    _kill_local_process_group(process)
+    try:
+        return process.communicate(timeout=_REAP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        _kill_local_process_group(process)
+        try:
+            return process.communicate(timeout=_REAP_TIMEOUT_S)
+        except subprocess.TimeoutExpired as exc:  # pragma: no cover - unkillable OS child
+            raise AgentContainmentError(
+                "local agent process group could not be reaped after termination"
+            ) from exc
 
 
 def last_paragraph(text: str) -> str:
@@ -420,12 +581,3 @@ def last_paragraph(text: str) -> str:
     while start > 0 and lines[start - 1].strip():
         start -= 1
     return "\n".join(lines[start:end]).strip()
-
-
-def _as_text(stream: str | bytes | None) -> str:
-    """Normalise a possibly-bytes, possibly-absent subprocess stream to text."""
-    if stream is None:
-        return ""
-    if isinstance(stream, bytes):
-        return stream.decode("utf-8", errors="replace")
-    return stream

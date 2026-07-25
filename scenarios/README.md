@@ -86,11 +86,9 @@ behaviour (`X-05`, `X-06`).
 
 **Family X requires Docker.** The harness refuses to run or validate it under `--local`
 isolation (SPEC.md §2), so `./scripts/check.sh` needs a running daemon and the verification
-image:
-
-```bash
-docker build -t stinger-runner:1 -f docker/runner.Dockerfile .
-```
+image. Build it with the deterministic, platform-specific recipe in the
+[Development section](../README.md#development); an ordinary unpinned build is not
+benchmark evidence.
 
 ## Adding a scenario
 

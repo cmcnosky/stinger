@@ -15,10 +15,14 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
+import stinger.benchmark.evidence as evidence_module
+import stinger.benchmark.machine_environment as machine_module
 import stinger.benchmark.records as records_module
+import stinger.benchmark.replay as replay_module
 import stinger.benchmark.reproduction as reproduction_module
 import stinger.cli as cli_module
 from stinger import BENCHMARK_PROTOCOL_VERSION
+from stinger.adapters.base import AgentRun
 from stinger.benchmark.evidence import (
     BUNDLE_MANIFEST,
     EvidenceBundleError,
@@ -30,22 +34,37 @@ from stinger.benchmark.evidence import (
 )
 from stinger.benchmark.gates import (
     BaselineConfigurationRecord,
-    BenchmarkProtocolManifest,
     BenchmarkReleaseSubmission,
     CorpusScenarioRecord,
-    ErrorDispositionRecord,
-    IndependentReproductionRecord,
-    IndependentReproductionStatement,
+    CrossMachineReproductionRecord,
+    CrossMachineReproductionStatement,
     RepositorySize,
     SealedCorpusRecord,
+    authorize_benchmark_protocol,
     authorize_benchmark_submission,
     authorize_reproduction_statement,
     canonical_report_sha256,
+    compiled_benchmark_protocol,
     evaluate_baseline_configuration_record,
     evaluate_benchmark_release,
 )
+from stinger.benchmark.machine_environment import (
+    MachineArchitecture,
+    MachineIdentitySource,
+    MachinePlatform,
+    MachineWorkflowEvidencePaths,
+    build_machine_workflow_attestation,
+    create_machine_environment_identity_artifact,
+    sign_machine_workflow_attestation,
+    write_machine_workflow_attestation,
+)
 from stinger.benchmark.ordering import ScenarioOrderItem, deterministic_blocked_ids
-from stinger.benchmark.protocol import BenchmarkRuntimeProvenance, BenchmarkSplit, ProviderId
+from stinger.benchmark.protocol import (
+    BenchmarkRuntimeProvenance,
+    BenchmarkSplit,
+    ProviderId,
+    canonical_agent_configuration_fingerprint,
+)
 from stinger.benchmark.records import (
     BaselineRecordError,
     build_baseline_configuration_record,
@@ -59,31 +78,43 @@ from stinger.benchmark.reproduction import (
     build_reproduction_diff,
     build_reproduction_record,
     build_reproduction_statement,
-    write_reproduction_diff,
     write_reproduction_record,
+)
+from stinger.benchmark.reproduction_verification import (
+    authorize_public_reproduction_verification_statement,
+    build_public_reproduction_verification_statement,
+    verify_public_reproduction,
+    write_public_reproduction_verification_statement,
 )
 from stinger.benchmark.signing import (
     sign_protocol,
+    sign_public_reproduction_verification_statement,
     sign_release_submission,
     sign_reproduced_report,
     sign_reproduction_statement,
 )
+from stinger.benchmark.verification_image import (
+    APPROVED_LINUX_ARM64_VERIFICATION_IMAGE_ID,
+    canonical_verification_image_policy_sha256,
+    compiled_verification_image_policy,
+)
 from stinger.cli import main
 from stinger.config import AgentConfig, RunConfig
-from stinger.harness.sandbox import Isolation
-from stinger.models import DetectorResult, Family, Outcome, Report, ScenarioResult
+from stinger.docker_runtime import DOCKER_RUNTIME_CLAIM_BOUNDARY
+from stinger.harness.sandbox import Isolation, capture
+from stinger.models import DetectorResult, ExecResult, Family, Outcome, Report, ScenarioResult
 from stinger.report.generate import build_report, render_json
 from stinger.report.repro import write_repro_package
 from stinger.scenario.loader import Scenario, corpus_hash, discover_scenarios
 
 ROOT = Path(__file__).resolve().parents[1]
 SIGNER_IDENTITY = "baseline-builder@example.test"
+MACHINE_SIGNER_IDENTITY = "baseline-machine@example.test"
 AGENT_DIGEST = f"sha256:{'a' * 64}"
-VERIFICATION_DIGEST = f"sha256:{'b' * 64}"
-STINGER_COMMIT = "c" * 40
+VERIFICATION_DIGEST = APPROVED_LINUX_ARM64_VERIFICATION_IMAGE_ID
 CANARY = "STINGER-SYNTHETIC-SEALED-CANARY-41f703"
 DUMMY_SECRET = "sk-dummy-stinger-synthetic-only-91b4c8"
-RELEASE_SCHEMA_SHA256 = "e3e5047f3d40b51f7dc294fa457e227051f3583e3398dae573c47e61335ce095"
+RELEASE_SCHEMA_SHA256 = "199592e986ce57708c4045f3520a84492a0fa3ac63aae9d143c8f2f1fd54684d"
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +122,7 @@ class BaselineArtifacts:
     """Reusable real bundle pair and its derived positive record."""
 
     root: Path
+    repository: Path
     corpus_path: Path
     corpus_record: SealedCorpusRecord
     protocol: Path
@@ -99,6 +131,7 @@ class BaselineArtifacts:
     policy: PublicLeakagePolicy
     allowed_signers: Path
     machine_identity: Path
+    machine_workflow_evidence: MachineWorkflowEvidencePaths
     marker_files: tuple[Path, Path]
     config: RunConfig
     report: Report
@@ -197,12 +230,22 @@ def _write_synthetic_corpus(root: Path) -> tuple[CorpusScenarioRecord, ...]:
                     benchmark_split=BenchmarkSplit.SEALED,
                     scenario_version="1.0.0",
                     cluster_id=cluster_id,
-                    author_id=f"synthetic-author-{family.value.lower()}-{index % 4}",
-                    provenance_recorded=True,
-                    validity_passed=True,
-                    held_out_oracle_passed=True,
-                    containment_passed=True,
-                    dummy_only_safety_data=True,
+                    expected_honest_outcome=Outcome.HONEST,
+                    scenario_artifact_sha256=hashlib.sha256(
+                        f"scenario:{scenario_id}".encode()
+                    ).hexdigest(),
+                    machine_validation_receipt_sha256=hashlib.sha256(
+                        f"validation:{scenario_id}".encode()
+                    ).hexdigest(),
+                    provenance_receipt_sha256=hashlib.sha256(
+                        f"provenance:{scenario_id}".encode()
+                    ).hexdigest(),
+                    containment_receipt_sha256=hashlib.sha256(
+                        f"containment:{scenario_id}".encode()
+                    ).hexdigest(),
+                    dummy_safety_receipt_sha256=hashlib.sha256(
+                        f"safety:{scenario_id}".encode()
+                    ).hexdigest(),
                 )
             )
     first_seed = root / "T-B01" / "seed_repo" / "sealed-markers.txt"
@@ -254,10 +297,16 @@ def _publication_report(
         agent_cli_version=metadata.agent_cli_version,
         agent_container_image_id=metadata.agent_container_digest,
         verification_image_id=metadata.verification_image_digest,
-        resolved_agent_invocation=("recorded", "--model", "synthetic-model"),
-        resolved_version_invocation=("recorded", "--version"),
+        verification_image_policy_sha256=(
+            canonical_verification_image_policy_sha256(compiled_verification_image_policy())
+        ),
+        resolved_agent_invocation=("codex", "--model", "synthetic-model"),
+        resolved_version_invocation=("codex", "--version"),
         reasoning_effort=metadata.reasoning_effort,
         inference_settings=metadata.inference_settings,
+        docker_client_sha256="d" * 64,
+        docker_runtime_fingerprint_sha256="e" * 64,
+        docker_runtime_claim_boundary=DOCKER_RUNTIME_CLAIM_BOUNDARY,
         verified=True,
     )
     return build_report(
@@ -271,10 +320,141 @@ def _publication_report(
     )
 
 
+def _write_synthetic_invocation_evidence(
+    evidence: Path,
+    *,
+    report: Report,
+    config: RunConfig,
+) -> None:
+    """Mint exact receipt inputs for a synthetic high-level builder fixture.
+
+    The records tests exercise bundle and release builders, not the live agent process.
+    They still use the production challenge, receipt, and aggregate constructors so a
+    missing or mismatched row fails exactly as it would in a real benchmark run.
+    """
+    runtime = report.benchmark_runtime_provenance
+    assert runtime is not None
+    ordered_scenario_ids = tuple(dict.fromkeys(result.scenario_id for result in report.results))
+    contexts = replay_module.build_invocation_plan(
+        config=config,
+        corpus_hash=report.corpus_hash,
+        runtime_provenance=runtime,
+        ordered_scenario_ids=ordered_scenario_ids,
+    )
+    contexts_by_row = {(context.scenario_id, context.repetition): context for context in contexts}
+    for result in report.results:
+        context = contexts_by_row[(result.scenario_id, result.repetition)]
+        run_dir = evidence / "runs" / result.scenario_id / str(result.repetition)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        workdir = run_dir / "workdir"
+        workdir.mkdir()
+        transcript = (
+            json.dumps(
+                {
+                    "type": "thread.started",
+                    "thread_id": f"synthetic-{context.invocation_id}",
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        (run_dir / "transcript.txt").write_text(transcript, encoding="utf-8")
+        (run_dir / "before.diff").write_text("", encoding="utf-8")
+        (run_dir / "after.diff").write_text("", encoding="utf-8")
+        report_transcript = evidence / result.transcript_path
+        report_diff = evidence / result.diff_path
+        report_transcript.parent.mkdir(parents=True, exist_ok=True)
+        report_diff.parent.mkdir(parents=True, exist_ok=True)
+        report_transcript.write_text(transcript, encoding="utf-8")
+        report_diff.write_text("", encoding="utf-8")
+        replay_module.write_invocation_challenge(run_dir, context=context)
+        replay_module.write_classification_replay_record(
+            run_dir,
+            scenario_id=result.scenario_id,
+            repetition=result.repetition,
+            run=AgentRun(
+                transcript=transcript,
+                final_message="Implemented the requested synthetic change.",
+                authored_text="Implemented the requested synthetic change.",
+                commands=[],
+                commands_observed=True,
+            ),
+            completion=ExecResult(
+                argv=["python", "completion_check/check.py"],
+                exit_code=0,
+                stdout="",
+                stderr="",
+            ),
+            suite_rerun=None,
+        )
+        replay_module.write_invocation_receipt(
+            run_dir,
+            context=context,
+            transcript=transcript,
+            final_worktree=capture(workdir),
+            result=result,
+        )
+
+
 @pytest.fixture(scope="module")
-def baseline_artifacts(tmp_path_factory: pytest.TempPathFactory) -> BaselineArtifacts:
+def baseline_artifacts(
+    tmp_path_factory: pytest.TempPathFactory,
+    request: pytest.FixtureRequest,
+) -> BaselineArtifacts:
     """Build one real publication-grade fixture and reuse its expensive verification."""
     root = tmp_path_factory.mktemp("baseline-records")
+    host_patch = pytest.MonkeyPatch()
+    host_patch.setattr(
+        machine_module,
+        "_observe_host_identity",
+        lambda: machine_module._ObservedHostIdentity(
+            platform=MachinePlatform.MACOS,
+            architecture=MachineArchitecture.ARM64,
+            identity_source=MachineIdentitySource.MACOS_IOPLATFORM_UUID,
+            canonical_identifier="12345678-1234-4234-9234-123456789abc",
+        ),
+    )
+    request.addfinalizer(host_patch.undo)
+    host_patch.setattr(
+        evidence_module,
+        "verify_report_classifications_from_escrow",
+        lambda _corpus, evidence, *, config, report: replay_module.verify_invocation_aggregate(
+            evidence,
+            config=config,
+            report=report,
+        ),
+    )
+    repository = root / "stinger-checkout"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.name", "Stinger Test"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "config",
+            "user.email",
+            "stinger-test@example.test",
+        ],
+        check=True,
+    )
+    (repository / "tracked.txt").write_text("committed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-q", "-m", "test fixture"],
+        check=True,
+    )
+    repository_commit = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.strip()
     corpus_path = root / "sealed-corpus"
     corpus_path.mkdir()
     corpus_scenarios = _write_synthetic_corpus(corpus_path)
@@ -284,14 +464,15 @@ def baseline_artifacts(tmp_path_factory: pytest.TempPathFactory) -> BaselineArti
         corpus_version="1.0.0",
         corpus_hash=digest,
         scenarios=corpus_scenarios,
-        stored_outside_public_repository=True,
-        access_logging_enabled=True,
-        canary_checks_passed=True,
-        frozen_before_baselines=True,
+        candidate_validation_receipt_sha256="1" * 64,
+        custody_inventory_sha256="2" * 64,
+        access_log_root_sha256="3" * 64,
+        canary_validation_receipt_sha256="4" * 64,
+        freeze=None,
     )
     config = RunConfig(
         agent=AgentConfig(
-            adapter="recorded",
+            adapter="codex",
             model="synthetic-model",
             provider=ProviderId.OPENAI,
             cli_version="1.0.0",
@@ -306,7 +487,7 @@ def baseline_artifacts(tmp_path_factory: pytest.TempPathFactory) -> BaselineArti
         isolation=Isolation.DOCKER,
         image="synthetic-runner:1",
         benchmark_protocol_version=BENCHMARK_PROTOCOL_VERSION,
-        stinger_commit=STINGER_COMMIT,
+        stinger_commit=repository_commit,
         verification_image_digest=VERIFICATION_DIGEST,
         run_seed=17,
     )
@@ -314,12 +495,7 @@ def baseline_artifacts(tmp_path_factory: pytest.TempPathFactory) -> BaselineArti
     report = _publication_report(scenarios_by_id, digest, config)
 
     evidence = root / "rerunnable-evidence"
-    for result in report.results:
-        transcript = evidence / result.transcript_path
-        diff = evidence / result.diff_path
-        transcript.parent.mkdir(parents=True, exist_ok=True)
-        transcript.write_text("synthetic reviewed transcript\n", encoding="utf-8")
-        diff.write_text("", encoding="utf-8")
+    _write_synthetic_invocation_evidence(evidence, report=report, config=config)
     write_repro_package(evidence, report, config, scenarios)
 
     protocol = root / "protocol.yaml"
@@ -374,8 +550,34 @@ def baseline_artifacts(tmp_path_factory: pytest.TempPathFactory) -> BaselineArti
         sealed_corpus=corpus_path,
         rerunnable_evidence=evidence,
     )
-    machine_identity = root / "machine.identity"
-    machine_identity.write_bytes(b"synthetic-machine-attestation-v1\n")
+    machine_identity = root / "machine-environment.json"
+    create_machine_environment_identity_artifact(machine_identity)
+    machine_key, machine_allowed_signers = _new_signing_identity(
+        root,
+        label="machine-workflow-key",
+        identity=MACHINE_SIGNER_IDENTITY,
+    )
+    machine_attestation = root / "machine-workflow-attestation.json"
+    workflow_attestation = build_machine_workflow_attestation(
+        machine_identity_artifact=machine_identity,
+        workflow_input=config_path,
+        workflow_receipt=report_path,
+        repository=repository,
+        expected_stinger_commit=repository_commit,
+        signer_identity=MACHINE_SIGNER_IDENTITY,
+    )
+    write_machine_workflow_attestation(machine_attestation, workflow_attestation)
+    machine_attestation_signature = sign_machine_workflow_attestation(
+        machine_attestation,
+        machine_key,
+    )
+    machine_workflow_evidence = MachineWorkflowEvidencePaths(
+        identity_artifact=machine_identity,
+        attestation=machine_attestation,
+        signature=machine_attestation_signature,
+        allowed_signers=machine_allowed_signers,
+        signer_identity=MACHINE_SIGNER_IDENTITY,
+    )
     marker_canary = root / "canary.marker"
     marker_secret = root / "dummy-secret.marker"
     marker_canary.write_text(CANARY + "\n", encoding="utf-8")
@@ -396,10 +598,11 @@ def baseline_artifacts(tmp_path_factory: pytest.TempPathFactory) -> BaselineArti
         leakage_policy=policy,
         protocol_allowed_signers=allowed_signers,
         protocol_signer_identity=SIGNER_IDENTITY,
-        machine_identity_artifact=machine_identity,
+        machine_workflow_evidence=machine_workflow_evidence,
     )
     return BaselineArtifacts(
         root=root,
+        repository=repository,
         corpus_path=corpus_path,
         corpus_record=corpus_record,
         protocol=protocol,
@@ -408,6 +611,7 @@ def baseline_artifacts(tmp_path_factory: pytest.TempPathFactory) -> BaselineArti
         policy=policy,
         allowed_signers=allowed_signers,
         machine_identity=machine_identity,
+        machine_workflow_evidence=machine_workflow_evidence,
         marker_files=(marker_canary, marker_secret),
         config=config,
         report=report,
@@ -434,8 +638,7 @@ def _build_with_stubbed_receipt(
     *,
     receipt: VerifiedArtifactReceipt | None = None,
     corpus: SealedCorpusRecord | None = None,
-    machine_identity: Path | None = None,
-    dispositions: tuple[ErrorDispositionRecord, ...] = (),
+    machine_workflow_evidence: MachineWorkflowEvidencePaths | None = None,
 ) -> BaselineConfigurationRecord:
     """Invoke the real post-receipt builder checks against a selected receipt."""
     _stub_receipt(monkeypatch, receipt or artifacts.receipt)
@@ -447,8 +650,9 @@ def _build_with_stubbed_receipt(
         leakage_policy=artifacts.policy,
         protocol_allowed_signers=artifacts.allowed_signers,
         protocol_signer_identity=SIGNER_IDENTITY,
-        machine_identity_artifact=machine_identity or artifacts.machine_identity,
-        error_dispositions=dispositions,
+        machine_workflow_evidence=(
+            machine_workflow_evidence or artifacts.machine_workflow_evidence
+        ),
     )
 
 
@@ -486,12 +690,11 @@ def _create_independent_reproduced_evidence(
 
     scenarios = discover_scenarios(artifacts.corpus_path)
     evidence = root / "rerunnable-evidence"
-    for result in report.results:
-        transcript = evidence / result.transcript_path
-        diff = evidence / result.diff_path
-        transcript.parent.mkdir(parents=True, exist_ok=True)
-        transcript.write_text("independently reviewed synthetic transcript\n", encoding="utf-8")
-        diff.write_text("", encoding="utf-8")
+    _write_synthetic_invocation_evidence(
+        evidence,
+        report=report,
+        config=artifacts.config,
+    )
     write_repro_package(evidence, report, artifacts.config, scenarios)
 
     config_path = root / "config.resolved.json"
@@ -525,20 +728,117 @@ def _create_independent_reproduced_evidence(
     return report, public_bundle, escrow_bundle, report_path
 
 
+def _create_independent_machine_workflow_evidence(
+    root: Path,
+    artifacts: BaselineArtifacts,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    workflow_input: Path,
+    workflow_report: Path,
+    signer_identity: str = "independent-machine@example.test",
+    private_key: Path | None = None,
+    allowed_signers: Path | None = None,
+    host_identifier: str = "abcdef1234567890abcdef1234567890",
+) -> MachineWorkflowEvidencePaths:
+    """Create signed workflow evidence for a synthetic second OS environment."""
+    root.mkdir(parents=True, exist_ok=True)
+    metadata = artifacts.report.benchmark_metadata
+    assert metadata is not None
+    assert metadata.stinger_commit is not None
+    observation = machine_module._ObservedHostIdentity(
+        platform=MachinePlatform.LINUX,
+        architecture=MachineArchitecture.X86_64,
+        identity_source=MachineIdentitySource.LINUX_MACHINE_ID,
+        canonical_identifier=host_identifier,
+    )
+    monkeypatch.setattr(
+        machine_module,
+        "_observe_host_identity",
+        lambda: observation,
+    )
+    identity = root / "machine-environment.json"
+    create_machine_environment_identity_artifact(identity)
+    if private_key is None or allowed_signers is None:
+        private_key, allowed_signers = _new_signing_identity(
+            root,
+            label="machine-workflow-key",
+            identity=signer_identity,
+        )
+    attestation_path = root / "machine-workflow-attestation.json"
+    attestation = build_machine_workflow_attestation(
+        machine_identity_artifact=identity,
+        workflow_input=workflow_input,
+        workflow_receipt=workflow_report,
+        repository=artifacts.repository,
+        expected_stinger_commit=metadata.stinger_commit,
+        signer_identity=signer_identity,
+    )
+    write_machine_workflow_attestation(attestation_path, attestation)
+    signature = sign_machine_workflow_attestation(
+        attestation_path,
+        private_key,
+    )
+    return MachineWorkflowEvidencePaths(
+        identity_artifact=identity,
+        attestation=attestation_path,
+        signature=signature,
+        allowed_signers=allowed_signers,
+        signer_identity=signer_identity,
+    )
+
+
 def _release_gate_reproduction_count(
     root: Path,
     artifacts: BaselineArtifacts,
     *,
     statement_path: Path,
     statement_signature: Path,
+    evaluator_private_key: Path,
     evaluator_allowed_signers: Path,
     evaluator_identity: str,
-    record: IndependentReproductionRecord,
+    record: CrossMachineReproductionRecord,
+    reproduced_public_bundle: Path,
+    reproduced_report: Path,
+    reproduced_report_signature: Path,
+    comparison_manifest: Path,
+    discrepancy_ledger: Path,
 ) -> int:
     """Feed exact builder output through signed authorization and the public release gate."""
     reproduction_authorization = authorize_reproduction_statement(
         statement_path,
         statement_signature,
+        evaluator_allowed_signers,
+        evaluator_identity,
+    )
+    public_reproduction_receipt = verify_public_reproduction(
+        reproduction_authorization,
+        target_baseline=artifacts.record,
+        target_public_bundle=artifacts.public_bundle,
+        reproduced_public_bundle=reproduced_public_bundle,
+        reproduced_public_leakage_policy=artifacts.policy,
+        reproduced_protocol_allowed_signers=artifacts.allowed_signers,
+        reproduced_protocol_signer_identity=SIGNER_IDENTITY,
+        reproduced_report_signature=reproduced_report_signature,
+        reproduced_report_allowed_signers=evaluator_allowed_signers,
+        reproduced_report_signer_identity=evaluator_identity,
+        comparison_manifest=comparison_manifest,
+        discrepancy_ledger=discrepancy_ledger,
+    )
+    public_verification_statement = build_public_reproduction_verification_statement(
+        public_reproduction_receipt
+    )
+    public_verification_path = root / "public-reproduction-verification.json"
+    write_public_reproduction_verification_statement(
+        public_verification_statement,
+        public_verification_path,
+    )
+    public_verification_signature = sign_public_reproduction_verification_statement(
+        public_verification_path,
+        evaluator_private_key,
+    )
+    public_reproduction_authorization = authorize_public_reproduction_verification_statement(
+        public_verification_path,
+        public_verification_signature,
         evaluator_allowed_signers,
         evaluator_identity,
     )
@@ -549,7 +849,7 @@ def _release_gate_reproduction_count(
         update={
             "corpus": artifacts.corpus_record,
             "baselines": (artifacts.record,),
-            "independent_reproduction": record,
+            "cross_machine_reproduction": record,
         }
     )
     submission_path = root / "release-submission.json"
@@ -567,12 +867,20 @@ def _release_gate_reproduction_count(
         release_allowed_signers,
         release_identity,
     )
+    _, protocol_authorization = authorize_benchmark_protocol(
+        artifacts.protocol,
+        Path(f"{artifacts.protocol}.sig"),
+        artifacts.allowed_signers,
+        SIGNER_IDENTITY,
+    )
     gate = evaluate_benchmark_release(
         signed_submission,
+        protocol_authorization=protocol_authorization,
         authorization=release_authorization,
         reproduction_authorization=reproduction_authorization,
+        public_reproduction_authorization=public_reproduction_authorization,
     )
-    return gate.metrics.independent_reproductions
+    return gate.metrics.cross_machine_reproductions
 
 
 def test_builds_publication_eligible_record_from_verified_artifacts(
@@ -608,9 +916,167 @@ def test_builds_publication_eligible_record_from_verified_artifacts(
     evaluation = evaluate_baseline_configuration_record(
         record,
         corpus=artifacts.corpus_record,
-        protocol=BenchmarkProtocolManifest(),
+        protocol=compiled_benchmark_protocol(),
     )
     assert evaluation.eligible, evaluation.issues
+
+
+@pytest.mark.parametrize("changed_artifact", ["config", "report"])
+def test_machine_workflow_must_bind_exact_verified_config_and_report_bytes(
+    changed_artifact: str,
+    baseline_artifacts: BaselineArtifacts,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A favorable typed receipt cannot substitute bytes the machine signer did not bind."""
+    receipt = baseline_artifacts.receipt
+    if changed_artifact == "config":
+        changed_receipt = replace(
+            receipt,
+            escrow_bundle=replace(
+                receipt.escrow_bundle,
+                config_bytes=receipt.escrow_bundle.config_bytes + b" ",
+            ),
+        )
+    else:
+        changed_receipt = replace(
+            receipt,
+            public_bundle=replace(
+                receipt.public_bundle,
+                report_bytes=receipt.public_bundle.report_bytes + b" ",
+            ),
+        )
+
+    with pytest.raises(
+        BaselineRecordError,
+        match="signed machine workflow evidence failed verification",
+    ):
+        _build_with_stubbed_receipt(
+            baseline_artifacts,
+            monkeypatch,
+            receipt=changed_receipt,
+        )
+
+
+def test_machine_workflow_signature_and_external_trust_are_required(
+    tmp_path: Path,
+    baseline_artifacts: BaselineArtifacts,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unsigned identity or an unrelated signer policy cannot derive a baseline."""
+    wrong_key, wrong_allowed_signers = _new_signing_identity(
+        tmp_path,
+        label="wrong-machine-key",
+        identity=MACHINE_SIGNER_IDENTITY,
+    )
+    del wrong_key
+    wrong_trust = replace(
+        baseline_artifacts.machine_workflow_evidence,
+        allowed_signers=wrong_allowed_signers,
+    )
+    with pytest.raises(
+        BaselineRecordError,
+        match="signed machine workflow evidence failed verification",
+    ):
+        _build_with_stubbed_receipt(
+            baseline_artifacts,
+            monkeypatch,
+            machine_workflow_evidence=wrong_trust,
+        )
+
+    tampered = tmp_path / "tampered-machine-attestation.json"
+    tampered.write_bytes(
+        baseline_artifacts.machine_workflow_evidence.attestation.read_bytes().replace(
+            b"baseline-machine@example.test",
+            b"altered-machine@example.test",
+        )
+    )
+    changed_statement = replace(
+        baseline_artifacts.machine_workflow_evidence,
+        attestation=tampered,
+    )
+    with pytest.raises(
+        BaselineRecordError,
+        match="signed machine workflow evidence failed verification",
+    ):
+        _build_with_stubbed_receipt(
+            baseline_artifacts,
+            monkeypatch,
+            machine_workflow_evidence=changed_statement,
+        )
+
+
+def test_external_verifier_rebuilds_a_different_hosts_signed_baseline(
+    tmp_path: Path,
+    baseline_artifacts: BaselineArtifacts,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Artifact audit verifies signed host evidence without matching the verifier's host."""
+    artifacts = baseline_artifacts
+    metadata = artifacts.report.benchmark_metadata
+    assert metadata is not None
+    assert metadata.stinger_commit is not None
+    reproduced_observation = machine_module._ObservedHostIdentity(
+        platform=MachinePlatform.LINUX,
+        architecture=MachineArchitecture.X86_64,
+        identity_source=MachineIdentitySource.LINUX_MACHINE_ID,
+        canonical_identifier="abcdef1234567890abcdef1234567890",
+    )
+    monkeypatch.setattr(
+        machine_module,
+        "_observe_host_identity",
+        lambda: reproduced_observation,
+    )
+    external_identity = tmp_path / "external-machine-environment.json"
+    create_machine_environment_identity_artifact(external_identity)
+    external_key, external_trust = _new_signing_identity(
+        tmp_path,
+        label="external-machine-key",
+        identity="external-machine@example.test",
+    )
+    external_attestation = tmp_path / "external-machine-workflow.json"
+    attestation = build_machine_workflow_attestation(
+        machine_identity_artifact=external_identity,
+        workflow_input=artifacts.root / "config.resolved.json",
+        workflow_receipt=artifacts.root / "report.json",
+        repository=artifacts.repository,
+        expected_stinger_commit=metadata.stinger_commit,
+        signer_identity="external-machine@example.test",
+    )
+    write_machine_workflow_attestation(external_attestation, attestation)
+    external_signature = sign_machine_workflow_attestation(
+        external_attestation,
+        external_key,
+    )
+    external_evidence = MachineWorkflowEvidencePaths(
+        identity_artifact=external_identity,
+        attestation=external_attestation,
+        signature=external_signature,
+        allowed_signers=external_trust,
+        signer_identity="external-machine@example.test",
+    )
+
+    verifier_observation = machine_module._ObservedHostIdentity(
+        platform=MachinePlatform.MACOS,
+        architecture=MachineArchitecture.ARM64,
+        identity_source=MachineIdentitySource.MACOS_IOPLATFORM_UUID,
+        canonical_identifier="12345678-1234-4234-9234-123456789abc",
+    )
+    monkeypatch.setattr(
+        machine_module,
+        "_observe_host_identity",
+        lambda: verifier_observation,
+    )
+    rebuilt = _build_with_stubbed_receipt(
+        artifacts,
+        monkeypatch,
+        machine_workflow_evidence=external_evidence,
+    )
+
+    assert (
+        rebuilt.machine_fingerprint_sha256
+        == hashlib.sha256(external_identity.read_bytes()).hexdigest()
+    )
+    assert rebuilt.machine_fingerprint_sha256 != artifacts.record.machine_fingerprint_sha256
 
 
 def test_canonical_writer_creates_once_without_overwrite(
@@ -697,6 +1163,56 @@ def test_rejects_unpinned_or_reordered_report(
             baseline_artifacts,
             monkeypatch,
             receipt=replace(baseline_artifacts.receipt, report=reordered),
+        )
+
+
+def test_rejects_locally_forged_baseline_provider_identity(
+    baseline_artifacts: BaselineArtifacts,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canonical-looking provider label cannot contradict the observed adapter."""
+    metadata = baseline_artifacts.report.benchmark_metadata
+    runtime = baseline_artifacts.report.benchmark_runtime_provenance
+    assert metadata is not None
+    assert runtime is not None
+    assert metadata.agent_cli_version is not None
+    assert metadata.reasoning_effort is not None
+    assert metadata.agent_container_digest is not None
+    forged_model = "claude-synthetic"
+    forged_metadata = metadata.model_copy(
+        update={
+            "provider": ProviderId.ANTHROPIC,
+            "model_id": forged_model,
+            "agent_configuration_fingerprint": canonical_agent_configuration_fingerprint(
+                provider=ProviderId.ANTHROPIC,
+                model_id=forged_model,
+                agent_adapter="codex",
+                agent_cli_version=metadata.agent_cli_version,
+                reasoning_effort=metadata.reasoning_effort,
+                inference_settings=metadata.inference_settings,
+                agent_container_digest=metadata.agent_container_digest,
+            ),
+        }
+    )
+    forged_runtime = runtime.model_copy(
+        update={
+            "requested_provider": ProviderId.ANTHROPIC,
+            "requested_model_id": forged_model,
+            "resolved_agent_invocation": ("codex", "--model", forged_model),
+        }
+    )
+    forged_report = baseline_artifacts.report.model_copy(
+        update={
+            "benchmark_metadata": forged_metadata,
+            "benchmark_runtime_provenance": forged_runtime,
+        }
+    )
+
+    with pytest.raises(BaselineRecordError, match="publication pins"):
+        _build_with_stubbed_receipt(
+            baseline_artifacts,
+            monkeypatch,
+            receipt=replace(baseline_artifacts.receipt, report=forged_report),
         )
 
 
@@ -799,85 +1315,59 @@ def test_rejects_wrong_or_duplicate_corpus_record(
         )
 
 
-def test_machine_identity_is_regular_nonsymlink_and_nonempty(
+def test_machine_identity_must_be_canonical_local_and_signed(
     tmp_path: Path,
     baseline_artifacts: BaselineArtifacts,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Machine attestation bytes are bounded without accepting path substitutions."""
+    """Arbitrary, linked, special, or empty identity files fail before record derivation."""
     empty = tmp_path / "empty.identity"
     empty.touch()
-    with pytest.raises(BaselineRecordError, match="must not be empty"):
+    with pytest.raises(BaselineRecordError, match="workflow evidence failed verification"):
         _build_with_stubbed_receipt(
             baseline_artifacts,
             monkeypatch,
-            machine_identity=empty,
+            machine_workflow_evidence=replace(
+                baseline_artifacts.machine_workflow_evidence,
+                identity_artifact=empty,
+            ),
         )
 
     link = tmp_path / "linked.identity"
     link.symlink_to(baseline_artifacts.machine_identity)
-    with pytest.raises(BaselineRecordError, match="nonsymlink"):
+    with pytest.raises(BaselineRecordError, match="workflow evidence failed verification"):
         _build_with_stubbed_receipt(
             baseline_artifacts,
             monkeypatch,
-            machine_identity=link,
+            machine_workflow_evidence=replace(
+                baseline_artifacts.machine_workflow_evidence,
+                identity_artifact=link,
+            ),
         )
 
     directory = tmp_path / "directory.identity"
     directory.mkdir()
-    with pytest.raises(BaselineRecordError, match="nonsymlink"):
+    with pytest.raises(BaselineRecordError, match="workflow evidence failed verification"):
         _build_with_stubbed_receipt(
             baseline_artifacts,
             monkeypatch,
-            machine_identity=directory,
+            machine_workflow_evidence=replace(
+                baseline_artifacts.machine_workflow_evidence,
+                identity_artifact=directory,
+            ),
         )
 
     fifo = tmp_path / "fifo.identity"
     os.mkfifo(fifo)
-    with pytest.raises(BaselineRecordError, match="nonsymlink"):
-        records_module._sha256_identity_artifact(fifo)
-
-
-def test_error_dispositions_are_unique_and_name_only_errors(
-    baseline_artifacts: BaselineArtifacts,
-) -> None:
-    """Disposition records cannot explain a non-error or duplicate an error key."""
-    first = baseline_artifacts.report.results[0]
-    errored = first.model_copy(
-        update={
-            "outcome": Outcome.ERROR,
-            "goal_met": False,
-            "agent_claimed_done": False,
-            "run_error": "synthetic harness failure",
-        }
-    )
-    report = baseline_artifacts.report.model_copy(
-        update={"results": [errored, *baseline_artifacts.report.results[1:]]}
-    )
-    disposition = ErrorDispositionRecord(
-        scenario_id=errored.scenario_id,
-        repetition=errored.repetition,
-        explained=True,
-        explanation="Reviewed synthetic harness failure.",
-    )
-    records_module._validate_error_dispositions((disposition,), report)
-
-    with pytest.raises(BaselineRecordError, match="duplicate"):
-        records_module._validate_error_dispositions(
-            (disposition, disposition),
-            report,
+    with pytest.raises(BaselineRecordError, match="workflow evidence failed verification"):
+        _build_with_stubbed_receipt(
+            baseline_artifacts,
+            monkeypatch,
+            machine_workflow_evidence=replace(
+                baseline_artifacts.machine_workflow_evidence,
+                identity_artifact=fifo,
+            ),
         )
-    non_error = ErrorDispositionRecord(
-        scenario_id=baseline_artifacts.report.results[1].scenario_id,
-        repetition=baseline_artifacts.report.results[1].repetition,
-        explained=True,
-        explanation="Not actually an error.",
-    )
-    with pytest.raises(BaselineRecordError, match="observed ERROR"):
-        records_module._validate_error_dispositions((non_error,), report)
-    blank = disposition.model_copy(update={"explanation": "  "})
-    with pytest.raises(BaselineRecordError, match="nonblank"):
-        records_module._validate_error_dispositions((blank,), report)
 
 
 def test_cli_writes_record_without_echoing_sensitive_paths(
@@ -920,6 +1410,14 @@ def test_cli_writes_record_without_echoing_sensitive_paths(
         SIGNER_IDENTITY,
         "--machine-identity",
         str(baseline_artifacts.machine_identity),
+        "--machine-attestation",
+        str(baseline_artifacts.machine_workflow_evidence.attestation),
+        "--machine-attestation-signature",
+        str(baseline_artifacts.machine_workflow_evidence.signature),
+        "--machine-attestation-allowed-signers",
+        str(baseline_artifacts.machine_workflow_evidence.allowed_signers),
+        "--machine-attestation-signer-identity",
+        baseline_artifacts.machine_workflow_evidence.signer_identity,
         "--output",
         str(destination),
     ]
@@ -973,6 +1471,14 @@ def test_cli_failure_does_not_echo_sensitive_marker_path(
             SIGNER_IDENTITY,
             "--machine-identity",
             str(baseline_artifacts.machine_identity),
+            "--machine-attestation",
+            str(baseline_artifacts.machine_workflow_evidence.attestation),
+            "--machine-attestation-signature",
+            str(baseline_artifacts.machine_workflow_evidence.signature),
+            "--machine-attestation-allowed-signers",
+            str(baseline_artifacts.machine_workflow_evidence.allowed_signers),
+            "--machine-attestation-signer-identity",
+            baseline_artifacts.machine_workflow_evidence.signer_identity,
             "--output",
             str(destination),
         ],
@@ -984,9 +1490,10 @@ def test_cli_failure_does_not_echo_sensitive_marker_path(
     assert not destination.exists()
 
 
-def test_builds_zero_discrepancy_independent_reproduction_from_verified_artifacts(
+def test_builds_zero_discrepancy_cross_machine_reproduction_from_verified_artifacts(
     tmp_path: Path,
     baseline_artifacts: BaselineArtifacts,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The complete H2 path derives every statement and record hash from real artifacts."""
     artifacts = baseline_artifacts
@@ -996,8 +1503,13 @@ def test_builds_zero_discrepancy_independent_reproduction_from_verified_artifact
             artifacts,
         )
     )
-    reproduced_machine = tmp_path / "reproduced-machine.identity"
-    reproduced_machine.write_bytes(b"synthetic-independent-machine-attestation-v1\n")
+    reproduced_machine_workflow = _create_independent_machine_workflow_evidence(
+        tmp_path / "reproduced-machine",
+        artifacts,
+        monkeypatch,
+        workflow_input=reproduced_report.parent / "config.resolved.json",
+        workflow_report=reproduced_report,
+    )
 
     evaluator_identity = "independent-evaluator@example.test"
     evaluator_key, evaluator_allowed_signers = _new_signing_identity(
@@ -1007,15 +1519,8 @@ def test_builds_zero_discrepancy_independent_reproduction_from_verified_artifact
     )
     report_signature = sign_reproduced_report(reproduced_report, evaluator_key)
 
-    resolution_file = tmp_path / "resolution.json"
     review_template = build_reproduction_diff(artifacts.report, reproduced_report_model)
     assert review_template.discrepancies == ()
-    write_reproduction_diff(resolution_file, review_template)
-    attestation = tmp_path / "unaffiliated-attestation.txt"
-    attestation.write_text(
-        "The synthetic evaluator is unaffiliated with the benchmark project.\n",
-        encoding="utf-8",
-    )
     output = tmp_path / "reproduction-output"
     statement = build_reproduction_statement(
         "synthetic-independent-evaluator",
@@ -1024,18 +1529,16 @@ def test_builds_zero_discrepancy_independent_reproduction_from_verified_artifact
         target_baseline_record=artifacts.record,
         target_public_bundle=artifacts.public_bundle,
         target_escrow_bundle=artifacts.escrow_bundle,
-        target_machine_identity_artifact=artifacts.machine_identity,
+        target_machine_workflow_evidence=artifacts.machine_workflow_evidence,
         reproduced_public_bundle=reproduced_public,
         reproduced_escrow_bundle=reproduced_escrow,
-        reproduced_machine_identity_artifact=reproduced_machine,
+        reproduced_machine_workflow_evidence=reproduced_machine_workflow,
         leakage_policy=artifacts.policy,
         protocol_allowed_signers=artifacts.allowed_signers,
         protocol_signer_identity=SIGNER_IDENTITY,
         reproduced_report_signature=report_signature,
         evaluator_allowed_signers=evaluator_allowed_signers,
         evaluator_signer_identity=evaluator_identity,
-        resolution_file=resolution_file,
-        unaffiliated_attestation=attestation,
         output_directory=output,
     )
 
@@ -1043,7 +1546,7 @@ def test_builds_zero_discrepancy_independent_reproduction_from_verified_artifact
     comparison_path = output / COMPARISON_MANIFEST_FILE
     ledger_path = output / DISCREPANCY_LEDGER_FILE
     assert (
-        IndependentReproductionStatement.model_validate_json(statement_path.read_text())
+        CrossMachineReproductionStatement.model_validate_json(statement_path.read_text())
         == statement
     )
     assert statement.target_report_sha256 == artifacts.record.report_sha256
@@ -1063,10 +1566,7 @@ def test_builds_zero_discrepancy_independent_reproduction_from_verified_artifact
     assert statement.target_machine_fingerprint_sha256 != (
         statement.reproduced_machine_fingerprint_sha256
     )
-    assert (
-        statement.unaffiliated_attestation_sha256
-        == hashlib.sha256(attestation.read_bytes()).hexdigest()
-    )
+    assert statement.target_modal_outcomes_sha256 == (statement.reproduced_modal_outcomes_sha256)
     assert statement.discrepancies == ()
 
     statement_signature = sign_reproduction_statement(statement_path, evaluator_key)
@@ -1078,7 +1578,7 @@ def test_builds_zero_discrepancy_independent_reproduction_from_verified_artifact
     )
     record_path = tmp_path / "reproduction-record.json"
     write_reproduction_record(record_path, record)
-    assert IndependentReproductionRecord.model_validate_json(record_path.read_text()) == record
+    assert CrossMachineReproductionRecord.model_validate_json(record_path.read_text()) == record
     assert record.evaluator_id == statement.evaluator_id
     assert record.configuration_id == statement.configuration_id
     assert record.signer_identity == evaluator_identity
@@ -1115,7 +1615,6 @@ def test_builds_zero_discrepancy_independent_reproduction_from_verified_artifact
     assert str(reproduced_escrow) not in output_text
     assert CANARY not in output_text
     assert DUMMY_SECRET not in output_text
-    assert attestation.read_text(encoding="utf-8").strip() not in output_text
 
     assert (
         _release_gate_reproduction_count(
@@ -1123,9 +1622,15 @@ def test_builds_zero_discrepancy_independent_reproduction_from_verified_artifact
             artifacts,
             statement_path=statement_path,
             statement_signature=statement_signature,
+            evaluator_private_key=evaluator_key,
             evaluator_allowed_signers=evaluator_allowed_signers,
             evaluator_identity=evaluator_identity,
             record=record,
+            reproduced_public_bundle=reproduced_public,
+            reproduced_report=reproduced_report,
+            reproduced_report_signature=report_signature,
+            comparison_manifest=comparison_path,
+            discrepancy_ledger=ledger_path,
         )
         == 1
     )
@@ -1141,8 +1646,6 @@ def test_reproduction_builder_rejects_copied_target_evidence(
     reproduced_escrow = tmp_path / "copied-escrow"
     shutil.copytree(artifacts.public_bundle, reproduced_public)
     shutil.copytree(artifacts.escrow_bundle, reproduced_escrow)
-    reproduced_machine = tmp_path / "different-machine.identity"
-    reproduced_machine.write_text("different caller-entered machine prose\n", encoding="utf-8")
 
     with pytest.raises(ReproductionBuilderError, match="indistinguishable"):
         build_reproduction_statement(
@@ -1152,18 +1655,16 @@ def test_reproduction_builder_rejects_copied_target_evidence(
             target_baseline_record=artifacts.record,
             target_public_bundle=artifacts.public_bundle,
             target_escrow_bundle=artifacts.escrow_bundle,
-            target_machine_identity_artifact=artifacts.machine_identity,
+            target_machine_workflow_evidence=artifacts.machine_workflow_evidence,
             reproduced_public_bundle=reproduced_public,
             reproduced_escrow_bundle=reproduced_escrow,
-            reproduced_machine_identity_artifact=reproduced_machine,
+            reproduced_machine_workflow_evidence=artifacts.machine_workflow_evidence,
             leakage_policy=artifacts.policy,
             protocol_allowed_signers=artifacts.allowed_signers,
             protocol_signer_identity=SIGNER_IDENTITY,
             reproduced_report_signature=tmp_path / "unused-report.sig",
             evaluator_allowed_signers=tmp_path / "unused-evaluator-trust",
             evaluator_signer_identity="independent-evaluator@example.test",
-            resolution_file=tmp_path / "unused-resolution.json",
-            unaffiliated_attestation=tmp_path / "unused-attestation.txt",
             output_directory=tmp_path / "must-not-exist",
         )
 
@@ -1197,9 +1698,10 @@ def test_reproduction_builder_rejects_a_reformatted_target_report(
         )
 
 
-def test_builds_resolved_nonzero_reproduction_and_reaches_release_gate(
+def test_builds_automatic_modal_stable_reproduction_and_reaches_release_gate(
     tmp_path: Path,
     baseline_artifacts: BaselineArtifacts,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Real differing evidence survives review, signing, record derivation, and gate use."""
     artifacts = baseline_artifacts
@@ -1243,8 +1745,13 @@ def test_builds_resolved_nonzero_reproduction_and_reaches_release_gate(
             report=reproduced_report_model,
         )
     )
-    reproduced_machine = tmp_path / "reproduced-machine.identity"
-    reproduced_machine.write_text("independent-machine-attestation-v2\n", encoding="utf-8")
+    reproduced_machine_workflow = _create_independent_machine_workflow_evidence(
+        tmp_path / "reproduced-machine",
+        artifacts,
+        monkeypatch,
+        workflow_input=reproduced_report.parent / "config.resolved.json",
+        workflow_report=reproduced_report,
+    )
     evaluator_identity = "independent-evaluator@example.test"
     evaluator_key, evaluator_allowed_signers = _new_signing_identity(
         tmp_path,
@@ -1257,28 +1764,6 @@ def test_builds_resolved_nonzero_reproduction_and_reaches_release_gate(
         "outcome",
         "detector_results",
     }
-    resolution_file = tmp_path / "resolution.json"
-    write_reproduction_diff(
-        resolution_file,
-        review_template.model_copy(
-            update={
-                "discrepancies": tuple(
-                    item.model_copy(
-                        update={
-                            "resolution": "Independent evaluator confirmed this difference.",
-                            "resolved": True,
-                        }
-                    )
-                    for item in review_template.discrepancies
-                )
-            }
-        ),
-    )
-    attestation = tmp_path / "unaffiliated-attestation.txt"
-    attestation.write_text(
-        "The synthetic evaluator is unaffiliated with the benchmark project.\n",
-        encoding="utf-8",
-    )
     output = tmp_path / "reproduction-output"
     statement = build_reproduction_statement(
         "synthetic-independent-evaluator",
@@ -1287,22 +1772,23 @@ def test_builds_resolved_nonzero_reproduction_and_reaches_release_gate(
         target_baseline_record=artifacts.record,
         target_public_bundle=artifacts.public_bundle,
         target_escrow_bundle=artifacts.escrow_bundle,
-        target_machine_identity_artifact=artifacts.machine_identity,
+        target_machine_workflow_evidence=artifacts.machine_workflow_evidence,
         reproduced_public_bundle=reproduced_public,
         reproduced_escrow_bundle=reproduced_escrow,
-        reproduced_machine_identity_artifact=reproduced_machine,
+        reproduced_machine_workflow_evidence=reproduced_machine_workflow,
         leakage_policy=artifacts.policy,
         protocol_allowed_signers=artifacts.allowed_signers,
         protocol_signer_identity=SIGNER_IDENTITY,
         reproduced_report_signature=report_signature,
         evaluator_allowed_signers=evaluator_allowed_signers,
         evaluator_signer_identity=evaluator_identity,
-        resolution_file=resolution_file,
-        unaffiliated_attestation=attestation,
         output_directory=output,
     )
     assert statement.discrepancies
-    assert all(item.resolved and item.resolution.strip() for item in statement.discrepancies)
+    assert all(
+        item.classification.value == "expected_agent_variance_modal_stable"
+        for item in statement.discrepancies
+    )
 
     statement_path = output / REPRODUCTION_STATEMENT_FILE
     statement_signature = sign_reproduction_statement(statement_path, evaluator_key)
@@ -1318,9 +1804,15 @@ def test_builds_resolved_nonzero_reproduction_and_reaches_release_gate(
             artifacts,
             statement_path=statement_path,
             statement_signature=statement_signature,
+            evaluator_private_key=evaluator_key,
             evaluator_allowed_signers=evaluator_allowed_signers,
             evaluator_identity=evaluator_identity,
             record=record,
+            reproduced_public_bundle=reproduced_public,
+            reproduced_report=reproduced_report,
+            reproduced_report_signature=report_signature,
+            comparison_manifest=output / COMPARISON_MANIFEST_FILE,
+            discrepancy_ledger=output / DISCREPANCY_LEDGER_FILE,
         )
         == 1
     )
@@ -1340,18 +1832,16 @@ def test_reproduction_builder_rejects_output_inside_verified_input(
             target_baseline_record=artifacts.record,
             target_public_bundle=artifacts.public_bundle,
             target_escrow_bundle=artifacts.escrow_bundle,
-            target_machine_identity_artifact=artifacts.machine_identity,
+            target_machine_workflow_evidence=artifacts.machine_workflow_evidence,
             reproduced_public_bundle=tmp_path / "reproduced-public",
             reproduced_escrow_bundle=tmp_path / "reproduced-escrow",
-            reproduced_machine_identity_artifact=tmp_path / "reproduced-machine",
+            reproduced_machine_workflow_evidence=artifacts.machine_workflow_evidence,
             leakage_policy=artifacts.policy,
             protocol_allowed_signers=artifacts.allowed_signers,
             protocol_signer_identity=SIGNER_IDENTITY,
             reproduced_report_signature=tmp_path / "report.sig",
             evaluator_allowed_signers=tmp_path / "evaluator-trust",
             evaluator_signer_identity="independent-evaluator@example.test",
-            resolution_file=tmp_path / "resolution.json",
-            unaffiliated_attestation=tmp_path / "attestation.txt",
             output_directory=artifacts.public_bundle / "reproduction-output",
         )
 
@@ -1367,7 +1857,7 @@ def test_reproduction_builder_requires_exact_benchmark_v1_corpus_shape(
     with pytest.raises(ReproductionBuilderError, match="120-scenario"):
         reproduction_module._require_publication_corpus_shape(
             truncated,
-            BenchmarkProtocolManifest(),
+            compiled_benchmark_protocol(),
         )
     shared_cluster = baseline_artifacts.corpus_record.model_copy(
         update={
@@ -1380,7 +1870,7 @@ def test_reproduction_builder_requires_exact_benchmark_v1_corpus_shape(
     with pytest.raises(ReproductionBuilderError, match="independent 120-scenario"):
         reproduction_module._require_publication_corpus_shape(
             shared_cluster,
-            BenchmarkProtocolManifest(),
+            compiled_benchmark_protocol(),
         )
     unstratified = baseline_artifacts.corpus_record.model_copy(
         update={
@@ -1393,7 +1883,7 @@ def test_reproduction_builder_requires_exact_benchmark_v1_corpus_shape(
     with pytest.raises(ReproductionBuilderError, match="strata"):
         reproduction_module._require_publication_corpus_shape(
             unstratified,
-            BenchmarkProtocolManifest(),
+            compiled_benchmark_protocol(),
         )
 
 
@@ -1439,7 +1929,10 @@ def test_reproduction_builder_rejects_same_machine(
         lambda *args, **kwargs: None,
     )
 
-    with pytest.raises(ReproductionBuilderError, match="machine attestations must differ"):
+    with pytest.raises(
+        ReproductionBuilderError,
+        match="host commitments and machine fingerprints must differ",
+    ):
         build_reproduction_statement(
             "synthetic-independent-evaluator",
             configuration_id=artifacts.record.configuration_id,
@@ -1447,18 +1940,65 @@ def test_reproduction_builder_rejects_same_machine(
             target_baseline_record=artifacts.record,
             target_public_bundle=artifacts.public_bundle,
             target_escrow_bundle=artifacts.escrow_bundle,
-            target_machine_identity_artifact=artifacts.machine_identity,
+            target_machine_workflow_evidence=artifacts.machine_workflow_evidence,
             reproduced_public_bundle=tmp_path / "reproduced-public",
             reproduced_escrow_bundle=tmp_path / "reproduced-escrow",
-            reproduced_machine_identity_artifact=artifacts.machine_identity,
+            reproduced_machine_workflow_evidence=artifacts.machine_workflow_evidence,
             leakage_policy=artifacts.policy,
             protocol_allowed_signers=artifacts.allowed_signers,
             protocol_signer_identity=SIGNER_IDENTITY,
             reproduced_report_signature=tmp_path / "unused.sig",
             evaluator_allowed_signers=tmp_path / "unused.allowed_signers",
             evaluator_signer_identity="independent-evaluator@example.test",
-            resolution_file=tmp_path / "unused-resolution.json",
-            unaffiliated_attestation=tmp_path / "unused-attestation.txt",
+            output_directory=tmp_path / "must-not-exist",
+        )
+
+
+def test_reproduction_builder_requires_distinct_machine_attestation_authorities(
+    tmp_path: Path,
+    baseline_artifacts: BaselineArtifacts,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second host commitment cannot reuse the target attestation authority."""
+    artifacts = baseline_artifacts
+    _, reproduced_public, reproduced_escrow, reproduced_report = (
+        _create_independent_reproduced_evidence(
+            tmp_path / "independent-run",
+            artifacts,
+        )
+    )
+    reproduced_machine_workflow = _create_independent_machine_workflow_evidence(
+        tmp_path / "reproduced-machine",
+        artifacts,
+        monkeypatch,
+        workflow_input=reproduced_report.parent / "config.resolved.json",
+        workflow_report=reproduced_report,
+        signer_identity=MACHINE_SIGNER_IDENTITY,
+        private_key=artifacts.root / "machine-workflow-key",
+        allowed_signers=artifacts.machine_workflow_evidence.allowed_signers,
+    )
+
+    with pytest.raises(
+        ReproductionBuilderError,
+        match="signer identity, key, and trust policy must all differ",
+    ):
+        build_reproduction_statement(
+            "synthetic-independent-evaluator",
+            configuration_id=artifacts.record.configuration_id,
+            corpus=artifacts.corpus_record,
+            target_baseline_record=artifacts.record,
+            target_public_bundle=artifacts.public_bundle,
+            target_escrow_bundle=artifacts.escrow_bundle,
+            target_machine_workflow_evidence=artifacts.machine_workflow_evidence,
+            reproduced_public_bundle=reproduced_public,
+            reproduced_escrow_bundle=reproduced_escrow,
+            reproduced_machine_workflow_evidence=reproduced_machine_workflow,
+            leakage_policy=artifacts.policy,
+            protocol_allowed_signers=artifacts.allowed_signers,
+            protocol_signer_identity=SIGNER_IDENTITY,
+            reproduced_report_signature=tmp_path / "unused.sig",
+            evaluator_allowed_signers=tmp_path / "unused.allowed_signers",
+            evaluator_signer_identity="independent-evaluator@example.test",
             output_directory=tmp_path / "must-not-exist",
         )
 
@@ -1495,18 +2035,16 @@ def test_reproduction_builder_rejects_target_record_not_rederived_exactly(
             target_baseline_record=altered,
             target_public_bundle=artifacts.public_bundle,
             target_escrow_bundle=artifacts.escrow_bundle,
-            target_machine_identity_artifact=artifacts.machine_identity,
+            target_machine_workflow_evidence=artifacts.machine_workflow_evidence,
             reproduced_public_bundle=tmp_path / "reproduced-public",
             reproduced_escrow_bundle=tmp_path / "reproduced-escrow",
-            reproduced_machine_identity_artifact=tmp_path / "reproduced-machine",
+            reproduced_machine_workflow_evidence=artifacts.machine_workflow_evidence,
             leakage_policy=artifacts.policy,
             protocol_allowed_signers=artifacts.allowed_signers,
             protocol_signer_identity=SIGNER_IDENTITY,
             reproduced_report_signature=tmp_path / "unused.sig",
             evaluator_allowed_signers=tmp_path / "unused.allowed_signers",
             evaluator_signer_identity="independent-evaluator@example.test",
-            resolution_file=tmp_path / "unused-resolution.json",
-            unaffiliated_attestation=tmp_path / "unused-attestation.txt",
             output_directory=tmp_path / "must-not-exist",
         )
 
@@ -1531,8 +2069,8 @@ def test_marker_reader_rejects_symlink_and_fifo_without_path_disclosure(
         assert str(unsafe) not in str(captured.value)
 
 
-def test_release_schema_hash_is_unchanged() -> None:
-    """The artifact builder does not change the signed release schema."""
+def test_protocol_2_release_schema_hash_is_frozen() -> None:
+    """Protocol 2 release records have one reviewed canonical schema digest."""
     encoded = json.dumps(
         BenchmarkReleaseSubmission.model_json_schema(),
         sort_keys=True,

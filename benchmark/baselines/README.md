@@ -21,8 +21,15 @@ evidence. The builder derives the report hash, exact public/escrow manifest-file
 machine-attestation hash, and favorable booleans only after the verified artifacts pass the
 existing per-configuration release evaluator.
 
-The machine-identity artifact is an out-of-band identity attestation, not proof of physical
-hardware. The containment field records that the resolved run required Docker and that
-stored runtime provenance matched the pinned images and invocation; it is not independent
+The machine fingerprint is derived from a canonical host-derived environment identity.
+A separately signed workflow attestation must bind that identity to the exact resolved
+configuration, report, and clean Stinger commit. This is distinct-environment evidence,
+not TPM, physical-hardware, cloud-provider, organizational-independence, or anti-cloning
+proof. The containment field records that the resolved run required Docker and that stored
+runtime provenance matched the pinned images and invocation; it is not independent
 per-process hardware telemetry. Escrow and active leakage material stay outside the public
 release gate.
+
+Every `ERROR` result blocks publication under Protocol 2. The builder accepts no error
+disposition file and derives no exclusion that could turn a failed execution into favorable
+evidence.

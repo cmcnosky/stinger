@@ -101,8 +101,15 @@ jobs:
       - name: Build the verification image
         # Verification runs with the network disabled, so pytest has to already be inside the
         # image. `stinger run` preflights this and refuses to start if it is not — otherwise
-        # every scenario would score as a failure for a reason unrelated to your agent.
-        run: docker build -t stinger-runner:1 -f .stinger/docker/runner.Dockerfile .stinger
+        # every scenario would score as a failure for a reason unrelated to your agent. The
+        # deterministic export must reproduce the amd64 ID frozen in the signed protocol.
+        run: |
+          docker buildx build --no-cache --provenance=false \
+            --build-arg SOURCE_DATE_EPOCH=0 \
+            --platform linux/amd64 -t stinger-runner:1 \
+            --output type=docker,rewrite-timestamp=true,dest="$RUNNER_TEMP/stinger-runner.tar" \
+            -f .stinger/docker/runner.Dockerfile .stinger/docker
+          docker load --input "$RUNNER_TEMP/stinger-runner.tar"
 
       - name: Prove the corpus is fair before judging anything by it
         # SPEC §12. A trap that fires on correct behaviour, or that misses the cheat it was

@@ -89,12 +89,13 @@ output_dir: repro
 reps: 3
 
 # Benchmark mode is separately versioned from the frozen scoring rubric. Leave this entire
-# block commented for normal development runs. A v1 publication baseline uses reps: 5 and
-# records the exact Stinger revision, verification image, and fixed ordering/bootstrap seed.
-# Supplying these values does not by itself make a run publishable; the sealed-corpus,
-# construction, matrix, bundle, outside-reproduction, and human gates still apply.
+# block commented for normal development runs. Benchmark v1 under Protocol 2 uses reps: 5
+# and records the exact Stinger revision, verification image, and fixed
+# ordering/bootstrap seed. Supplying these values does not by itself make a run
+# publishable; sealed-corpus, machine-construction, matrix, bundle, cross-environment
+# reproduction, and final operator-authorization gates still apply.
 #
-# benchmark_protocol_version: "1.0.0"
+# benchmark_protocol_version: "2.0.0"
 # stinger_commit: <full 40-character Git commit>
 # verification_image_digest: sha256:<64 lowercase hex digits>
 # run_seed: 17
@@ -103,8 +104,8 @@ reps: 3
 isolation: docker
 
 # The image verification commands run in. It must already contain pytest, because
-# verification runs with the network disabled. Build Stinger's before the first Docker run:
-#     docker build -t stinger-runner:1 -f docker/runner.Dockerfile .
+# verification runs with the network disabled. Build Stinger's before the first Docker run
+# using the deterministic platform-specific recipe in README.md's Development section.
 # `stinger run` preflights this image and refuses to start if it cannot serve a completion
 # check — otherwise every scenario would score as a failure for a reason unrelated to the
 # agent, and the report would look entirely plausible.

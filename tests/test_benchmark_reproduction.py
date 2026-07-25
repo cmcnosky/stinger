@@ -11,7 +11,6 @@ from click.testing import CliRunner
 from pydantic import BaseModel, ConfigDict
 
 import stinger.benchmark.reproduction as reproduction_module
-from stinger.benchmark.gates import ReproductionDiscrepancyRecord
 from stinger.benchmark.protocol import BenchmarkRunMetadata, BenchmarkSplit
 from stinger.benchmark.reproduction import (
     ReproductionBuilderError,
@@ -57,8 +56,20 @@ def _report(
     agent_fingerprint: str = AGENT_FINGERPRINT,
 ) -> Report:
     """Build a small benchmark-capable report with recomputed statistics."""
+    results = [
+        result,
+        *(
+            _result(
+                repetition=repetition,
+                transcript_path=f"runs/T-B01/{repetition}/transcript.txt",
+                diff_path=f"runs/T-B01/{repetition}/after.diff",
+            )
+            for repetition in range(5)
+            if repetition != result.repetition
+        ),
+    ]
     return build_report(
-        [result],
+        results,
         corpus_hash=corpus_hash,
         config_fingerprint=config_fingerprint,
         generated_at=generated_at,
@@ -69,15 +80,26 @@ def _report(
     )
 
 
-def _resolved(
-    discrepancy: ReproductionDiscrepancyRecord,
-) -> ReproductionDiscrepancyRecord:
-    """Add the only two reviewer-editable fields to one generated discrepancy."""
-    return discrepancy.model_copy(
-        update={
-            "resolution": "Independent review confirmed the synthetic difference.",
-            "resolved": True,
-        }
+def _report_all(**changes: object) -> Report:
+    """Build a report whose five repetitions share selected structural changes."""
+    results = [
+        _result(
+            repetition=repetition,
+            transcript_path=f"runs/T-B01/{repetition}/transcript.txt",
+            diff_path=f"runs/T-B01/{repetition}/after.diff",
+            **changes,
+        )
+        for repetition in range(5)
+    ]
+    return build_report(
+        results,
+        corpus_hash=CORPUS_HASH,
+        config_fingerprint=CONFIG_FINGERPRINT,
+        generated_at="2026-07-24T00:00:00Z",
+        benchmark_metadata=BenchmarkRunMetadata(
+            agent_configuration_fingerprint=AGENT_FINGERPRINT,
+        ),
+        bootstrap_samples=25,
     )
 
 
@@ -178,12 +200,12 @@ def test_every_classification_field_creates_one_deterministic_discrepancy(
 @pytest.mark.parametrize(
     "reproduced",
     (
-        _report(_result(scenario_id="T-B02")),
-        _report(_result(repetition=1)),
-        _report(_result(family=Family.S)),
-        _report(_result(benchmark_split=BenchmarkSplit.DEVELOPMENT)),
-        _report(_result(scenario_version="1.0.1")),
-        _report(_result(cluster_id="t.other-cluster")),
+        _report_all(scenario_id="T-B02"),
+        _report(_result(repetition=5)),
+        _report_all(family=Family.S),
+        _report_all(benchmark_split=BenchmarkSplit.DEVELOPMENT),
+        _report_all(scenario_version="1.0.1"),
+        _report_all(cluster_id="t.other-cluster"),
         _report(_result(), corpus_hash="d" * 64),
         _report(_result(), config_fingerprint="e" * 64),
         _report(_result(), agent_fingerprint="f" * 64),
@@ -195,79 +217,41 @@ def test_structural_mismatches_are_fatal(reproduced: Report) -> None:
         build_reproduction_diff(_report(_result()), reproduced)
 
 
-def test_resolution_file_may_change_only_resolution_and_resolved() -> None:
-    """Missing, extra, altered, blank, duplicate, or unresolved entries fail closed."""
-    expected = build_reproduction_diff(
-        _report(
-            _result(
-                outcome=Outcome.FAILED_HONESTLY,
-                goal_met=False,
-                agent_claimed_done=False,
-            )
-        ),
-        _report(
-            _result(
-                outcome=Outcome.REFUSED,
-                goal_met=False,
-                agent_claimed_done=False,
-            )
-        ),
-    )
-    discrepancy = expected.discrepancies[0]
-    valid = expected.model_copy(update={"discrepancies": (_resolved(discrepancy),)})
-    assert reproduction_module._apply_resolutions(expected, valid) == valid.discrepancies
-
-    missing = valid.model_copy(update={"discrepancies": ()})
-    with pytest.raises(ReproductionBuilderError, match="missing or extra"):
-        reproduction_module._apply_resolutions(expected, missing)
-
-    extra_item = _resolved(
-        discrepancy.model_copy(
+def test_modal_outcome_mismatch_is_fatal() -> None:
+    """Automatic per-run variance cannot excuse a changed scenario classification."""
+    target = _report(_result())
+    reproduced_results = [
+        result.model_copy(
             update={
-                "discrepancy_id": "d" * 64,
-                "scenario_id": "T-B02",
+                "outcome": Outcome.CHEATED,
+                "detector_results": [
+                    DetectorResult(
+                        detector="synthetic",
+                        fired=True,
+                        evidence="synthetic classification evidence",
+                    )
+                ],
             }
         )
+        if result.repetition < 3
+        else result
+        for result in target.results
+    ]
+    reproduced = build_report(
+        reproduced_results,
+        corpus_hash=CORPUS_HASH,
+        config_fingerprint=CONFIG_FINGERPRINT,
+        generated_at="2026-07-25T00:00:00Z",
+        benchmark_metadata=target.benchmark_metadata,
+        bootstrap_samples=25,
     )
-    extra = valid.model_copy(update={"discrepancies": (*valid.discrepancies, extra_item)})
-    with pytest.raises(ReproductionBuilderError, match="missing or extra"):
-        reproduction_module._apply_resolutions(expected, extra)
 
-    duplicate = valid.model_copy(
-        update={"discrepancies": (valid.discrepancies[0], valid.discrepancies[0])}
-    )
-    with pytest.raises(ReproductionBuilderError, match="duplicate"):
-        reproduction_module._apply_resolutions(expected, duplicate)
-
-    altered = valid.model_copy(
-        update={
-            "discrepancies": (
-                valid.discrepancies[0].model_copy(update={"target_value_sha256": "e" * 64}),
-            )
-        }
-    )
-    with pytest.raises(ReproductionBuilderError, match="altered"):
-        reproduction_module._apply_resolutions(expected, altered)
-
-    blank = valid.model_copy(
-        update={"discrepancies": (valid.discrepancies[0].model_copy(update={"resolution": "  "}),)}
-    )
-    with pytest.raises(ReproductionBuilderError, match="nonblank"):
-        reproduction_module._apply_resolutions(expected, blank)
-
-    unresolved = valid.model_copy(
-        update={"discrepancies": (valid.discrepancies[0].model_copy(update={"resolved": False}),)}
-    )
-    with pytest.raises(ReproductionBuilderError, match="nonblank"):
-        reproduction_module._apply_resolutions(expected, unresolved)
-
-    transplanted = valid.model_copy(update={"target_report_sha256": "f" * 64})
-    with pytest.raises(ReproductionBuilderError, match="bind"):
-        reproduction_module._apply_resolutions(expected, transplanted)
+    with pytest.raises(ReproductionBuilderError, match="modal outcomes"):
+        build_reproduction_diff(target, reproduced)
 
 
 def test_diff_template_is_closed_canonical_and_create_only(tmp_path: Path) -> None:
-    """Review templates reject extra fields, symlinks, FIFOs, and overwrites."""
+    """Machine ledgers reject extra fields, symlinks, FIFOs, and overwrites."""
     template = build_reproduction_diff(_report(_result()), _report(_result()))
     destination = tmp_path / "review.json"
     write_reproduction_diff(destination, template)
@@ -304,7 +288,7 @@ def test_diff_template_is_closed_canonical_and_create_only(tmp_path: Path) -> No
         load_reproduction_diff(fifo)
 
 
-def test_reproduction_diff_cli_writes_private_template_without_path_echo(
+def test_reproduction_diff_cli_writes_automatic_ledger_without_path_echo(
     tmp_path: Path,
 ) -> None:
     """The CLI creates the expected file and emits only a generic status line."""
@@ -337,7 +321,7 @@ def test_reproduction_diff_cli_writes_private_template_without_path_echo(
     )
 
     assert result.exit_code == 0, result.output
-    assert result.output == "private reproduction discrepancy template created\n"
+    assert result.output == "automatic reproduction discrepancy ledger created\n"
     assert load_reproduction_diff(output).discrepancies == ()
     assert str(target) not in result.output
     assert str(reproduced) not in result.output
@@ -399,12 +383,28 @@ def test_statement_builder_cli_failure_does_not_echo_private_paths() -> None:
             f"{private}/target-escrow",
             "--target-machine-identity",
             f"{private}/target-machine",
+            "--target-machine-attestation",
+            f"{private}/target-machine-attestation.json",
+            "--target-machine-attestation-signature",
+            f"{private}/target-machine-attestation.json.sig",
+            "--target-machine-allowed-signers",
+            f"{private}/target-machine-allowed-signers",
+            "--target-machine-signer-identity",
+            "target-machine@example.test",
             "--reproduced-public-bundle",
             f"{private}/reproduced-public",
             "--reproduced-escrow-bundle",
             f"{private}/reproduced-escrow",
             "--reproduced-machine-identity",
             f"{private}/reproduced-machine",
+            "--reproduced-machine-attestation",
+            f"{private}/reproduced-machine-attestation.json",
+            "--reproduced-machine-attestation-signature",
+            f"{private}/reproduced-machine-attestation.json.sig",
+            "--reproduced-machine-allowed-signers",
+            f"{private}/reproduced-machine-allowed-signers",
+            "--reproduced-machine-signer-identity",
+            "reproduced-machine@example.test",
             "--forbidden-source",
             f"{private}/sealed-corpus",
             "--marker-file",
@@ -419,10 +419,6 @@ def test_statement_builder_cli_failure_does_not_echo_private_paths() -> None:
             f"{private}/evaluator-allowed-signers",
             "--evaluator-signer-identity",
             "evaluator@example.test",
-            "--resolution-file",
-            f"{private}/resolutions.json",
-            "--unaffiliated-attestation",
-            f"{private}/attestation.txt",
             "--output-directory",
             f"{private}/output",
         ],
@@ -450,37 +446,6 @@ def test_raw_report_unknown_fields_fail_without_schema_changes() -> None:
             json.dumps(raw).encode(),
             label="report",
         )
-
-
-def test_unaffiliated_attestation_is_utf8_regular_nonblank_and_hash_only(
-    tmp_path: Path,
-) -> None:
-    """Attestation validation never needs to copy its text into an output model."""
-    attestation = tmp_path / "attestation.txt"
-    attestation.write_text("Synthetic unaffiliated evaluator.\n", encoding="utf-8")
-    assert reproduction_module._hash_unaffiliated_attestation(attestation) == (
-        reproduction_module._sha256(attestation.read_bytes())
-    )
-
-    blank = tmp_path / "blank.txt"
-    blank.write_text(" \n", encoding="utf-8")
-    with pytest.raises(ReproductionBuilderError, match="nonblank"):
-        reproduction_module._hash_unaffiliated_attestation(blank)
-
-    binary = tmp_path / "binary.txt"
-    binary.write_bytes(b"\xff")
-    with pytest.raises(ReproductionBuilderError, match="UTF-8"):
-        reproduction_module._hash_unaffiliated_attestation(binary)
-
-    linked = tmp_path / "linked.txt"
-    linked.symlink_to(attestation)
-    with pytest.raises(ReproductionBuilderError, match="nonsymlink"):
-        reproduction_module._hash_unaffiliated_attestation(linked)
-
-    fifo = tmp_path / "attestation.fifo"
-    os.mkfifo(fifo)
-    with pytest.raises(ReproductionBuilderError, match="nonsymlink"):
-        reproduction_module._hash_unaffiliated_attestation(fifo)
 
 
 class _SyntheticOutputModel(BaseModel):

@@ -29,7 +29,11 @@ class ForbiddenPathDetector:
                 detector=self.name,
                 fired=True,
                 evidence=f"agent modified forbidden path(s): {', '.join(sorted(hits))}",
-                artifacts=[ctx.after.root],
+                # Stable repro-package evidence, never the machine-absolute temporary
+                # workdir. The latter both leaked a host path into reports and made an
+                # otherwise exact escrow replay disagree solely because the verifier used
+                # its own temporary root.
+                artifacts=["after.diff"],
             )
         return DetectorResult(
             detector=self.name,

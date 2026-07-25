@@ -9,24 +9,33 @@ cd "$(dirname "$0")/.."
 # files in a venv acquire the UF_HIDDEN flag and CPython's site.py then silently skips
 # them, leaving an "installed" editable package unimportable.
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+CHECK_PYTHON="${STINGER_CHECK_PYTHON:-python}"
+CHECK_ARTIFACT_DIR="${STINGER_CHECK_ARTIFACT_DIR:-$PWD}"
+COVERAGE_JSON="${STINGER_COVERAGE_JSON:-$CHECK_ARTIFACT_DIR/coverage.json}"
+export STINGER_COVERAGE_JSON="$COVERAGE_JSON"
+mkdir -p "$CHECK_ARTIFACT_DIR"
 
 echo "==> ruff lint"
-ruff check src tests
+"$CHECK_PYTHON" -m ruff check src tests
 
 echo "==> ruff format --check"
-ruff format --check src tests
+"$CHECK_PYTHON" -m ruff format --check src tests
 
 echo "==> mypy (strict)"
-mypy --strict src
+"$CHECK_PYTHON" -m mypy --strict src
 
 echo "==> pytest + coverage floor"
 # [OPEN default] 85% floor on scoring+detectors, 70% overall. One pytest run feeds both: the
 # project-wide floor is enforced here, the stricter per-package floors by coverage_floor.py,
 # which reads the JSON report this writes. --cov-fail-under alone cannot express two numbers.
-pytest --cov=stinger --cov-report=term-missing --cov-report=json --cov-fail-under=70
+"$CHECK_PYTHON" -m pytest \
+  --cov=stinger \
+  --cov-report=term-missing \
+  "--cov-report=json:$COVERAGE_JSON" \
+  --cov-fail-under=70
 
 echo "==> per-package coverage floors (SPEC.md §11)"
-python scripts/coverage_floor.py
+"$CHECK_PYTHON" scripts/coverage_floor.py
 
 echo "==> no-stub check (no NotImplementedError / # BUILD: may remain in shipped src)"
 # Scans every text file under src/. __pycache__ is excluded and binaries are skipped: .pyc
@@ -38,9 +47,9 @@ if grep -rnE --exclude-dir=__pycache__ --binary-files=without-match "NotImplemen
 fi
 
 echo "==> benchmark protocol structure (BENCHMARK.md)"
-python -m stinger.cli benchmark protocol-check benchmark/protocol.yaml
+"$CHECK_PYTHON" -m stinger.cli benchmark protocol-check benchmark/protocol.yaml
 
 echo "==> validity contract over the corpus (SPEC.md §12)"
-python -m stinger.cli validate scenarios/
+"$CHECK_PYTHON" -m stinger.cli validate scenarios/
 
 echo "ALL GREEN"

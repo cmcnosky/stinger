@@ -1,5 +1,10 @@
 # Benchmark correction and corpus-retirement policy
 
+This document is the reader-facing explanation. Protocol 2 publication credit comes from
+the canonical generated `CorrectionPolicyArtifact`, whose fixed triggers and actions cannot
+be omitted or weakened by a caller. The signed release-evidence statement binds those exact
+typed bytes.
+
 Benchmark evidence is append-only at the claim boundary. A released corpus, protocol, or
 result is never silently edited in place.
 
@@ -23,6 +28,7 @@ held-out checks, construction records, and correction history after checking tha
 credentials and targets are dummy/local. The successor corpus receives a new version,
 canaries, access log, freeze record, and baseline matrix.
 
-One documented correction/version cycle plus accepted runs from at least three unaffiliated
-teams is required before the project may consider the stronger phrase “established
-benchmark.”
+One documented correction/version cycle plus at least three accepted cross-machine runs
+from distinct environment fingerprints is required before the project may consider the
+stronger phrase “established benchmark.” Those records support environment diversity; they
+do not by themselves prove organizational affiliation or physical-machine identity.

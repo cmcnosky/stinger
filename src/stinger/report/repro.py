@@ -27,6 +27,11 @@ from pathlib import Path
 
 from stinger import RUBRIC_VERSION
 from stinger.benchmark.protocol import BenchmarkSplit
+from stinger.benchmark.replay import (
+    REPRO_EVIDENCE_FORMAT_FILE,
+    REPRO_EVIDENCE_FORMAT_VERSION,
+    write_invocation_aggregate,
+)
 from stinger.config import RunConfig
 from stinger.models import Report
 from stinger.report.generate import render_html, render_json, render_markdown
@@ -159,11 +164,17 @@ def write_repro_package(
     (directory / "report.html").write_text(render_html(report), encoding="utf-8")
     (directory / "corpus.lock").write_text(build_corpus_lock(scenarios), encoding="utf-8")
     (directory / "rubric.version").write_text(RUBRIC_VERSION + "\n", encoding="utf-8")
+    (directory / REPRO_EVIDENCE_FORMAT_FILE).write_text(
+        REPRO_EVIDENCE_FORMAT_VERSION + "\n",
+        encoding="ascii",
+    )
     if report.benchmark_protocol_version is not None:
         (directory / "benchmark.protocol.version").write_text(
             report.benchmark_protocol_version + "\n",
             encoding="utf-8",
         )
+    if sealed and report.benchmark_protocol_version is not None:
+        write_invocation_aggregate(directory, config=config, report=report)
 
     # Development/retired scenarios may travel with ordinary repro packages. Active sealed
     # scenarios never do: their answer-bearing source belongs only in the access-controlled

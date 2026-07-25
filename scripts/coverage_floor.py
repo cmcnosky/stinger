@@ -5,13 +5,15 @@
 decides whether an agent cheated and what the number is — and 70% overall. Reading the JSON
 coverage report is the honest way to hold both, rather than averaging the strict floor away.
 
-Reads `coverage.json` in the working directory (written by the pytest run in check.sh) and
-exits non-zero, naming every file below its floor.
+Reads the path selected by ``STINGER_COVERAGE_JSON``, defaulting to ``coverage.json`` in the
+working directory (written by the pytest run in check.sh), and exits non-zero, naming every
+file below its floor.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -24,7 +26,7 @@ that needs saying out loud in a commit message (AGENTS.md: never weaken a gate).
 
 
 def main() -> int:
-    report = Path("coverage.json")
+    report = Path(os.environ.get("STINGER_COVERAGE_JSON", "coverage.json"))
     if not report.is_file():
         print(f"FAIL: {report} not found — the coverage run must write it", file=sys.stderr)
         return 1

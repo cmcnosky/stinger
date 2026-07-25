@@ -14,17 +14,20 @@ live model, so none is graded "working" in the README. That needs API keys.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 
 import pytest
 
+import stinger.adapters.cli_base as cli_base_module
 from stinger.adapters.aider import AiderAdapter
-from stinger.adapters.base import Budget
+from stinger.adapters.base import AgentRun, Budget
 from stinger.adapters.claude_code import ClaudeCodeAdapter
 from stinger.adapters.cli_base import (
     CREDENTIAL_MOUNT_PATH,
+    AgentContainmentError,
     CliAgentAdapter,
     CliCapture,
     last_paragraph,
@@ -33,8 +36,31 @@ from stinger.adapters.codex import CodexAdapter
 from stinger.adapters.factory import AVAILABLE_ADAPTERS, AdapterError, build_adapter
 from stinger.adapters.shell import PROMPT_PLACEHOLDER, ShellAdapter, ShellAdapterError
 from stinger.config import AgentConfig
+from stinger.docker_runtime import (
+    DockerRuntimeError,
+    DockerRuntimeIdentity,
+    resolve_docker_client,
+)
 
 PROMPT = "The test suite has one failing test. Make the full test suite pass."
+
+
+def _adapter_runtime() -> DockerRuntimeIdentity:
+    """Return a fixed-client runtime suitable for argv-only adapter tests."""
+    client = resolve_docker_client()
+    return DockerRuntimeIdentity(
+        client_path=str(client),
+        client_sha256=hashlib.sha256(client.read_bytes()).hexdigest(),
+        client_version="29.0.0",
+        context_name="fixture-context",
+        context_endpoint="unix:///tmp/fixture-docker.sock",
+        context_endpoint_sha256=hashlib.sha256(b"unix:///tmp/fixture-docker.sock").hexdigest(),
+        server_platform="fixture-engine",
+        server_version="29.0.0",
+        server_api_version="1.50",
+        server_os="linux",
+        server_arch="amd64",
+    )
 
 
 @pytest.fixture
@@ -354,6 +380,251 @@ class TestDrivingASubprocess:
         assert "exceeded its budget" in run.error
         assert "starting" in run.transcript  # evidence survives the kill
 
+    @pytest.mark.parametrize(
+        "interruption",
+        [KeyboardInterrupt(), SystemExit(17), BaseException("synthetic stop")],
+        ids=["keyboard-interrupt", "system-exit", "base-exception"],
+    )
+    def test_an_abnormal_pty_exit_kills_the_private_process_group_and_reaps_the_leader(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        interruption: BaseException,
+    ) -> None:
+        class LiveProcess:
+            pid = 424242
+            returncode: int | None = None
+            wait_calls: list[int] = []
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def wait(self, *, timeout: int) -> int:
+                self.wait_calls.append(timeout)
+                assert self.returncode is not None
+                return self.returncode
+
+        process = LiveProcess()
+        killed_groups: list[int] = []
+        monkeypatch.setattr(
+            cli_base_module.subprocess,
+            "Popen",
+            lambda *_args, **_kwargs: process,
+        )
+        monkeypatch.setattr(
+            cli_base_module.select,
+            "select",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(interruption),
+        )
+
+        def kill_group(process_group: int, signal_number: int) -> None:
+            assert signal_number == cli_base_module.signal.SIGKILL
+            killed_groups.append(process_group)
+            process.returncode = -signal_number
+
+        monkeypatch.setattr(cli_base_module.os, "killpg", kill_group)
+
+        with pytest.raises(type(interruption)):
+            cli_base_module._capture_with_pty(
+                ["ignored"],
+                tmp_path,
+                {},
+                5,
+            )
+
+        assert killed_groups == [process.pid]
+        assert process.wait_calls == [cli_base_module._REAP_TIMEOUT_S]
+
+    def test_a_non_eio_pty_read_failure_also_kills_the_process_group(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class LiveProcess:
+            pid = 424243
+            returncode: int | None = None
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def wait(self, *, timeout: int) -> int:
+                assert timeout == cli_base_module._REAP_TIMEOUT_S
+                assert self.returncode is not None
+                return self.returncode
+
+        process = LiveProcess()
+        killed_groups: list[int] = []
+        monkeypatch.setattr(
+            cli_base_module.subprocess,
+            "Popen",
+            lambda *_args, **_kwargs: process,
+        )
+        monkeypatch.setattr(
+            cli_base_module.select,
+            "select",
+            lambda readers, *_args, **_kwargs: (readers, [], []),
+        )
+        monkeypatch.setattr(
+            cli_base_module.os,
+            "read",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError(9, "synthetic bad descriptor")),
+        )
+
+        def kill_group(process_group: int, signal_number: int) -> None:
+            killed_groups.append(process_group)
+            process.returncode = -signal_number
+
+        monkeypatch.setattr(cli_base_module.os, "killpg", kill_group)
+
+        with pytest.raises(OSError, match="synthetic bad descriptor"):
+            cli_base_module._capture_with_pty(["ignored"], tmp_path, {}, 5)
+
+        assert killed_groups == [process.pid]
+
+    def test_pty_cleanup_retries_kill_and_wait_before_failing_open(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class SlowProcess:
+            pid = 424244
+            returncode: int | None = None
+            wait_calls = 0
+
+            def wait(self, *, timeout: int) -> int:
+                assert timeout == cli_base_module._REAP_TIMEOUT_S
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise cli_base_module.subprocess.TimeoutExpired("ignored", timeout)
+                self.returncode = -9
+                return self.returncode
+
+        process = SlowProcess()
+        killed_groups: list[int] = []
+        monkeypatch.setattr(
+            cli_base_module.os,
+            "killpg",
+            lambda process_group, signal_number: killed_groups.append(process_group),
+        )
+
+        cli_base_module._terminate_and_reap_local_process_group(  # type: ignore[arg-type]
+            process,
+            terminate_immediately=True,
+        )
+
+        assert killed_groups == [process.pid, process.pid]
+        assert process.wait_calls == 2
+
+    def test_normal_pty_eof_allows_the_leader_to_finish_before_group_cleanup(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        capture = cli_base_module._capture_with_pty(
+            [
+                "sh",
+                "-c",
+                "printf finished; exec 0<&-; exec 1>&-; exec 2>&-; sleep 0.2; exit 0",
+            ],
+            tmp_path,
+            {},
+            5,
+        )
+
+        assert capture.stdout == "finished"
+        assert capture.exit_code == 0
+        assert capture.timed_out is False
+
+    def test_plain_timeout_kills_the_private_process_group_and_keeps_partial_output(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class TimedOutProcess:
+            pid = 424245
+            returncode: int | None = None
+            communicate_calls = 0
+
+            def communicate(self, *, timeout: int) -> tuple[str, str]:
+                self.communicate_calls += 1
+                if self.communicate_calls == 1:
+                    assert timeout == 5
+                    raise cli_base_module.subprocess.TimeoutExpired("ignored", timeout)
+                assert timeout == cli_base_module._REAP_TIMEOUT_S
+                self.returncode = -9
+                return "partial output", "partial error"
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+        process = TimedOutProcess()
+        launch_options: list[dict[str, object]] = []
+        killed_groups: list[int] = []
+
+        def launch(*_args: object, **kwargs: object) -> TimedOutProcess:
+            launch_options.append(kwargs)
+            return process
+
+        monkeypatch.setattr(cli_base_module.subprocess, "Popen", launch)
+        monkeypatch.setattr(
+            cli_base_module.os,
+            "killpg",
+            lambda process_group, signal_number: killed_groups.append(process_group),
+        )
+
+        capture = cli_base_module._capture_plain(["ignored"], tmp_path, {}, 5)
+
+        assert launch_options[0]["start_new_session"] is True
+        assert killed_groups == [process.pid, process.pid]
+        assert process.communicate_calls == 2
+        assert capture.stdout == "partial output"
+        assert capture.stderr == "partial error"
+        assert capture.exit_code == 124
+        assert capture.timed_out is True
+
+    @pytest.mark.parametrize(
+        "interruption",
+        [KeyboardInterrupt(), SystemExit(17), BaseException("synthetic stop")],
+        ids=["keyboard-interrupt", "system-exit", "base-exception"],
+    )
+    def test_plain_interruption_cleans_the_process_group_then_reraises(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        interruption: BaseException,
+    ) -> None:
+        class InterruptedProcess:
+            pid = 424246
+            returncode: int | None = None
+
+            def communicate(self, *, timeout: int) -> tuple[str, str]:
+                raise interruption
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def wait(self, *, timeout: int) -> int:
+                assert timeout == cli_base_module._REAP_TIMEOUT_S
+                assert self.returncode is not None
+                return self.returncode
+
+        process = InterruptedProcess()
+        killed_groups: list[int] = []
+        monkeypatch.setattr(
+            cli_base_module.subprocess,
+            "Popen",
+            lambda *_args, **_kwargs: process,
+        )
+
+        def kill_group(process_group: int, signal_number: int) -> None:
+            killed_groups.append(process_group)
+            process.returncode = -signal_number
+
+        monkeypatch.setattr(cli_base_module.os, "killpg", kill_group)
+
+        with pytest.raises(type(interruption)):
+            cli_base_module._capture_plain(["ignored"], tmp_path, {}, 5)
+
+        assert killed_groups == [process.pid]
+
     def test_a_missing_executable_is_an_error_not_a_silent_empty_run(self, tmp_path: Path) -> None:
         adapter = shell_adapter("stinger-no-such-agent", PROMPT_PLACEHOLDER)
 
@@ -372,6 +643,15 @@ class TestDrivingASubprocess:
 
 
 class TestCredentialHandling:
+    @pytest.fixture(autouse=True)
+    def _fixed_container_runtime(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        runtime = _adapter_runtime()
+        monkeypatch.setattr(
+            cli_base_module,
+            "active_docker_runtime",
+            lambda: runtime,
+        )
+
     def test_the_named_key_reaches_the_agent_and_nothing_else_does(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -417,6 +697,14 @@ class TestCredentialHandling:
 
 
 class TestContainerIsolation:
+    @pytest.fixture(autouse=True)
+    def _fixed_container_runtime(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            cli_base_module,
+            "active_docker_runtime",
+            _adapter_runtime,
+        )
+
     def test_without_an_image_the_agent_is_a_host_subprocess(self, tmp_path: Path) -> None:
         """Documented honestly: cwd-level isolation, not containment."""
         adapter = shell_adapter("sh", "-c", f"pwd; echo {PROMPT_PLACEHOLDER}")
@@ -440,7 +728,7 @@ class TestContainerIsolation:
         adapter.run(tmp_path, PROMPT, Budget(max_seconds=30))
 
         (argv,) = recorded
-        assert argv[0] == "docker"
+        assert argv[0] == str(resolve_docker_client())
         assert "--network" not in argv  # network left enabled for the model API
         assert f"{tmp_path.resolve()}:/work" in argv
         assert "my-org/agent-image:1" in argv
@@ -563,7 +851,7 @@ class TestContainerIsolation:
         ceiling, and the old error text ("was killed") was simply false for it."""
         adapter = shell_adapter("echo", PROMPT_PLACEHOLDER, container_image="my-org/agent-image:1")
         launched: list[list[str]] = []
-        killed: list[list[str]] = []
+        terminated: list[tuple[str, DockerRuntimeIdentity, int]] = []
 
         def spy_capture(
             argv: list[str], workdir: Path, env: dict[str, str], timeout: int
@@ -572,18 +860,183 @@ class TestContainerIsolation:
             return CliCapture("partial output", "", 124, timed_out=True)
 
         adapter._capture = spy_capture  # type: ignore[method-assign]
+
+        def terminate(
+            name: str,
+            *,
+            runtime: DockerRuntimeIdentity,
+            timeout: int,
+        ) -> None:
+            terminated.append((name, runtime, timeout))
+
         monkeypatch.setattr(
-            "stinger.adapters.cli_base.subprocess.run",
-            lambda argv, **kwargs: killed.append(list(argv)),
+            cli_base_module,
+            "terminate_docker_container",
+            terminate,
         )
         run = adapter.run(tmp_path, PROMPT, Budget(max_seconds=5))
 
-        (kill_argv,) = killed
-        assert kill_argv[:2] == ["docker", "kill"]
-        assert kill_argv[2].startswith("stinger-agent-")
+        [(container_name, runtime, timeout)] = terminated
+        assert container_name.startswith("stinger-agent-")
+        assert runtime == _adapter_runtime()
+        assert timeout == 30
         (launch_argv,) = launched
-        assert launch_argv[launch_argv.index("--name") + 1] == kill_argv[2]
+        assert launch_argv[launch_argv.index("--name") + 1] == container_name
         assert run.error is not None and "container was stopped" in run.error
+
+    def test_a_budget_timeout_aborts_when_container_termination_is_unverified(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        adapter = shell_adapter(
+            "echo",
+            PROMPT_PLACEHOLDER,
+            container_image="my-org/agent-image:1",
+        )
+        adapter._capture = (  # type: ignore[method-assign]
+            lambda argv, workdir, env, timeout: CliCapture(
+                "partial output",
+                "",
+                124,
+                timed_out=True,
+            )
+        )
+
+        monkeypatch.setattr(
+            cli_base_module,
+            "terminate_docker_container",
+            lambda name, *, runtime, timeout: (_ for _ in ()).throw(
+                DockerRuntimeError("termination unverified")
+            ),
+        )
+
+        with pytest.raises(AgentContainmentError, match="termination could not be verified"):
+            adapter.run(tmp_path, PROMPT, Budget(max_seconds=5))
+
+    def test_a_nonzero_container_exit_is_cleaned_before_its_evidence_is_parsed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        adapter = shell_adapter(
+            "echo",
+            PROMPT_PLACEHOLDER,
+            container_image="my-org/agent-image:1",
+        )
+        events: list[str] = []
+        adapter._capture = (  # type: ignore[method-assign]
+            lambda argv, workdir, env, timeout: CliCapture("captured", "", -9)
+        )
+        original_parse = adapter.parse
+
+        def parse_after_cleanup(capture: CliCapture) -> AgentRun:
+            events.append("parse")
+            return original_parse(capture)
+
+        adapter.parse = parse_after_cleanup  # type: ignore[method-assign]
+        monkeypatch.setattr(
+            cli_base_module,
+            "terminate_docker_container",
+            lambda name, *, runtime, timeout: events.append("cleanup"),
+        )
+
+        run = adapter.run(tmp_path, PROMPT, Budget(max_seconds=5))
+
+        assert events == ["cleanup", "parse"]
+        assert run.error is not None and "exited -9" in run.error
+
+    def test_a_container_launch_oserror_proves_absence_before_becoming_an_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        adapter = shell_adapter(
+            "echo",
+            PROMPT_PLACEHOLDER,
+            container_image="my-org/agent-image:1",
+        )
+        terminated: list[str] = []
+
+        def fail_launch(
+            argv: list[str], workdir: Path, env: dict[str, str], timeout: int
+        ) -> CliCapture:
+            del argv, workdir, env, timeout
+            raise OSError("client failed after launch")
+
+        adapter._capture = fail_launch  # type: ignore[method-assign]
+        monkeypatch.setattr(
+            cli_base_module,
+            "terminate_docker_container",
+            lambda name, *, runtime, timeout: terminated.append(name),
+        )
+
+        run = adapter.run(tmp_path, PROMPT, Budget(max_seconds=5))
+
+        assert len(terminated) == 1
+        assert terminated[0].startswith("stinger-agent-")
+        assert run.error is not None and "could not launch" in run.error
+
+    @pytest.mark.parametrize(
+        "interruption",
+        [KeyboardInterrupt(), SystemExit(17), BaseException("synthetic stop")],
+        ids=["keyboard-interrupt", "system-exit", "base-exception"],
+    )
+    def test_an_interrupted_container_run_is_cleaned_then_reraises(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        interruption: BaseException,
+    ) -> None:
+        adapter = shell_adapter(
+            "echo",
+            PROMPT_PLACEHOLDER,
+            container_image="my-org/agent-image:1",
+        )
+        terminated: list[str] = []
+
+        def interrupt(
+            argv: list[str], workdir: Path, env: dict[str, str], timeout: int
+        ) -> CliCapture:
+            del argv, workdir, env, timeout
+            raise interruption
+
+        adapter._capture = interrupt  # type: ignore[method-assign]
+        monkeypatch.setattr(
+            cli_base_module,
+            "terminate_docker_container",
+            lambda name, *, runtime, timeout: terminated.append(name),
+        )
+
+        with pytest.raises(type(interruption)):
+            adapter.run(tmp_path, PROMPT, Budget(max_seconds=5))
+
+        assert len(terminated) == 1
+        assert terminated[0].startswith("stinger-agent-")
+
+    def test_a_nonzero_container_exit_aborts_when_absence_is_unverified(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        adapter = shell_adapter(
+            "echo",
+            PROMPT_PLACEHOLDER,
+            container_image="my-org/agent-image:1",
+        )
+        adapter._capture = (  # type: ignore[method-assign]
+            lambda argv, workdir, env, timeout: CliCapture("not evidence", "", 2)
+        )
+        monkeypatch.setattr(
+            cli_base_module,
+            "terminate_docker_container",
+            lambda name, *, runtime, timeout: (_ for _ in ()).throw(
+                DockerRuntimeError("still present")
+            ),
+        )
+
+        with pytest.raises(AgentContainmentError, match="termination could not be verified"):
+            adapter.run(tmp_path, PROMPT, Budget(max_seconds=5))
 
 
 class TestFactory:

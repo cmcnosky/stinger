@@ -1,9 +1,8 @@
-"""Artifact-derived independent-reproduction evidence for Benchmark v1.
+"""Artifact-derived cross-machine reproduction evidence for Benchmark Protocol 2.
 
-The public release schema remains a compact signed attestation. This module is the
-construction boundary that proves every hash in that attestation from verified target and
-reproduced evidence, creates a private discrepancy review ledger, and refuses to emit
-favourable records from caller-entered hashes or booleans.
+This module proves every hash in the signed statement from verified target and reproduced
+evidence, creates an automatic immutable discrepancy ledger, and refuses to emit favourable
+records from caller-entered hashes or booleans.
 """
 
 from __future__ import annotations
@@ -39,23 +38,33 @@ from stinger.benchmark.evidence import (
 from stinger.benchmark.gates import (
     BaselineConfigurationRecord,
     BenchmarkProtocolManifest,
-    ErrorDispositionRecord,
-    IndependentReproductionRecord,
-    IndependentReproductionStatement,
+    CrossMachineReproductionRecord,
+    CrossMachineReproductionStatement,
     RepositorySize,
+    ReproductionDiscrepancyClassification,
     ReproductionDiscrepancyRecord,
     SealedCorpusRecord,
     authorize_reproduction_statement,
     canonical_report_sha256,
+    compiled_benchmark_protocol,
     reproduction_discrepancy_id,
     reproduction_discrepancy_ledger_sha256,
+    reproduction_modal_outcomes_sha256,
     reproduction_value_sha256,
+)
+from stinger.benchmark.machine_environment import (
+    MACHINE_ENVIRONMENT_CLAIM_BOUNDARY,
+    MachineAttestationError,
+    MachineWorkflowEvidencePaths,
+    VerifiedMachineWorkflowAttestation,
+    verify_machine_workflow_attestation,
 )
 from stinger.benchmark.records import (
     BaselineRecordError,
     _build_baseline_configuration_record_from_receipt,
 )
 from stinger.benchmark.signing import (
+    REPRODUCED_REPORT_SIGNATURE_NAMESPACE,
     ArtifactSignatureVerification,
     ProtocolSignatureError,
     verify_reproduced_report_signature,
@@ -110,7 +119,7 @@ __all__ = [
 
 
 class ReproductionBuilderError(Exception):
-    """Raised when artifacts cannot support independent-reproduction evidence."""
+    """Raised when artifacts cannot support cross-machine reproduction evidence."""
 
 
 class _FrozenModel(BaseModel):
@@ -120,15 +129,22 @@ class _FrozenModel(BaseModel):
 
 
 class ReproductionDiffTemplate(_FrozenModel):
-    """Private human-review template binding one exact report pair."""
+    """Immutable machine-generated ledger binding one exact report pair."""
 
     format_version: Literal["1"] = REPRODUCTION_FORMAT_VERSION
     method: Literal["classification_relevant_result_diff_v1"] = REPRODUCTION_DIFF_METHOD
     target_report_sha256: str
     reproduced_report_sha256: str
+    target_modal_outcomes_sha256: str
+    reproduced_modal_outcomes_sha256: str
     discrepancies: tuple[ReproductionDiscrepancyRecord, ...] = ()
 
-    @field_validator("target_report_sha256", "reproduced_report_sha256")
+    @field_validator(
+        "target_report_sha256",
+        "reproduced_report_sha256",
+        "target_modal_outcomes_sha256",
+        "reproduced_modal_outcomes_sha256",
+    )
     @classmethod
     def _valid_report_hash(cls, value: str) -> str:
         """Require exact lowercase report hashes in review templates."""
@@ -150,6 +166,8 @@ class ReproductionComparisonManifest(_FrozenModel):
     agent_configuration_fingerprint: str
     target_report_sha256: str
     reproduced_report_sha256: str
+    target_modal_outcomes_sha256: str
+    reproduced_modal_outcomes_sha256: str
     target_report_bytes_sha256: str
     reproduced_report_bytes_sha256: str
     target_public_bundle_manifest_sha256: str
@@ -157,6 +175,7 @@ class ReproductionComparisonManifest(_FrozenModel):
     reproduced_public_bundle_manifest_sha256: str
     reproduced_escrow_bundle_manifest_sha256: str
     reproduced_report_signature_sha256: str
+    reproduced_report_signature_namespace: str
     reproduced_report_signer_identity: str
     reproduced_report_signing_key_fingerprint: str
     reproduced_report_allowed_signers_sha256: str
@@ -171,14 +190,19 @@ def build_reproduction_diff(
     target_report: Report,
     reproduced_report: Report,
 ) -> ReproductionDiffTemplate:
-    """Create an unresolved private review template for one structurally matching pair."""
+    """Create an immutable automatic ledger for one modal-stable report pair."""
     _verify_reports_and_structure(target_report, reproduced_report)
+    _require_modal_outcomes_match(target_report, reproduced_report)
     target_hash = canonical_report_sha256(target_report)
     reproduced_hash = canonical_report_sha256(reproduced_report)
+    target_modal_hash = reproduction_modal_outcomes_sha256(target_report)
+    reproduced_modal_hash = reproduction_modal_outcomes_sha256(reproduced_report)
     discrepancies = _classification_discrepancies(target_report, reproduced_report)
     return ReproductionDiffTemplate(
         target_report_sha256=target_hash,
         reproduced_report_sha256=reproduced_hash,
+        target_modal_outcomes_sha256=target_modal_hash,
+        reproduced_modal_outcomes_sha256=reproduced_modal_hash,
         discrepancies=discrepancies,
     )
 
@@ -187,17 +211,21 @@ def write_reproduction_diff(
     destination: Path,
     template: ReproductionDiffTemplate,
 ) -> None:
-    """Create one canonical unresolved review template without overwriting a path."""
+    """Create one canonical automatic ledger without overwriting a path."""
     _atomic_create_file(destination, _canonical_model_bytes(template))
 
 
 def load_reproduction_diff(path: Path) -> ReproductionDiffTemplate:
-    """Load one closed private review template from a regular nonsymlink JSON file."""
+    """Load one closed automatic ledger from a regular nonsymlink JSON file."""
     try:
-        raw = json.loads(_read_regular_bytes(path, label="resolution file").decode("utf-8"))
+        raw = json.loads(
+            _read_regular_bytes(path, label="reproduction discrepancy ledger").decode("utf-8")
+        )
         return ReproductionDiffTemplate.model_validate(raw)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise ReproductionBuilderError("resolution file is not valid closed JSON") from exc
+        raise ReproductionBuilderError(
+            "reproduction discrepancy ledger is not valid closed JSON"
+        ) from exc
 
 
 def build_reproduction_statement(
@@ -208,22 +236,24 @@ def build_reproduction_statement(
     target_baseline_record: BaselineConfigurationRecord,
     target_public_bundle: Path,
     target_escrow_bundle: Path,
-    target_machine_identity_artifact: Path,
+    target_machine_workflow_evidence: MachineWorkflowEvidencePaths,
     reproduced_public_bundle: Path,
     reproduced_escrow_bundle: Path,
-    reproduced_machine_identity_artifact: Path,
+    reproduced_machine_workflow_evidence: MachineWorkflowEvidencePaths,
     leakage_policy: PublicLeakagePolicy,
     protocol_allowed_signers: Path,
     protocol_signer_identity: str,
     reproduced_report_signature: Path,
     evaluator_allowed_signers: Path,
     evaluator_signer_identity: str,
-    resolution_file: Path,
-    unaffiliated_attestation: Path,
     output_directory: Path,
-    reproduced_error_dispositions: tuple[ErrorDispositionRecord, ...] = (),
-) -> IndependentReproductionStatement:
-    """Verify both evidence pairs and atomically create a signed-statement input package."""
+) -> CrossMachineReproductionStatement:
+    """Verify both evidence pairs and atomically create a signed-statement input package.
+
+    Cross-machine evidence is a signed application-scoped operating-system environment
+    pseudonym bound to exact config and report bytes. It is not TPM, physical-hardware,
+    cloud-provider, organizational-independence, or anti-cloning proof.
+    """
     _require_identifier(evaluator_id, label="evaluator_id")
     _require_identifier(evaluator_signer_identity, label="evaluator signer identity")
     _require_distinct_evidence_paths(
@@ -235,15 +265,13 @@ def build_reproduction_statement(
     input_paths = (
         target_public_bundle,
         target_escrow_bundle,
-        target_machine_identity_artifact,
+        *_machine_workflow_paths(target_machine_workflow_evidence),
         reproduced_public_bundle,
         reproduced_escrow_bundle,
-        reproduced_machine_identity_artifact,
+        *_machine_workflow_paths(reproduced_machine_workflow_evidence),
         protocol_allowed_signers,
         reproduced_report_signature,
         evaluator_allowed_signers,
-        resolution_file,
-        unaffiliated_attestation,
         *leakage_policy.forbidden_sources,
     )
     _require_output_separate_from_inputs(output_directory, input_paths)
@@ -269,13 +297,22 @@ def build_reproduction_statement(
     _require_distinguishable_evidence(target_receipt, reproduced_receipt)
     _require_publication_corpus_shape(corpus, target_receipt.protocol)
     sensitive_paths = input_paths
+    target_machine_workflow = _verify_receipt_machine_workflow(
+        target_receipt,
+        target_machine_workflow_evidence,
+        label="target",
+    )
+    reproduced_machine_workflow = _verify_receipt_machine_workflow(
+        reproduced_receipt,
+        reproduced_machine_workflow_evidence,
+        label="reproduced",
+    )
     try:
         rebuilt_target = _build_baseline_configuration_record_from_receipt(
             configuration_id,
             corpus=corpus,
             receipt=target_receipt,
-            machine_identity_artifact=target_machine_identity_artifact,
-            error_dispositions=target_baseline_record.error_dispositions,
+            machine_workflow_evidence=target_machine_workflow_evidence,
             sensitive_paths=sensitive_paths,
             sensitive_markers=leakage_policy.forbidden_markers,
         )
@@ -283,8 +320,7 @@ def build_reproduction_statement(
             configuration_id,
             corpus=corpus,
             receipt=reproduced_receipt,
-            machine_identity_artifact=reproduced_machine_identity_artifact,
-            error_dispositions=reproduced_error_dispositions,
+            machine_workflow_evidence=reproduced_machine_workflow_evidence,
             sensitive_paths=sensitive_paths,
             sensitive_markers=leakage_policy.forbidden_markers,
         )
@@ -294,8 +330,12 @@ def build_reproduction_statement(
         raise ReproductionBuilderError(
             "supplied target baseline record does not match verified artifacts"
         )
-    if rebuilt_target.machine_fingerprint_sha256 == rebuilt_reproduced.machine_fingerprint_sha256:
-        raise ReproductionBuilderError("target and reproduced machine attestations must differ")
+    _require_independent_machine_workflows(
+        target_machine_workflow,
+        reproduced_machine_workflow,
+        target_fingerprint=rebuilt_target.machine_fingerprint_sha256,
+        reproduced_fingerprint=rebuilt_reproduced.machine_fingerprint_sha256,
+    )
 
     _reject_unknown_report_fields(
         target_receipt.public_bundle.report_bytes,
@@ -309,18 +349,15 @@ def build_reproduction_statement(
         rebuilt_target.report,
         rebuilt_reproduced.report,
     )
-    review_template = ReproductionDiffTemplate(
-        target_report_sha256=rebuilt_target.report_sha256,
-        reproduced_report_sha256=rebuilt_reproduced.report_sha256,
-        discrepancies=_classification_discrepancies(
-            rebuilt_target.report,
-            rebuilt_reproduced.report,
-        ),
+    _require_modal_outcomes_match(rebuilt_target.report, rebuilt_reproduced.report)
+    discrepancies = _classification_discrepancies(
+        rebuilt_target.report,
+        rebuilt_reproduced.report,
     )
-    resolutions = load_reproduction_diff(resolution_file)
-    discrepancies = _apply_resolutions(review_template, resolutions)
     target_report_hash = rebuilt_target.report_sha256
     reproduced_report_hash = rebuilt_reproduced.report_sha256
+    target_modal_hash = reproduction_modal_outcomes_sha256(rebuilt_target.report)
+    reproduced_modal_hash = reproduction_modal_outcomes_sha256(rebuilt_reproduced.report)
     ledger_hash = reproduction_discrepancy_ledger_sha256(
         discrepancies,
         target_report_sha256=target_report_hash,
@@ -374,6 +411,8 @@ def build_reproduction_statement(
         agent_configuration_fingerprint=target_agent_fingerprint,
         target_report_sha256=target_report_hash,
         reproduced_report_sha256=reproduced_report_hash,
+        target_modal_outcomes_sha256=target_modal_hash,
+        reproduced_modal_outcomes_sha256=reproduced_modal_hash,
         target_report_bytes_sha256=_sha256(target_receipt.public_bundle.report_bytes),
         reproduced_report_bytes_sha256=_sha256(reproduced_receipt.public_bundle.report_bytes),
         target_public_bundle_manifest_sha256=(target_receipt.public_bundle.manifest_sha256),
@@ -381,6 +420,7 @@ def build_reproduction_statement(
         reproduced_public_bundle_manifest_sha256=(reproduced_receipt.public_bundle.manifest_sha256),
         reproduced_escrow_bundle_manifest_sha256=(reproduced_receipt.escrow_bundle.manifest_sha256),
         reproduced_report_signature_sha256=report_signature.signature_sha256,
+        reproduced_report_signature_namespace=report_signature.namespace,
         reproduced_report_signer_identity=report_signature.identity,
         reproduced_report_signing_key_fingerprint=(report_signature.signing_key_fingerprint),
         reproduced_report_allowed_signers_sha256=(report_signature.allowed_signers_sha256),
@@ -398,14 +438,13 @@ def build_reproduction_statement(
     if _sha256(ledger_bytes) != ledger_hash:
         raise ReproductionBuilderError("discrepancy ledger serialization is inconsistent")
     comparison_bytes = _canonical_model_bytes(comparison_manifest)
-    attestation_hash = _hash_unaffiliated_attestation(unaffiliated_attestation)
     completed_families = tuple(
         family
         for family in Family
         if any(result.family is family for result in rebuilt_reproduced.report.results)
     )
     scenario_count = len({result.scenario_id for result in rebuilt_reproduced.report.results})
-    statement = IndependentReproductionStatement(
+    statement = CrossMachineReproductionStatement(
         benchmark_protocol_version=target_receipt.protocol.benchmark_protocol_version,
         evaluator_id=evaluator_id,
         signer_identity=evaluator_signer_identity,
@@ -419,6 +458,7 @@ def build_reproduction_statement(
         target_machine_fingerprint_sha256=(rebuilt_target.machine_fingerprint_sha256),
         reproduced_report_sha256=reproduced_report_hash,
         reproduced_report_signature_sha256=report_signature.signature_sha256,
+        reproduced_report_signature_namespace=report_signature.namespace,
         reproduced_report_signer_identity=report_signature.identity,
         reproduced_report_signing_key_fingerprint=(report_signature.signing_key_fingerprint),
         reproduced_report_allowed_signers_sha256=(report_signature.allowed_signers_sha256),
@@ -429,15 +469,16 @@ def build_reproduction_statement(
         reproduced_agent_configuration_fingerprint=reproduced_agent_fingerprint,
         comparison_manifest_sha256=_sha256(comparison_bytes),
         discrepancy_ledger_sha256=ledger_hash,
+        target_modal_outcomes_sha256=target_modal_hash,
+        reproduced_modal_outcomes_sha256=reproduced_modal_hash,
         completed_families=completed_families,
         scenario_count=scenario_count,
         repetitions=target_receipt.protocol.repetitions,
-        unaffiliated_attestation_sha256=attestation_hash,
         discrepancies=discrepancies,
     )
     statement_bytes = _canonical_model_bytes(statement)
     _reject_sensitive_outputs(
-        (comparison_manifest, statement, resolutions),
+        (comparison_manifest, statement),
         sensitive_paths=sensitive_paths,
         sensitive_markers=leakage_policy.forbidden_markers,
     )
@@ -457,7 +498,7 @@ def build_reproduction_record(
     signature: Path,
     allowed_signers: Path,
     signer_identity: str,
-) -> IndependentReproductionRecord:
+) -> CrossMachineReproductionRecord:
     """Authorize an evaluator-signed canonical statement and derive its release record."""
     try:
         statement_bytes = _read_regular_bytes(statement, label="reproduction statement")
@@ -484,6 +525,8 @@ def build_reproduction_record(
         raise ReproductionBuilderError("reproduction statement signer identity is inconsistent")
     if (
         authorization.statement.reproduced_report_signer_identity != authorization.identity
+        or authorization.statement.reproduced_report_signature_namespace
+        != REPRODUCED_REPORT_SIGNATURE_NAMESPACE
         or authorization.statement.reproduced_report_signing_key_fingerprint
         != authorization.signing_key_fingerprint
         or authorization.statement.reproduced_report_allowed_signers_sha256
@@ -492,7 +535,7 @@ def build_reproduction_record(
         raise ReproductionBuilderError(
             "reproduced report and statement authorities are inconsistent"
         )
-    return IndependentReproductionRecord(
+    return CrossMachineReproductionRecord(
         evaluator_id=authorization.statement.evaluator_id,
         configuration_id=authorization.statement.configuration_id,
         signer_identity=authorization.identity,
@@ -504,7 +547,7 @@ def build_reproduction_record(
 
 def write_reproduction_record(
     destination: Path,
-    record: IndependentReproductionRecord,
+    record: CrossMachineReproductionRecord,
 ) -> None:
     """Create one canonical reproduction record without overwriting a path."""
     _atomic_create_file(destination, _canonical_model_bytes(record))
@@ -520,6 +563,14 @@ def _verify_reports_and_structure(target: Report, reproduced: Report) -> None:
             "a compared report failed deterministic verification"
         ) from exc
     _require_structural_match(target, reproduced)
+
+
+def _require_modal_outcomes_match(target: Report, reproduced: Report) -> None:
+    """Reject a reproduction whose per-scenario modal classifications changed."""
+    if reproduction_modal_outcomes_sha256(target) != reproduction_modal_outcomes_sha256(reproduced):
+        raise ReproductionBuilderError(
+            "compared reports have different per-scenario modal outcomes"
+        )
 
 
 def _require_structural_match(target: Report, reproduced: Report) -> None:
@@ -599,71 +650,103 @@ def _classification_discrepancies(
                     field=field,
                     target_value_sha256=target_hash,
                     reproduced_value_sha256=reproduced_hash,
-                    resolution="",
-                    resolved=False,
+                    classification=(
+                        ReproductionDiscrepancyClassification.EXPECTED_AGENT_VARIANCE_MODAL_STABLE
+                    ),
                 )
             )
     return tuple(discrepancies)
 
 
-def _apply_resolutions(
-    expected: ReproductionDiffTemplate,
-    supplied: ReproductionDiffTemplate,
-) -> tuple[ReproductionDiscrepancyRecord, ...]:
-    """Allow a reviewer to change only disposition fields on the exact generated ledger."""
-    if (
-        supplied.format_version != expected.format_version
-        or supplied.method != expected.method
-        or supplied.target_report_sha256 != expected.target_report_sha256
-        or supplied.reproduced_report_sha256 != expected.reproduced_report_sha256
-    ):
-        raise ReproductionBuilderError("resolution file does not bind the compared reports")
-    expected_by_id = {item.discrepancy_id: item for item in expected.discrepancies}
-    supplied_by_id: dict[str, ReproductionDiscrepancyRecord] = {}
-    for item in supplied.discrepancies:
-        if item.discrepancy_id in supplied_by_id:
-            raise ReproductionBuilderError("resolution file contains a duplicate discrepancy")
-        supplied_by_id[item.discrepancy_id] = item
-    if set(expected_by_id) != set(supplied_by_id):
-        raise ReproductionBuilderError("resolution file has missing or extra discrepancies")
-    resolved: list[ReproductionDiscrepancyRecord] = []
-    for discrepancy_id in sorted(expected_by_id):
-        expected_item = expected_by_id[discrepancy_id]
-        supplied_item = supplied_by_id[discrepancy_id]
-        if _immutable_discrepancy_fields(expected_item) != _immutable_discrepancy_fields(
-            supplied_item
-        ):
-            raise ReproductionBuilderError("resolution file altered a discrepancy")
-        if not supplied_item.resolved or not supplied_item.resolution.strip():
-            raise ReproductionBuilderError(
-                "every discrepancy requires a nonblank resolved disposition"
-            )
-        resolved.append(supplied_item)
-    return tuple(
-        sorted(
-            resolved,
-            key=lambda item: (
-                item.scenario_id,
-                item.repetition,
-                item.field,
-                _sha256(_canonical_payload_bytes(item.model_dump(mode="json"))),
-            ),
-        )
-    )
-
-
-def _immutable_discrepancy_fields(
-    discrepancy: ReproductionDiscrepancyRecord,
-) -> tuple[object, ...]:
-    """Return every discrepancy field a reviewer is forbidden to alter."""
+def _machine_workflow_paths(
+    evidence: MachineWorkflowEvidencePaths,
+) -> tuple[Path, Path, Path, Path]:
+    """Return every private path consumed by one machine-workflow verification."""
     return (
-        discrepancy.discrepancy_id,
-        discrepancy.scenario_id,
-        discrepancy.repetition,
-        discrepancy.field,
-        discrepancy.target_value_sha256,
-        discrepancy.reproduced_value_sha256,
+        evidence.identity_artifact,
+        evidence.attestation,
+        evidence.signature,
+        evidence.allowed_signers,
     )
+
+
+def _verify_receipt_machine_workflow(
+    receipt: VerifiedArtifactReceipt,
+    evidence: MachineWorkflowEvidencePaths,
+    *,
+    label: Literal["target", "reproduced"],
+) -> VerifiedMachineWorkflowAttestation:
+    """Verify signed machine evidence against exact config and report snapshots."""
+    metadata = receipt.report.benchmark_metadata
+    if metadata is None or metadata.stinger_commit is None:
+        raise ReproductionBuilderError(
+            f"{label} report lacks the commit required by machine workflow evidence"
+        )
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=f"stinger-reproduction-{label}-machine-"
+        ) as temporary:
+            root = Path(temporary)
+            config = root / "config.resolved.json"
+            report = root / "report.json"
+            config.write_bytes(receipt.escrow_bundle.config_bytes)
+            report.write_bytes(receipt.public_bundle.report_bytes)
+            return verify_machine_workflow_attestation(
+                machine_identity_artifact=evidence.identity_artifact,
+                workflow_input=config,
+                workflow_receipt=report,
+                attestation=evidence.attestation,
+                signature=evidence.signature,
+                allowed_signers=evidence.allowed_signers,
+                signer_identity=evidence.signer_identity,
+                expected_stinger_commit=metadata.stinger_commit,
+            )
+    except MachineAttestationError as exc:
+        raise ReproductionBuilderError(
+            f"{label} signed machine workflow evidence failed verification"
+        ) from exc
+
+
+def _require_independent_machine_workflows(
+    target: VerifiedMachineWorkflowAttestation,
+    reproduced: VerifiedMachineWorkflowAttestation,
+    *,
+    target_fingerprint: str,
+    reproduced_fingerprint: str,
+) -> None:
+    """Require distinct environment commitments and separately trusted authorities.
+
+    These checks establish independently signed operating-system environment pseudonyms.
+    They deliberately preserve :data:`MACHINE_ENVIRONMENT_CLAIM_BOUNDARY`: neither
+    pseudonym is TPM, physical-hardware, cloud-provider, organizational-independence, or
+    anti-cloning proof.
+    """
+    if (
+        target.statement.claim_boundary != MACHINE_ENVIRONMENT_CLAIM_BOUNDARY
+        or reproduced.statement.claim_boundary != MACHINE_ENVIRONMENT_CLAIM_BOUNDARY
+        or target_fingerprint != target.statement.machine_identity_sha256
+        or reproduced_fingerprint != reproduced.statement.machine_identity_sha256
+    ):
+        raise ReproductionBuilderError(
+            "derived machine fingerprints do not match signed workflow evidence"
+        )
+    if (
+        target_fingerprint == reproduced_fingerprint
+        or target.statement.host_identity_commitment_sha256
+        == reproduced.statement.host_identity_commitment_sha256
+    ):
+        raise ReproductionBuilderError(
+            "target and reproduced host commitments and machine fingerprints must differ"
+        )
+    if (
+        target.signer_identity == reproduced.signer_identity
+        or target.signing_key_fingerprint == reproduced.signing_key_fingerprint
+        or target.allowed_signers_sha256 == reproduced.allowed_signers_sha256
+    ):
+        raise ReproductionBuilderError(
+            "target and reproduced machine-attestation signer identity, key, and trust "
+            "policy must all differ"
+        )
 
 
 def _cross_bind_protocol_trust(
@@ -672,7 +755,7 @@ def _cross_bind_protocol_trust(
 ) -> None:
     """Require both separately verified runs to use one frozen protocol trust root."""
     if (
-        target.protocol != BenchmarkProtocolManifest()
+        target.protocol != compiled_benchmark_protocol()
         or target.public_bundle.protocol_bytes != reproduced.public_bundle.protocol_bytes
         or target.public_bundle.protocol_signature_bytes
         != reproduced.public_bundle.protocol_signature_bytes
@@ -844,18 +927,6 @@ def _require_known_keys(
     """Reject keys Pydantic's legacy report models would otherwise ignore."""
     if not set(raw).issubset(model.model_fields):
         raise ReproductionBuilderError(f"{label} contains unknown fields")
-
-
-def _hash_unaffiliated_attestation(path: Path) -> str:
-    """Hash a nonblank UTF-8 attestation without copying its contents."""
-    content = _read_regular_bytes(path, label="unaffiliated attestation")
-    try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ReproductionBuilderError("unaffiliated attestation must be valid UTF-8") from exc
-    if not text.strip():
-        raise ReproductionBuilderError("unaffiliated attestation must be nonblank")
-    return _sha256(content)
 
 
 def _read_regular_bytes(path: Path, *, label: str) -> bytes:

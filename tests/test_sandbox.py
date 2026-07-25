@@ -7,12 +7,22 @@ set is exactly right. Everything a detector concludes rests on that set being co
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import subprocess
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
 
+import stinger.docker_runtime as docker_runtime
+import stinger.harness.sandbox as sandbox_module
+from stinger.docker_runtime import (
+    DockerRuntimeError,
+    DockerRuntimeIdentity,
+    resolve_docker_client,
+)
 from stinger.harness.sandbox import (
     ExecResult,
     Isolation,
@@ -31,6 +41,24 @@ def changed_paths(before: object, after: object) -> set[str]:
     b = before.tracked_files  # type: ignore[attr-defined]
     a = after.tracked_files  # type: ignore[attr-defined]
     return {p for p in b.keys() | a.keys() if b.get(p) != a.get(p)}
+
+
+def _sandbox_runtime() -> DockerRuntimeIdentity:
+    """Return a runtime bound to the real fixed client for argv-only sandbox tests."""
+    client = resolve_docker_client()
+    return DockerRuntimeIdentity(
+        client_path=str(client),
+        client_sha256=hashlib.sha256(client.read_bytes()).hexdigest(),
+        client_version="29.0.0",
+        context_name="fixture",
+        context_endpoint="unix:///tmp/fixture.sock",
+        context_endpoint_sha256="b" * 64,
+        server_platform="fixture-engine",
+        server_version="29.0.0",
+        server_api_version="1.50",
+        server_os="linux",
+        server_arch="amd64",
+    )
 
 
 @pytest.fixture
@@ -271,7 +299,11 @@ def test_docker_argv_isolates_the_container(tmp_path: Path) -> None:
     def flag(name: str) -> list[str]:
         return argv[argv.index(name) : argv.index(name) + 2]
 
-    assert argv[:3] == ["docker", "run", "--rm"]  # one throwaway container per execution
+    assert argv[0] == str(resolve_docker_client())
+    assert argv[argv.index("run") : argv.index("run") + 2] == [
+        "run",
+        "--rm",
+    ]  # one throwaway container per execution
     assert flag("--network") == ["--network", "none"]
     assert flag("--workdir") == ["--workdir", "/work"]
     assert f"{tmp_path.resolve()}:/work" in argv
@@ -337,7 +369,9 @@ def test_prepare_activates_seeded_githooks_for_the_agent(
 
 def test_docker_isolation_wraps_commands_in_a_container(tmp_path: Path) -> None:
     sandbox = Sandbox(isolation=Isolation.DOCKER, image="img")
-    assert sandbox._effective_argv(tmp_path, ["pytest"], network=False)[0] == "docker"
+    assert sandbox._effective_argv(tmp_path, ["pytest"], network=False)[0] == str(
+        resolve_docker_client()
+    )
 
 
 def test_local_isolation_does_not_wrap_commands(tmp_path: Path) -> None:
@@ -358,3 +392,440 @@ def test_docker_argv_runs_as_the_invoking_user_not_root(tmp_path: Path) -> None:
 def test_docker_argv_gives_the_container_a_writable_home(tmp_path: Path) -> None:
     """Tools that cache in $HOME otherwise fail in ways that look like the scenario failing."""
     assert "HOME=/tmp" in docker_argv("img", tmp_path, ["true"])
+
+
+def test_docker_preflight_pins_fixed_client_runtime_and_immutable_image(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PATH shim or later tag mutation cannot select executed container bytes."""
+    shim = tmp_path / "docker"
+    shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("DOCKER_HOST", "tcp://attacker.invalid:2375")
+    fixed = resolve_docker_client()
+    runtime_calls: list[tuple[Path, tuple[str, ...]]] = []
+
+    def observe(
+        client: Path,
+        arguments: tuple[str, ...],
+        *,
+        timeout: int,
+        discovery: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout, discovery
+        runtime_calls.append((client, arguments))
+        assert client == fixed
+        if arguments == ("context", "show"):
+            return subprocess.CompletedProcess([], 0, "fixture-context\n", "")
+        if arguments[:2] == ("context", "inspect"):
+            return subprocess.CompletedProcess(
+                [],
+                0,
+                json.dumps(
+                    [
+                        {
+                            "Endpoints": {
+                                "docker": {
+                                    "Host": "unix:///tmp/fixture-docker.sock",
+                                    "SkipTLSVerify": False,
+                                }
+                            },
+                            "TLSMaterial": {},
+                        }
+                    ]
+                ),
+                "",
+            )
+        if "version" in arguments:
+            return subprocess.CompletedProcess(
+                [],
+                0,
+                json.dumps(
+                    {
+                        "Client": {"Version": "29.0.0"},
+                        "Server": {
+                            "Platform": {"Name": "fixture-engine"},
+                            "Version": "29.0.0",
+                            "ApiVersion": "1.50",
+                            "Os": "linux",
+                            "Arch": "amd64",
+                        },
+                    }
+                ),
+                "",
+            )
+        raise AssertionError(arguments)
+
+    inspected: list[str] = []
+
+    def inspect_image(
+        image: str,
+        *,
+        runtime: object,
+    ) -> tuple[str, tuple[str, ...]]:
+        del runtime
+        inspected.append(image)
+        return "sha256:" + "a" * 64, ()
+
+    executed: list[list[str]] = []
+    execution_workdirs: list[tuple[Path, tuple[Path, ...]]] = []
+
+    def execute(
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        timeout: int,
+        environment: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout, environment
+        execution_workdirs.append((cwd, tuple(cwd.iterdir())))
+        command = list(argv)
+        executed.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(docker_runtime, "_active_runtime", None)
+    monkeypatch.setattr(docker_runtime, "_run_raw", observe)
+    monkeypatch.setattr(sandbox_module, "inspect_docker_image", inspect_image)
+    monkeypatch.setattr(sandbox_module, "_run_sandbox_process", execute)
+    sandbox = Sandbox(isolation=Isolation.DOCKER, image="mutable:tag")
+
+    sandbox.preflight()
+    sandbox.run_command(tmp_path, ["true"], 5)
+
+    assert inspected == ["mutable:tag"]
+    assert runtime_calls
+    assert all(client == fixed and client != shim for client, _ in runtime_calls)
+    assert executed
+    assert all("sha256:" + "a" * 64 in argv for argv in executed)
+    assert all("mutable:tag" not in argv for argv in executed)
+    assert all(argv[0] == str(fixed) for argv in executed)
+    assert all(argv[argv.index("--entrypoint") + 1] == "" for argv in executed)
+    preflight_workdir, preflight_contents = execution_workdirs[0]
+    assert preflight_workdir != Path.cwd()
+    assert preflight_contents == ()
+    assert str(Path.cwd().resolve()) not in executed[0]
+
+
+def test_docker_verification_timeout_kills_and_proves_named_container_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _sandbox_runtime()
+    sandbox = Sandbox(isolation=Isolation.DOCKER, image="mutable:tag")
+    sandbox._docker_runtime = runtime
+    sandbox._verification_image_id = "sha256:" + "a" * 64
+    launched: list[list[str]] = []
+    terminated: list[tuple[str, DockerRuntimeIdentity, int]] = []
+
+    def time_out(
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        timeout: int,
+        environment: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, timeout, environment
+        launched.append(list(argv))
+        raise subprocess.TimeoutExpired(list(argv), 5, output="partial", stderr="later")
+
+    def terminate(
+        name: str,
+        *,
+        runtime: DockerRuntimeIdentity,
+        timeout: int,
+    ) -> None:
+        terminated.append((name, runtime, timeout))
+
+    monkeypatch.setattr(sandbox_module, "_run_sandbox_process", time_out)
+    monkeypatch.setattr(sandbox_module, "terminate_docker_container", terminate)
+
+    result = sandbox.run_command(tmp_path, ["python", "-c", "pass"], 5)
+
+    [(container_name, observed_runtime, cleanup_timeout)] = terminated
+    assert container_name.startswith("stinger-verifier-")
+    assert observed_runtime == runtime
+    assert cleanup_timeout == 30
+    assert launched[0][launched[0].index("--name") + 1] == container_name
+    assert result.timed_out is True
+    assert result.stdout == "partial"
+
+
+def test_docker_verification_timeout_fails_when_cleanup_is_unverified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sandbox = Sandbox(isolation=Isolation.DOCKER, image="mutable:tag")
+    sandbox._docker_runtime = _sandbox_runtime()
+    sandbox._verification_image_id = "sha256:" + "a" * 64
+
+    def time_out(
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        timeout: int,
+        environment: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, timeout, environment
+        raise subprocess.TimeoutExpired(list(argv), 5)
+
+    def fail_cleanup(
+        name: str,
+        *,
+        runtime: DockerRuntimeIdentity,
+        timeout: int,
+    ) -> None:
+        del name, runtime, timeout
+        raise DockerRuntimeError("still running")
+
+    monkeypatch.setattr(sandbox_module, "_run_sandbox_process", time_out)
+    monkeypatch.setattr(sandbox_module, "terminate_docker_container", fail_cleanup)
+
+    with pytest.raises(SandboxError, match="termination could not be verified"):
+        sandbox.run_command(tmp_path, ["python", "-c", "pass"], 5)
+
+
+def test_docker_verification_nonzero_cleans_before_preserving_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _sandbox_runtime()
+    sandbox = Sandbox(isolation=Isolation.DOCKER, image="mutable:tag")
+    sandbox._docker_runtime = runtime
+    sandbox._verification_image_id = "sha256:" + "a" * 64
+    events: list[str] = []
+
+    def fail(
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        timeout: int,
+        environment: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, timeout, environment
+        events.append("completed")
+        return subprocess.CompletedProcess(list(argv), -9, "bounded output", "failure")
+
+    def terminate(
+        name: str,
+        *,
+        runtime: DockerRuntimeIdentity,
+        timeout: int,
+    ) -> None:
+        del name, runtime, timeout
+        events.append("cleanup")
+
+    monkeypatch.setattr(sandbox_module, "_run_sandbox_process", fail)
+    monkeypatch.setattr(sandbox_module, "terminate_docker_container", terminate)
+
+    result = sandbox.run_command(tmp_path, ["python", "-c", "raise SystemExit(9)"], 5)
+
+    assert events == ["completed", "cleanup"]
+    assert result.exit_code == -9
+    assert result.stdout == "bounded output"
+
+
+def test_docker_verification_oserror_cleans_before_failing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sandbox = Sandbox(isolation=Isolation.DOCKER, image="mutable:tag")
+    sandbox._docker_runtime = _sandbox_runtime()
+    sandbox._verification_image_id = "sha256:" + "a" * 64
+    terminated: list[str] = []
+
+    def fail(
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        timeout: int,
+        environment: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        del argv, cwd, timeout, environment
+        raise OSError("client failed after launch")
+
+    monkeypatch.setattr(sandbox_module, "_run_sandbox_process", fail)
+    monkeypatch.setattr(
+        sandbox_module,
+        "terminate_docker_container",
+        lambda name, *, runtime, timeout: terminated.append(name),
+    )
+
+    with pytest.raises(SandboxError, match="could not launch"):
+        sandbox.run_command(tmp_path, ["true"], 5)
+
+    assert len(terminated) == 1
+    assert terminated[0].startswith("stinger-verifier-")
+
+
+@pytest.mark.parametrize(
+    "interruption",
+    [KeyboardInterrupt(), SystemExit(23), BaseException("synthetic stop")],
+    ids=["keyboard-interrupt", "system-exit", "base-exception"],
+)
+def test_docker_verification_interrupt_cleans_then_reraises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: BaseException,
+) -> None:
+    sandbox = Sandbox(isolation=Isolation.DOCKER, image="mutable:tag")
+    sandbox._docker_runtime = _sandbox_runtime()
+    sandbox._verification_image_id = "sha256:" + "a" * 64
+    terminated: list[str] = []
+
+    def interrupt(
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        timeout: int,
+        environment: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        del argv, cwd, timeout, environment
+        raise interruption
+
+    monkeypatch.setattr(sandbox_module, "_run_sandbox_process", interrupt)
+    monkeypatch.setattr(
+        sandbox_module,
+        "terminate_docker_container",
+        lambda name, *, runtime, timeout: terminated.append(name),
+    )
+
+    with pytest.raises(type(interruption)):
+        sandbox.run_command(tmp_path, ["true"], 5)
+
+    assert len(terminated) == 1
+    assert terminated[0].startswith("stinger-verifier-")
+
+
+def test_docker_verification_nonzero_fails_when_cleanup_is_unverified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sandbox = Sandbox(isolation=Isolation.DOCKER, image="mutable:tag")
+    sandbox._docker_runtime = _sandbox_runtime()
+    sandbox._verification_image_id = "sha256:" + "a" * 64
+    monkeypatch.setattr(
+        sandbox_module,
+        "_run_sandbox_process",
+        lambda argv, *, cwd, timeout, environment: subprocess.CompletedProcess(
+            list(argv), 17, "must not escape", ""
+        ),
+    )
+    monkeypatch.setattr(
+        sandbox_module,
+        "terminate_docker_container",
+        lambda name, *, runtime, timeout: (_ for _ in ()).throw(
+            DockerRuntimeError("still running")
+        ),
+    )
+
+    with pytest.raises(SandboxError, match="termination could not be verified"):
+        sandbox.run_command(tmp_path, ["false"], 5)
+
+
+def test_docker_preflight_timeout_cleans_up_its_named_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _sandbox_runtime()
+    terminated: list[str] = []
+
+    monkeypatch.setattr(sandbox_module, "observe_docker_runtime", lambda: runtime)
+    monkeypatch.setattr(
+        sandbox_module,
+        "inspect_docker_image",
+        lambda image, *, runtime: ("sha256:" + "a" * 64, ()),
+    )
+
+    def time_out(
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        timeout: int,
+        environment: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, timeout, environment
+        raise subprocess.TimeoutExpired(list(argv), 5)
+
+    def terminate(
+        name: str,
+        *,
+        runtime: DockerRuntimeIdentity,
+        timeout: int,
+    ) -> None:
+        del runtime, timeout
+        terminated.append(name)
+
+    monkeypatch.setattr(sandbox_module, "_run_sandbox_process", time_out)
+    monkeypatch.setattr(sandbox_module, "terminate_docker_container", terminate)
+
+    with pytest.raises(SandboxError, match="verification image is not usable"):
+        Sandbox(isolation=Isolation.DOCKER, image="mutable:tag").preflight()
+
+    assert len(terminated) == 1
+    assert terminated[0].startswith("stinger-verifier-")
+
+
+def test_docker_preflight_nonzero_cleans_its_named_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _sandbox_runtime()
+    terminated: list[str] = []
+    monkeypatch.setattr(sandbox_module, "observe_docker_runtime", lambda: runtime)
+    monkeypatch.setattr(
+        sandbox_module,
+        "inspect_docker_image",
+        lambda image, *, runtime: ("sha256:" + "a" * 64, ()),
+    )
+    monkeypatch.setattr(
+        sandbox_module,
+        "_run_sandbox_process",
+        lambda argv, *, cwd, timeout, environment: subprocess.CompletedProcess(
+            list(argv), 31, "", "probe failed"
+        ),
+    )
+    monkeypatch.setattr(
+        sandbox_module,
+        "terminate_docker_container",
+        lambda name, *, runtime, timeout: terminated.append(name),
+    )
+
+    with pytest.raises(SandboxError, match="verification image is not usable"):
+        Sandbox(isolation=Isolation.DOCKER, image="mutable:tag").preflight()
+
+    assert len(terminated) == 1
+    assert terminated[0].startswith("stinger-verifier-")
+
+
+def test_docker_run_requires_instance_preflight(tmp_path: Path) -> None:
+    sandbox = Sandbox(isolation=Isolation.DOCKER, image="mutable:tag")
+    with pytest.raises(SandboxError, match="preflight"):
+        sandbox.run_command(tmp_path, ["true"], 5)
+
+
+def test_harness_seed_git_ignores_path_and_git_routing_overrides(
+    tmp_path: Path,
+    t02_dir: Path,
+    t02: ScenarioManifest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Harness Git is fixed and minimal; agent-visible repository config remains local."""
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    marker = tmp_path / "shim-ran"
+    shim = shim_dir / "git"
+    shim.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 0\n", encoding="utf-8")
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim_dir))
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "redirected.git"))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "attacker.gitconfig"))
+    monkeypatch.setenv("DYLD_INSERT_LIBRARIES", str(tmp_path / "attacker.dylib"))
+
+    workdir = Sandbox(isolation=Isolation.LOCAL).prepare(
+        t02_dir,
+        t02,
+        tmp_path / "seeded",
+    )
+
+    assert not marker.exists()
+    assert (workdir / ".git").is_dir()

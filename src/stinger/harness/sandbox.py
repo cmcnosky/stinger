@@ -27,11 +27,29 @@ import hashlib
 import os
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
+from uuid import uuid4
 
+from stinger.benchmark.verification_image import (
+    VerificationImagePolicy,
+    VerificationImagePolicyError,
+    compiled_verification_image_policy,
+    verify_approved_verification_image,
+)
 from stinger.detectors.base import RepoState
+from stinger.docker_runtime import (
+    DockerRuntimeError,
+    DockerRuntimeIdentity,
+    docker_command_argv,
+    docker_environment,
+    inspect_docker_image,
+    observe_docker_runtime,
+    terminate_docker_container,
+    verify_docker_runtime,
+)
 from stinger.models import ExecResult, Family
 from stinger.scenario.manifest import ScenarioManifest
 
@@ -90,7 +108,15 @@ def _build_hint(image: str) -> str:
     """
     lines = [
         "Fix it by building Stinger's verification image:",
-        f"    docker build -t {DEFAULT_IMAGE} -f docker/runner.Dockerfile .",
+        '    stinger_runner_build_dir="$(mktemp -d)"',
+        "    docker buildx build --no-cache --provenance=false \\",
+        "      --build-arg SOURCE_DATE_EPOCH=0 \\",
+        f"      --platform linux/arm64 -t {DEFAULT_IMAGE} \\",
+        "      --output type=docker,rewrite-timestamp=true,"
+        'dest="$stinger_runner_build_dir/stinger-runner.tar" \\',
+        "      -f docker/runner.Dockerfile docker/",
+        '    docker load --input "$stinger_runner_build_dir/stinger-runner.tar"',
+        "    # Use --platform linux/amd64 on an amd64 Docker host.",
     ]
     if image != DEFAULT_IMAGE:
         lines.append(
@@ -113,8 +139,17 @@ _GIT_ENV: Mapping[str, str] = {
     "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+00:00",
     "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+00:00",
     "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_CONFIG_SYSTEM": os.devnull,
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+    "HOME": "/nonexistent",
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": "/usr/bin:/bin",
+    "XDG_CONFIG_HOME": "/nonexistent",
 }
+_FIXED_GIT = Path("/usr/bin/git")
 
 
 class SandboxError(Exception):
@@ -144,6 +179,44 @@ class Sandbox:
         """
         self.isolation = isolation
         self.image = image
+        self._docker_runtime: DockerRuntimeIdentity | None = None
+        self._verification_image_id: str | None = None
+        self._verification_image_repo_digests: tuple[str, ...] = ()
+        self._verification_image_policy_sha256: str | None = None
+
+    def preflight_benchmark(
+        self,
+        repository: Path,
+        *,
+        policy: VerificationImagePolicy | None = None,
+    ) -> None:
+        """Approve Protocol 2 source, platform, and image bytes before any container starts.
+
+        Ordinary development runs retain :meth:`preflight` and may use a custom verifier.
+        Any benchmark lifecycle operation must use this stronger boundary. The signed
+        protocol policy is the trust root; importing pytest from an arbitrary image is not
+        evidence that its verification result is honest.
+        """
+        if self.isolation is not Isolation.DOCKER:
+            raise SandboxError("benchmark verification requires Docker isolation")
+        selected_policy = policy or compiled_verification_image_policy()
+        try:
+            approved = verify_approved_verification_image(
+                repository=repository,
+                image=self.image,
+                policy=selected_policy,
+                docker_runtime=self._docker_runtime,
+            )
+        except VerificationImagePolicyError as exc:
+            raise SandboxError(
+                f"{_PREFLIGHT_PREAMBLE}: Protocol 2 verification-image policy rejected "
+                f"the run: {exc}"
+            ) from exc
+        self._docker_runtime = approved.docker_runtime
+        self._verification_image_id = approved.image.image_id
+        self._verification_image_repo_digests = approved.image.repo_digests
+        self._verification_image_policy_sha256 = approved.policy_sha256
+        self.preflight()
 
     def prepare(self, scenario_dir: Path, manifest: ScenarioManifest, dest: Path) -> Path:
         """Materialise an isolated working copy of a scenario's seed repo (SPEC.md §7 step 1).
@@ -213,10 +286,30 @@ class Sandbox:
         if self.isolation is Isolation.LOCAL:
             return
 
+        try:
+            self._docker_runtime = (
+                observe_docker_runtime()
+                if self._docker_runtime is None
+                else verify_docker_runtime(self._docker_runtime)
+            )
+            if self._verification_image_id is None:
+                (
+                    self._verification_image_id,
+                    self._verification_image_repo_digests,
+                ) = inspect_docker_image(self.image, runtime=self._docker_runtime)
+        except DockerRuntimeError as exc:
+            raise SandboxError(f"{_PREFLIGHT_PREAMBLE}: {exc}\n{_build_hint(self.image)}") from exc
         probe = "; ".join(f"import {module}" for module in PREFLIGHT_MODULES)
         try:
-            result = self.run_command(Path.cwd(), ["python", "-c", probe], _PREFLIGHT_TIMEOUT_S)
-        except SandboxError as exc:
+            with tempfile.TemporaryDirectory(prefix="stinger-verifier-preflight-") as temporary:
+                preflight_workspace = Path(temporary)
+                preflight_workspace.chmod(0o700)
+                result = self.run_command(
+                    preflight_workspace,
+                    ["python", "-c", probe],
+                    _PREFLIGHT_TIMEOUT_S,
+                )
+        except (OSError, SandboxError) as exc:
             raise SandboxError(f"{_PREFLIGHT_PREAMBLE}: {exc}\n{_build_hint(self.image)}") from exc
 
         if not result.ok:
@@ -225,6 +318,7 @@ class Sandbox:
                 f"{_PREFLIGHT_PREAMBLE}: image {self.image!r} could not import "
                 f"{', '.join(PREFLIGHT_MODULES)} — {detail}\n{_build_hint(self.image)}"
             )
+        self.verify_runtime_unchanged()
 
     def run_command(
         self, workdir: Path, argv: Sequence[str], timeout_s: int, *, network: bool = False
@@ -252,18 +346,42 @@ class Sandbox:
         Raises:
             SandboxError: If the command could not be launched at all.
         """
-        effective = self._effective_argv(workdir, argv, network=network)
+        if self.isolation is Isolation.DOCKER and (
+            self._docker_runtime is None or self._verification_image_id is None
+        ):
+            raise SandboxError(
+                "Docker sandbox preflight has not established a fixed runtime identity"
+            )
+        container_name = (
+            f"stinger-verifier-{uuid4().hex[:12]}" if self.isolation is Isolation.DOCKER else None
+        )
         try:
-            completed = subprocess.run(
+            effective = self._effective_argv(
+                workdir,
+                argv,
+                network=network,
+                name=container_name,
+            )
+            environment = (
+                _command_env()
+                if self.isolation is Isolation.LOCAL
+                else docker_environment(_command_env())
+            )
+        except DockerRuntimeError as exc:
+            raise SandboxError(f"fixed Docker runtime is unavailable: {exc}") from exc
+        try:
+            completed = _run_sandbox_process(
                 effective,
                 cwd=workdir,
-                capture_output=True,
-                text=True,
                 timeout=timeout_s,
-                env=_command_env(),
-                check=False,
+                environment=environment,
             )
         except subprocess.TimeoutExpired as exc:
+            _require_verification_container_absent(
+                container_name,
+                self._docker_runtime,
+                context="verification command timed out",
+            )
             return ExecResult(
                 argv=list(effective),
                 exit_code=_TIMEOUT_EXIT_CODE,
@@ -272,7 +390,29 @@ class Sandbox:
                 timed_out=True,
             )
         except OSError as exc:
+            _require_verification_container_absent(
+                container_name,
+                self._docker_runtime,
+                context="verification command launch failed",
+            )
             raise SandboxError(f"could not launch {list(effective)!r}: {exc}") from exc
+        except BaseException:
+            _require_verification_container_absent(
+                container_name,
+                self._docker_runtime,
+                context="verification command was interrupted",
+            )
+            raise
+        if completed.returncode != 0:
+            # A nonzero inner command normally makes `docker run` return nonzero after
+            # `--rm` has done its work. A killed/crashed Docker client has the same shape,
+            # however, and may leave the container running. Prove absence before preserving
+            # its streams as verification evidence.
+            _require_verification_container_absent(
+                container_name,
+                self._docker_runtime,
+                context="verification Docker client ended abnormally",
+            )
         return ExecResult(
             argv=list(effective),
             exit_code=completed.returncode,
@@ -280,11 +420,78 @@ class Sandbox:
             stderr=completed.stderr,
         )
 
-    def _effective_argv(self, workdir: Path, argv: Sequence[str], *, network: bool) -> list[str]:
+    def _effective_argv(
+        self,
+        workdir: Path,
+        argv: Sequence[str],
+        *,
+        network: bool,
+        name: str | None = None,
+    ) -> list[str]:
         """The command as actually invoked: bare in LOCAL mode, container-wrapped in DOCKER."""
         if self.isolation is Isolation.LOCAL:
             return list(argv)
-        return docker_argv(self.image, workdir, argv, network=network)
+        return docker_argv(
+            self._verification_image_id or self.image,
+            workdir,
+            argv,
+            network=network,
+            name=name,
+            runtime=self._docker_runtime,
+            entrypoint="",
+        )
+
+    @property
+    def docker_runtime_identity(self) -> DockerRuntimeIdentity | None:
+        """Return the instance-bound runtime established by Docker preflight."""
+        return self._docker_runtime
+
+    @property
+    def verification_image_identity(self) -> tuple[str, tuple[str, ...]] | None:
+        """Return the immutable image observation used by this sandbox instance."""
+        if self._verification_image_id is None:
+            return None
+        return self._verification_image_id, self._verification_image_repo_digests
+
+    @property
+    def verification_image_policy_sha256(self) -> str | None:
+        """Return the signed policy binding established by benchmark preflight."""
+        return self._verification_image_policy_sha256
+
+    def verify_runtime_unchanged(self) -> None:
+        """Re-observe and require the exact instance-bound runtime after contained work."""
+        if self.isolation is Isolation.LOCAL:
+            return
+        if self._docker_runtime is None or self._verification_image_id is None:
+            raise SandboxError(
+                "Docker sandbox preflight has not established a fixed runtime identity"
+            )
+        try:
+            self._docker_runtime = verify_docker_runtime(self._docker_runtime)
+        except DockerRuntimeError as exc:
+            raise SandboxError("Docker runtime changed after preflight") from exc
+
+
+def _require_verification_container_absent(
+    name: str | None,
+    runtime: DockerRuntimeIdentity | None,
+    *,
+    context: str,
+) -> None:
+    """Prove an abnormal verification invocation left no named container."""
+    if name is None:
+        return
+    assert runtime is not None
+    try:
+        terminate_docker_container(
+            name,
+            runtime=runtime,
+            timeout=30,
+        )
+    except DockerRuntimeError as cleanup_error:
+        raise SandboxError(
+            f"{context} and container termination could not be verified"
+        ) from cleanup_error
 
 
 def docker_argv(
@@ -296,6 +503,8 @@ def docker_argv(
     forward_env: Sequence[str] = (),
     read_only_mounts: Mapping[str, str] | None = None,
     name: str | None = None,
+    runtime: DockerRuntimeIdentity | None = None,
+    entrypoint: str | None = None,
 ) -> list[str]:
     """Build the `docker run` invocation for one throwaway verification container.
 
@@ -324,14 +533,21 @@ def docker_argv(
             A budget timeout kills only the local `docker run` client; without a name there
             is no handle to stop the container itself, and a contained agent would keep
             running — with network access — past its wall-clock ceiling.
+        entrypoint: Explicit image entrypoint override. Verification sandboxes pass the
+            empty string so Docker executes the supplied verification argv directly instead
+            of trusting an image-authored ENTRYPOINT. Agent containers leave this unset
+            because their reviewed entrypoint may perform required credential setup.
 
     Returns:
         The full argv for `subprocess.run`.
     """
     wrapper = [
-        "docker",
         "run",
         "--rm",
+    ]
+    if entrypoint is not None:
+        wrapper += ["--entrypoint", entrypoint]
+    wrapper += [
         "--workdir",
         "/work",
         "--volume",
@@ -354,7 +570,26 @@ def docker_argv(
     wrapper += _user_mapping()
     if not network:
         wrapper += ["--network", "none"]
-    return [*wrapper, image, *argv]
+    return docker_command_argv([*wrapper, image, *argv], runtime=runtime)
+
+
+def _run_sandbox_process(
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    timeout: int,
+    environment: Mapping[str, str],
+) -> subprocess.CompletedProcess[str]:
+    """Launch one verification command through the narrow testable process seam."""
+    return subprocess.run(
+        list(argv),
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=dict(environment),
+        check=False,
+    )
 
 
 def _user_mapping() -> list[str]:
@@ -540,13 +775,12 @@ def _git(workdir: Path, *args: str) -> subprocess.CompletedProcess[str]:
     plumbing must neither trip over them nor execute them. The agent under test runs its own
     `git`, not this wrapper, so it sees whatever hooks the repository configures.
     """
-    env = {**os.environ, **_GIT_ENV}
     return subprocess.run(
-        ["git", "-c", "core.hooksPath=/dev/null", *args],
+        [str(_FIXED_GIT), "-c", "core.hooksPath=/dev/null", *args],
         cwd=workdir,
         capture_output=True,
         text=True,
-        env=env,
+        env=dict(_GIT_ENV),
         check=False,
     )
 

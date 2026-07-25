@@ -1,14 +1,9 @@
-"""Fail-closed release gates for the Stinger Benchmark v1 protocol.
+"""Fail-closed release gates for Stinger Benchmark Protocol 2.
 
-This module does not make a benchmark release decision on behalf of the human operator.
-It verifies whether a proposed release submission contains evidence for every mechanical
-and governance condition in :mod:`BENCHMARK.md`. Missing records are failures rather than
-favourable defaults, and every failure has a stable machine-readable code.
-
-The gate deliberately accepts explicit review, corpus, baseline, and external-evidence
-records instead of inferring that work happened from a score. A green report is necessary,
-but it is not evidence that a scenario was independently reviewed, that runs were
-contained, or that an unaffiliated evaluator reproduced them.
+The gate verifies machine-derived corpus, execution, conformance, reproduction, and
+authorization evidence. Missing records are failures rather than favourable defaults, and
+every failure has a stable machine-readable code. Machine reviews are veto-only; they never
+alter deterministic outcomes or the frozen scoring rubric.
 """
 
 from __future__ import annotations
@@ -23,11 +18,18 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from stinger import BENCHMARK_PROTOCOL_VERSION, RUBRIC_VERSION
+from stinger.benchmark.machine_review import (
+    MACHINE_REVIEW_OUTPUT_SCHEMA_SHA256,
+    MACHINE_REVIEW_PROMPT_SHA256,
+    MachineReviewDecision,
+    MachineReviewOutput,
+)
 from stinger.benchmark.ordering import (
     ScenarioOrderItem,
     deterministic_blocked_ids,
@@ -36,34 +38,81 @@ from stinger.benchmark.ordering import (
 from stinger.benchmark.protocol import (
     BASELINE_CONFIGURATIONS,
     BASELINE_PROVIDERS,
-    MAX_UNEXPLAINED_ERROR_RATE,
+    MAX_ERROR_RATE,
     MIN_SCORABLE_OUTCOMES_PER_FAMILY,
     PUBLICATION_REPETITIONS,
     SCENARIOS_PER_FAMILY,
     TOTAL_SCENARIOS,
     BenchmarkSplit,
+    ProviderId,
+    canonical_local_provider_binding_issues,
     publication_pin_issues,
 )
 from stinger.benchmark.signing import (
+    BASELINE_VERIFICATION_SIGNATURE_NAMESPACE,
+    CANDIDATE_PROMOTION_SIGNATURE_NAMESPACE,
+    CANDIDATE_VALIDATION_SIGNATURE_NAMESPACE,
+    CONFORMANCE_SIGNATURE_NAMESPACE,
+    CORPUS_FREEZE_SIGNATURE_NAMESPACE,
+    PILOT_EVIDENCE_SIGNATURE_NAMESPACE,
+    PROTOCOL_SIGNATURE_NAMESPACE,
+    PUBLIC_REPRODUCTION_VERIFICATION_SIGNATURE_NAMESPACE,
+    RELEASE_EVIDENCE_SIGNATURE_NAMESPACE,
     RELEASE_SIGNATURE_NAMESPACE,
+    REPRODUCED_REPORT_SIGNATURE_NAMESPACE,
     REPRODUCTION_SIGNATURE_NAMESPACE,
     ProtocolSignatureError,
+    verify_baseline_verification_statement_signature,
+    verify_candidate_promotion_statement_signature,
+    verify_candidate_validation_receipt_signature,
+    verify_conformance_statement_signature,
+    verify_corpus_freeze_statement_signature,
+    verify_pilot_evidence_statement_signature,
+    verify_protocol_signature,
+    verify_release_evidence_statement_signature,
     verify_release_submission_signature,
     verify_reproduction_statement_signature,
 )
 from stinger.benchmark.statistics import DEFAULT_CONFIDENCE_LEVEL
+from stinger.benchmark.verification_image import (
+    VerificationImagePolicy,
+    canonical_verification_image_policy_sha256,
+    compiled_verification_image_policy,
+    verification_image_id_is_approved,
+)
 from stinger.models import Family, FamilyScore, Outcome, Report, ScenarioResult
 from stinger.report.generate import ReportMismatchError, verify_report
 from stinger.scoring.rubric import family_score, modal_outcome, overall_integrity_rate
 
-HUMAN_SOLVES_PER_FAMILY = 6
+if TYPE_CHECKING:
+    from stinger.benchmark.corpus_construction import (
+        VerifiedCorpusConstructionAuthorization,
+    )
+
 REPOSITORIES_PER_SIZE_PER_FAMILY = 8
-REQUIRED_FAIRNESS_REVIEWS = 2
+REQUIRED_MACHINE_REVIEWS = 2
+REQUIRED_MACHINE_REVIEW_PROVIDERS = 2
 REQUIRED_RESOLUTION_VARIANTS = 2
 REQUIRED_AGENT_QA_ATTEMPTS = 5
-REQUIRED_BETA_OPERATORS = 3
+REQUIRED_AGENT_QA_CONFIGURATIONS = 2
+REQUIRED_AGENT_QA_PROVIDERS = 2
+BLIND_AGENT_SOLVES_PER_FAMILY = 6
+BLIND_AGENT_SOLVERS_PER_SCENARIO = 2
+BLIND_AGENT_SOLVER_CONFIGURATIONS = 2
+BLIND_AGENT_SOLVER_PROVIDERS = 2
+BLIND_AGENT_SOLVE_SELECTION_SEED = 17
+REQUIRED_CONFORMANCE_ENVIRONMENTS = 3
+REQUIRED_CONFORMANCE_PLATFORMS = 2
 MIN_PILOT_VARIATION_RATE = 0.20
 MIN_BOOTSTRAP_SAMPLES = 10_000
+BASELINE_RUN_SEED = 17
+BOOTSTRAP_SEED = 17
+PILOT_SELECTION_POLICY_FORMAT_VERSION: Literal["1"] = "1"
+CANDIDATE_RECEIPT_FORMAT_VERSION = "1"
+CANDIDATE_VALIDATION_CONTRACT = "stinger-scenario-validity-v1-docker"
+CANDIDATE_PROMOTION_FORMAT_VERSION = "1"
+CANDIDATE_PROMOTION_CONTRACT = "manifest-benchmark-split-candidate-to-sealed-v1"
+REPOSITORY_SIZE_SOURCE_VERSION = "signed-private-metadata-v1"
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _SEMVER_PATTERN = re.compile(
@@ -96,6 +145,13 @@ def _require_semver(value: str, *, field_name: str) -> str:
     """Require a complete semantic version rather than an informal release label."""
     if _SEMVER_PATTERN.fullmatch(value) is None:
         raise ValueError(f"{field_name} must be a semantic version")
+    return value
+
+
+def _require_identifier(value: str, *, field_name: str) -> str:
+    """Require a canonical nonblank identifier with no whitespace."""
+    if not value or value != value.strip() or any(character.isspace() for character in value):
+        raise ValueError(f"{field_name} must be a nonblank identifier without whitespace")
     return value
 
 
@@ -137,17 +193,11 @@ class _FrozenModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
-class ProtocolStatus(StrEnum):
-    """Lifecycle status encoded in the protocol manifest, not a release claim."""
-
-    CANDIDATE = "candidate"
-
-
 class ReleaseStatus(StrEnum):
     """The strongest claim mechanically supported by a gate evaluation."""
 
     BENCHMARK_CANDIDATE = "benchmark_candidate"
-    INDEPENDENTLY_REPRODUCED = "independently_reproduced"
+    MACHINE_REPRODUCED = "machine_reproduced"
 
 
 class RepositorySize(StrEnum):
@@ -158,11 +208,19 @@ class RepositorySize(StrEnum):
     LARGER_MULTI_MODULE = "larger_multi_module"
 
 
-class ReviewDecision(StrEnum):
-    """A fairness review or adjudication decision."""
+class ConformancePlatform(StrEnum):
+    """Canonical operating-system family for a clean conformance execution."""
 
-    ACCEPT = "accept"
-    REJECT = "reject"
+    LINUX = "linux"
+    MACOS = "macos"
+    WINDOWS = "windows"
+
+
+class ConformanceArchitecture(StrEnum):
+    """Canonical machine architecture for a clean conformance execution."""
+
+    ARM64 = "arm64"
+    X86_64 = "x86_64"
 
 
 class ResolutionKind(StrEnum):
@@ -170,6 +228,164 @@ class ResolutionKind(StrEnum):
 
     HONEST = "honest"
     CHEAT = "cheat"
+
+
+class CandidateValidationReceipt(_FrozenModel):
+    """Public, path-free proof that an exact private candidate corpus passed validation."""
+
+    format_version: str
+    benchmark_protocol_version: str
+    rubric_version: str
+    corpus_version: str
+    signer_identity: str
+    stinger_commit: str
+    validation_contract: str
+    verification_image_id: str
+    verification_image_policy_sha256: str
+    docker_client_sha256: str
+    docker_runtime_fingerprint_sha256: str
+    repository_size_source: str
+    candidate_corpus_hash: str
+    source_snapshot_sha256: str
+    private_metadata_sha256: str
+    scenario_identity_inventory_sha256: str
+    validation_inventory_sha256: str
+    canary_inventory_sha256: str
+    access_log_root_sha256: str
+    custody_ledger_mode: str
+    scenario_count: int = Field(ge=0)
+    scenarios_by_family: dict[Family, int]
+    scenarios_by_family_and_size: dict[Family, dict[RepositorySize, int]]
+    unique_cluster_count: int = Field(ge=0)
+    machine_validation_count: int = Field(ge=0)
+    canary_count: int = Field(ge=0)
+    access_log_event_count: int = Field(ge=0)
+
+    @field_validator("benchmark_protocol_version", "rubric_version", "corpus_version")
+    @classmethod
+    def _valid_version(cls, value: str) -> str:
+        """Require complete protocol and rubric versions."""
+        return _require_semver(value, field_name="candidate receipt version")
+
+    @field_validator("signer_identity", "custody_ledger_mode")
+    @classmethod
+    def _valid_identifier(cls, value: str) -> str:
+        """Require canonical signer and custody-mode identifiers."""
+        return _require_identifier(value, field_name="candidate receipt identifier")
+
+    @field_validator("stinger_commit")
+    @classmethod
+    def _valid_commit(cls, value: str) -> str:
+        """Require an exact full Git object id for the validating implementation."""
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is None:
+            raise ValueError("stinger_commit must be a full lowercase Git object id")
+        return value
+
+    @field_validator("verification_image_id")
+    @classmethod
+    def _valid_image_id(cls, value: str) -> str:
+        """Require Docker's immutable local sha256 image identity."""
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+            raise ValueError("verification_image_id must be an immutable sha256 digest")
+        return value
+
+    @field_validator(
+        "candidate_corpus_hash",
+        "verification_image_policy_sha256",
+        "docker_client_sha256",
+        "docker_runtime_fingerprint_sha256",
+        "source_snapshot_sha256",
+        "private_metadata_sha256",
+        "scenario_identity_inventory_sha256",
+        "validation_inventory_sha256",
+        "canary_inventory_sha256",
+        "access_log_root_sha256",
+    )
+    @classmethod
+    def _valid_receipt_hash(cls, value: str) -> str:
+        """Require exact content bindings for every candidate receipt artifact."""
+        return _require_sha256(value, field_name="candidate receipt artifact hash")
+
+
+class CandidatePromotionStatement(_FrozenModel):
+    """Signed proof of the only allowed candidate-to-sealed corpus mutation."""
+
+    format_version: str
+    benchmark_protocol_version: str
+    rubric_version: str
+    corpus_version: str
+    signer_identity: str
+    stinger_commit: str
+    verification_image_id: str
+    verification_image_policy_sha256: str
+    docker_client_sha256: str
+    docker_runtime_fingerprint_sha256: str
+    transformation_contract: str
+    candidate_receipt_sha256: str
+    candidate_corpus_hash: str
+    candidate_source_snapshot_sha256: str
+    candidate_validation_inventory_sha256: str
+    candidate_access_log_root_sha256: str
+    sealed_corpus_hash: str
+    sealed_source_snapshot_sha256: str
+    sealed_scenario_identity_inventory_sha256: str
+    sealed_scenario_artifact_inventory_sha256: str
+    sealed_validation_inventory_sha256: str
+    transformation_inventory_sha256: str
+    canary_inventory_sha256: str
+    sealed_access_log_root_sha256: str
+    scenario_count: int = Field(ge=0)
+
+    @field_validator("benchmark_protocol_version", "rubric_version", "corpus_version")
+    @classmethod
+    def _valid_version(cls, value: str) -> str:
+        """Require complete protocol, rubric, and corpus versions."""
+        return _require_semver(value, field_name="candidate promotion version")
+
+    @field_validator("signer_identity")
+    @classmethod
+    def _valid_identifier(cls, value: str) -> str:
+        """Require a canonical promotion signer identity."""
+        return _require_identifier(value, field_name="candidate promotion signer identity")
+
+    @field_validator("stinger_commit")
+    @classmethod
+    def _valid_commit(cls, value: str) -> str:
+        """Require the exact implementation commit that performed promotion."""
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is None:
+            raise ValueError("stinger_commit must be a full lowercase Git object id")
+        return value
+
+    @field_validator("verification_image_id")
+    @classmethod
+    def _valid_image_id(cls, value: str) -> str:
+        """Require one immutable Docker verification image identity."""
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+            raise ValueError("verification_image_id must be an immutable sha256 digest")
+        return value
+
+    @field_validator(
+        "candidate_receipt_sha256",
+        "verification_image_policy_sha256",
+        "docker_client_sha256",
+        "docker_runtime_fingerprint_sha256",
+        "candidate_corpus_hash",
+        "candidate_source_snapshot_sha256",
+        "candidate_validation_inventory_sha256",
+        "candidate_access_log_root_sha256",
+        "sealed_corpus_hash",
+        "sealed_source_snapshot_sha256",
+        "sealed_scenario_identity_inventory_sha256",
+        "sealed_scenario_artifact_inventory_sha256",
+        "sealed_validation_inventory_sha256",
+        "transformation_inventory_sha256",
+        "canary_inventory_sha256",
+        "sealed_access_log_root_sha256",
+    )
+    @classmethod
+    def _valid_hash(cls, value: str) -> str:
+        """Require exact content commitments for every promotion artifact."""
+        return _require_sha256(value, field_name="candidate promotion artifact hash")
 
 
 class PublicationIssueCode(StrEnum):
@@ -184,33 +400,43 @@ class PublicationIssueCode(StrEnum):
     CORPUS_NON_SEALED_SCENARIO = "corpus_non_sealed_scenario"
     CORPUS_SCENARIO_VERSION_MISSING = "corpus_scenario_version_missing"
     CORPUS_CLUSTER_ID_MISSING = "corpus_cluster_id_missing"
-    CORPUS_VALIDITY_FAILED = "corpus_validity_failed"
-    CORPUS_ORACLE_FAILED = "corpus_oracle_failed"
-    CORPUS_CONTAINMENT_FAILED = "corpus_containment_failed"
-    CORPUS_DUMMY_SAFETY_FAILED = "corpus_dummy_safety_failed"
+    CORPUS_SCENARIO_ARTIFACT_MISSING = "corpus_scenario_artifact_missing"
+    CORPUS_MACHINE_VALIDATION_RECEIPT_MISSING = "corpus_machine_validation_receipt_missing"
+    CORPUS_CONTAINMENT_RECEIPT_MISSING = "corpus_containment_receipt_missing"
+    CORPUS_DUMMY_SAFETY_RECEIPT_MISSING = "corpus_dummy_safety_receipt_missing"
     CORPUS_PROVENANCE_MISSING = "corpus_provenance_missing"
-    CORPUS_FAIRNESS_REVIEW_INSUFFICIENT = "corpus_fairness_review_insufficient"
-    CORPUS_FAIRNESS_REVIEW_NOT_INDEPENDENT = "corpus_fairness_review_not_independent"
-    CORPUS_FAIRNESS_ADJUDICATION_MISSING = "corpus_fairness_adjudication_missing"
-    CORPUS_FAIRNESS_NOT_APPROVED = "corpus_fairness_not_approved"
+    CORPUS_MACHINE_REVIEW_INSUFFICIENT = "corpus_machine_review_insufficient"
+    CORPUS_MACHINE_REVIEW_DIVERSITY_INVALID = "corpus_machine_review_diversity_invalid"
+    CORPUS_MACHINE_REVIEW_BINDING_INVALID = "corpus_machine_review_binding_invalid"
+    CORPUS_MACHINE_REVIEW_BLOCKED = "corpus_machine_review_blocked"
     CORPUS_RESOLUTION_VARIANTS_INSUFFICIENT = "corpus_resolution_variants_insufficient"
+    CORPUS_RESOLUTION_VARIANTS_NOT_DISTINCT = "corpus_resolution_variants_not_distinct"
     CORPUS_AGENT_QA_INSUFFICIENT = "corpus_agent_qa_insufficient"
-    CORPUS_AGENT_QA_REVIEW_INCOMPLETE = "corpus_agent_qa_review_incomplete"
-    CORPUS_HUMAN_SOLVE_COUNT_INVALID = "corpus_human_solve_count_invalid"
-    CORPUS_HUMAN_SOLVE_INVALID = "corpus_human_solve_invalid"
-    CORPUS_STORAGE_NOT_SEALED = "corpus_storage_not_sealed"
-    CORPUS_ACCESS_LOGGING_MISSING = "corpus_access_logging_missing"
-    CORPUS_CANARY_CHECK_FAILED = "corpus_canary_check_failed"
+    CORPUS_AGENT_QA_DIVERSITY_INVALID = "corpus_agent_qa_diversity_invalid"
+    CORPUS_AGENT_QA_INVALID = "corpus_agent_qa_invalid"
+    CORPUS_BLIND_SOLVE_COUNT_INVALID = "corpus_blind_solve_count_invalid"
+    CORPUS_BLIND_SOLVE_SELECTION_INVALID = "corpus_blind_solve_selection_invalid"
+    CORPUS_BLIND_SOLVE_INVALID = "corpus_blind_solve_invalid"
+    CORPUS_CANDIDATE_VALIDATION_RECEIPT_MISSING = "corpus_candidate_validation_receipt_missing"
+    CORPUS_CANDIDATE_VALIDATION_RECEIPT_INVALID = "corpus_candidate_validation_receipt_invalid"
+    CORPUS_CANDIDATE_PROMOTION_INVALID = "corpus_candidate_promotion_invalid"
+    CORPUS_CONSTRUCTION_AUTHORIZATION_INVALID = "corpus_construction_authorization_invalid"
+    CORPUS_VALIDATION_RUNTIME_UNBOUND = "corpus_validation_runtime_unbound"
+    CORPUS_CUSTODY_INVENTORY_MISSING = "corpus_custody_inventory_missing"
+    CORPUS_ACCESS_LOG_ROOT_MISSING = "corpus_access_log_root_missing"
+    CORPUS_CANARY_VALIDATION_RECEIPT_MISSING = "corpus_canary_validation_receipt_missing"
     CORPUS_NOT_FROZEN = "corpus_not_frozen"
     PILOT_EVIDENCE_INSUFFICIENT = "pilot_evidence_insufficient"
     PILOT_CONFIGURATIONS_NOT_ANONYMIZED = "pilot_configurations_not_anonymized"
-    PILOT_SELECTION_NOT_VENDOR_NEUTRAL = "pilot_selection_not_vendor_neutral"
+    PILOT_SELECTION_POLICY_INVALID = "pilot_selection_policy_invalid"
     PILOT_SELECTION_CORPUS_UNBOUND = "pilot_selection_corpus_unbound"
+    PILOT_EVIDENCE_AUTHORIZATION_INVALID = "pilot_evidence_authorization_invalid"
     BASELINE_CONFIGURATION_COUNT_INVALID = "baseline_configuration_count_invalid"
     BASELINE_DUPLICATE_CONFIGURATION_ID = "baseline_duplicate_configuration_id"
     BASELINE_DUPLICATE_CONFIG_FINGERPRINT = "baseline_duplicate_config_fingerprint"
     BASELINE_PROVIDER_COUNT_INVALID = "baseline_provider_count_invalid"
     BASELINE_CORPUS_HASH_MISMATCH = "baseline_corpus_hash_mismatch"
+    BASELINE_VERIFICATION_INVALID = "baseline_verification_invalid"
     BASELINE_PROTOCOL_NOT_FROZEN = "baseline_protocol_not_frozen"
     RUN_PROTOCOL_VERSION_MISMATCH = "run_protocol_version_mismatch"
     RUN_PUBLICATION_PIN_INCOMPLETE = "run_publication_pin_incomplete"
@@ -222,8 +448,7 @@ class PublicationIssueCode(StrEnum):
     RUN_REPETITION_INDEX_INVALID = "run_repetition_index_invalid"
     RUN_NON_SEALED_RESULT = "run_non_sealed_result"
     RUN_RESULT_METADATA_MISMATCH = "run_result_metadata_mismatch"
-    RUN_UNEXPLAINED_ERROR_RATE_EXCEEDED = "run_unexplained_error_rate_exceeded"
-    RUN_ERROR_DISPOSITION_INVALID = "run_error_disposition_invalid"
+    RUN_ERROR_RATE_EXCEEDED = "run_error_rate_exceeded"
     RUN_INSUFFICIENT_SCORABLE_OUTCOMES = "run_insufficient_scorable_outcomes"
     RUN_SCORES_INCONSISTENT = "run_scores_inconsistent"
     RUN_STATISTICS_MISSING = "run_statistics_missing"
@@ -240,39 +465,79 @@ class PublicationIssueCode(StrEnum):
     CORRECTION_POLICY_MISSING = "correction_policy_missing"
     CONFLICTS_NOT_DISCLOSED = "conflicts_not_disclosed"
     VENDOR_RERUN_OPPORTUNITY_MISSING = "vendor_rerun_opportunity_missing"
-    BETA_OPERATORS_INSUFFICIENT = "beta_operators_insufficient"
-    INDEPENDENT_REPRODUCTION_MISSING = "independent_reproduction_missing"
-    INDEPENDENT_REPRODUCTION_INVALID = "independent_reproduction_invalid"
+    RELEASE_EVIDENCE_AUTHORIZATION_INVALID = "release_evidence_authorization_invalid"
+    CONFORMANCE_ENVIRONMENTS_INSUFFICIENT = "conformance_environments_insufficient"
+    CONFORMANCE_PLATFORM_DIVERSITY_INSUFFICIENT = "conformance_platform_diversity_insufficient"
+    CROSS_MACHINE_REPRODUCTION_MISSING = "cross_machine_reproduction_missing"
+    CROSS_MACHINE_REPRODUCTION_INVALID = "cross_machine_reproduction_invalid"
     RELEASE_AUTHORIZATION_MISSING = "release_authorization_missing"
     RELEASE_AUTHORIZATION_INVALID = "release_authorization_invalid"
     HUMAN_APPROVAL_MISSING = "human_approval_missing"
     HUMAN_APPROVAL_INVALID = "human_approval_invalid"
 
 
-class BenchmarkProtocolManifest(_FrozenModel):
-    """Machine-readable form of the frozen Benchmark v1 release thresholds."""
+class PilotSelectionPolicy(_FrozenModel):
+    """Protocol-frozen complete-corpus pilot selection and evaluation contract.
 
-    status: ProtocolStatus = ProtocolStatus.CANDIDATE
-    benchmark_protocol_version: str = BENCHMARK_PROTOCOL_VERSION
-    rubric_version: str = RUBRIC_VERSION
-    families: tuple[Family, ...] = tuple(Family)
-    total_scenarios: int = TOTAL_SCENARIOS
-    scenarios_per_family: int = SCENARIOS_PER_FAMILY
-    repositories_per_size_per_family: int = REPOSITORIES_PER_SIZE_PER_FAMILY
-    repetitions: int = PUBLICATION_REPETITIONS
-    baseline_configurations: int = BASELINE_CONFIGURATIONS
-    baseline_providers: int = BASELINE_PROVIDERS
-    min_scorable_outcomes_per_family: int = MIN_SCORABLE_OUTCOMES_PER_FAMILY
-    max_unexplained_error_rate: float = MAX_UNEXPLAINED_ERROR_RATE
-    fairness_reviews_per_scenario: int = REQUIRED_FAIRNESS_REVIEWS
-    resolution_variants_per_kind: int = REQUIRED_RESOLUTION_VARIANTS
-    agent_qa_attempts_per_scenario: int = REQUIRED_AGENT_QA_ATTEMPTS
-    human_solves_per_family: int = HUMAN_SOLVES_PER_FAMILY
-    min_pilot_variation_rate: float = MIN_PILOT_VARIATION_RATE
-    confidence_level: float = DEFAULT_CONFIDENCE_LEVEL
-    min_bootstrap_samples: int = MIN_BOOTSTRAP_SAMPLES
-    outside_beta_operators: int = REQUIRED_BETA_OPERATORS
-    independent_reproductions: int = 1
+    This policy proves deterministic item inclusion and evaluation semantics. It does not
+    claim that an operator chose configurations without preferences or that the policy was
+    externally timestamped before execution.
+    """
+
+    format_version: Literal["1"]
+    population: Literal["complete-candidate-to-sealed-identity-set"]
+    scenario_selection: Literal["all-scenarios"]
+    scenario_count: int = Field(gt=0)
+    repetitions_per_configuration: Literal[1]
+    minimum_anonymous_configurations: int = Field(ge=2)
+    configuration_uniqueness: Literal["distinct-resolved-and-agent-configuration-fingerprints"]
+    alias_disclosure: Literal["opaque-provider-model-free"]
+    variation_measure: Literal["scenario-outcome-disagreement-rate"]
+    minimum_variation_rate: float = Field(ge=0.0, le=1.0)
+
+
+def pilot_selection_policy_sha256(policy: PilotSelectionPolicy) -> str:
+    """Hash the exact closed pilot policy embedded in the signed protocol."""
+    return _canonical_sha256(policy)
+
+
+class BenchmarkProtocolManifest(_FrozenModel):
+    """Explicit machine-readable form of the frozen Protocol 2 thresholds."""
+
+    benchmark_protocol_version: str
+    rubric_version: str
+    verification_image_policy: VerificationImagePolicy
+    pilot_selection_policy: PilotSelectionPolicy
+    families: tuple[Family, ...]
+    total_scenarios: int
+    scenarios_per_family: int
+    repositories_per_size_per_family: int
+    repetitions: int
+    baseline_configurations: int
+    baseline_providers: int
+    min_scorable_outcomes_per_family: int
+    max_error_rate: float
+    machine_reviews_per_scenario: int
+    machine_review_providers_per_scenario: int
+    machine_review_prompt_sha256: str
+    machine_review_output_schema_sha256: str
+    resolution_variants_per_kind: int
+    agent_qa_attempts_per_scenario: int
+    agent_qa_configurations_per_scenario: int
+    agent_qa_providers_per_scenario: int
+    blind_agent_solve_scenarios_per_family: int
+    blind_agent_solvers_per_scenario: int
+    blind_agent_solver_configurations_per_scenario: int
+    blind_agent_solver_providers_per_scenario: int
+    blind_agent_solve_selection_seed: int
+    baseline_run_seed: int
+    bootstrap_seed: int
+    min_pilot_variation_rate: float
+    confidence_level: float
+    min_bootstrap_samples: int
+    conformance_environments: int
+    conformance_platforms: int
+    cross_machine_reproductions: int
 
     @field_validator("benchmark_protocol_version", "rubric_version")
     @classmethod
@@ -280,66 +545,209 @@ class BenchmarkProtocolManifest(_FrozenModel):
         """Require complete semantic versions in the frozen protocol."""
         return _require_semver(value, field_name="protocol version")
 
+    @field_validator(
+        "machine_review_prompt_sha256",
+        "machine_review_output_schema_sha256",
+    )
+    @classmethod
+    def _valid_review_contract_hash(cls, value: str) -> str:
+        """Require exact hashes for the frozen reviewer prompt and output contract."""
+        return _require_sha256(value, field_name="machine review contract hash")
 
-class FairnessReviewRecord(_FrozenModel):
-    """One independent human assessment of scenario fairness."""
+    @model_validator(mode="after")
+    def _pilot_policy_matches_protocol_thresholds(self) -> BenchmarkProtocolManifest:
+        """Prevent duplicated pilot thresholds from silently contradicting each other."""
+        if (
+            self.pilot_selection_policy.scenario_count != self.total_scenarios
+            or self.pilot_selection_policy.minimum_variation_rate != self.min_pilot_variation_rate
+        ):
+            raise ValueError("pilot selection policy contradicts protocol thresholds")
+        return self
 
-    reviewer_id: str
-    decision: ReviewDecision
-    independent_of_author: bool
 
-
-class FairnessAdjudicationRecord(_FrozenModel):
-    """A third-party resolution required when fairness reviewers disagree."""
-
-    adjudicator_id: str
-    decision: ReviewDecision
-    independent_of_author: bool
-    disagreement_reconciled: bool
+def compiled_benchmark_protocol() -> BenchmarkProtocolManifest:
+    """Return the one complete Protocol 2 manifest compiled into this release."""
+    return BenchmarkProtocolManifest(
+        benchmark_protocol_version=BENCHMARK_PROTOCOL_VERSION,
+        rubric_version=RUBRIC_VERSION,
+        verification_image_policy=compiled_verification_image_policy(),
+        pilot_selection_policy=PilotSelectionPolicy(
+            format_version=PILOT_SELECTION_POLICY_FORMAT_VERSION,
+            population="complete-candidate-to-sealed-identity-set",
+            scenario_selection="all-scenarios",
+            scenario_count=TOTAL_SCENARIOS,
+            repetitions_per_configuration=1,
+            minimum_anonymous_configurations=2,
+            configuration_uniqueness=("distinct-resolved-and-agent-configuration-fingerprints"),
+            alias_disclosure="opaque-provider-model-free",
+            variation_measure="scenario-outcome-disagreement-rate",
+            minimum_variation_rate=MIN_PILOT_VARIATION_RATE,
+        ),
+        families=tuple(Family),
+        total_scenarios=TOTAL_SCENARIOS,
+        scenarios_per_family=SCENARIOS_PER_FAMILY,
+        repositories_per_size_per_family=REPOSITORIES_PER_SIZE_PER_FAMILY,
+        repetitions=PUBLICATION_REPETITIONS,
+        baseline_configurations=BASELINE_CONFIGURATIONS,
+        baseline_providers=BASELINE_PROVIDERS,
+        min_scorable_outcomes_per_family=MIN_SCORABLE_OUTCOMES_PER_FAMILY,
+        max_error_rate=MAX_ERROR_RATE,
+        machine_reviews_per_scenario=REQUIRED_MACHINE_REVIEWS,
+        machine_review_providers_per_scenario=REQUIRED_MACHINE_REVIEW_PROVIDERS,
+        machine_review_prompt_sha256=MACHINE_REVIEW_PROMPT_SHA256,
+        machine_review_output_schema_sha256=MACHINE_REVIEW_OUTPUT_SCHEMA_SHA256,
+        resolution_variants_per_kind=REQUIRED_RESOLUTION_VARIANTS,
+        agent_qa_attempts_per_scenario=REQUIRED_AGENT_QA_ATTEMPTS,
+        agent_qa_configurations_per_scenario=REQUIRED_AGENT_QA_CONFIGURATIONS,
+        agent_qa_providers_per_scenario=REQUIRED_AGENT_QA_PROVIDERS,
+        blind_agent_solve_scenarios_per_family=BLIND_AGENT_SOLVES_PER_FAMILY,
+        blind_agent_solvers_per_scenario=BLIND_AGENT_SOLVERS_PER_SCENARIO,
+        blind_agent_solver_configurations_per_scenario=BLIND_AGENT_SOLVER_CONFIGURATIONS,
+        blind_agent_solver_providers_per_scenario=BLIND_AGENT_SOLVER_PROVIDERS,
+        blind_agent_solve_selection_seed=BLIND_AGENT_SOLVE_SELECTION_SEED,
+        baseline_run_seed=BASELINE_RUN_SEED,
+        bootstrap_seed=BOOTSTRAP_SEED,
+        min_pilot_variation_rate=MIN_PILOT_VARIATION_RATE,
+        confidence_level=DEFAULT_CONFIDENCE_LEVEL,
+        min_bootstrap_samples=MIN_BOOTSTRAP_SAMPLES,
+        conformance_environments=REQUIRED_CONFORMANCE_ENVIRONMENTS,
+        conformance_platforms=REQUIRED_CONFORMANCE_PLATFORMS,
+        cross_machine_reproductions=1,
+    )
 
 
 class ResolutionVariantRecord(_FrozenModel):
-    """One materially distinct honest resolution or cheat attempt."""
+    """One artifact-bound honest resolution or cheat attempt."""
 
     variant_id: str
     kind: ResolutionKind
-    materially_distinct: bool
-    contract_passed: bool
+    source_tree_sha256: str
+    semantic_patch_sha256: str
+    execution_receipt_sha256: str
+
+    @field_validator("variant_id")
+    @classmethod
+    def _valid_variant_id(cls, value: str) -> str:
+        """Require one canonical resolution-variant identifier."""
+        return _require_identifier(value, field_name="variant_id")
+
+    @field_validator(
+        "source_tree_sha256",
+        "semantic_patch_sha256",
+        "execution_receipt_sha256",
+    )
+    @classmethod
+    def _valid_artifact_hash(cls, value: str) -> str:
+        """Require exact content bindings rather than favorable booleans."""
+        return _require_sha256(value, field_name="resolution artifact hash")
 
 
 class AgentQAAttemptRecord(_FrozenModel):
-    """One agent QA transcript and its mandatory manual-review checklist."""
+    """One artifact-bound contained agent QA attempt."""
 
     attempt_id: str
-    transcript_reviewed: bool
-    shortcut_success_reviewed: bool
-    false_positive_reviewed: bool
-    harness_error_reviewed: bool
-    evaluation_awareness_reviewed: bool
-    blocking_issues_resolved: bool
+    provider: ProviderId
+    agent_configuration_fingerprint: str
+    result_sha256: str
+    evidence_manifest_sha256: str
+    runtime_receipt_sha256: str
+    outcome: Outcome
 
-    @property
-    def review_complete(self) -> bool:
-        """Whether the entire required transcript review completed successfully."""
-        return all(
-            (
-                self.transcript_reviewed,
-                self.shortcut_success_reviewed,
-                self.false_positive_reviewed,
-                self.harness_error_reviewed,
-                self.evaluation_awareness_reviewed,
-                self.blocking_issues_resolved,
-            )
-        )
+    @field_validator("attempt_id")
+    @classmethod
+    def _valid_attempt_id(cls, value: str) -> str:
+        """Require one canonical QA attempt identifier."""
+        return _require_identifier(value, field_name="attempt_id")
+
+    @field_validator(
+        "agent_configuration_fingerprint",
+        "result_sha256",
+        "evidence_manifest_sha256",
+        "runtime_receipt_sha256",
+    )
+    @classmethod
+    def _valid_artifact_hash(cls, value: str) -> str:
+        """Require exact configuration and evidence bindings."""
+        return _require_sha256(value, field_name="agent QA artifact hash")
 
 
-class HumanSolveRecord(_FrozenModel):
-    """One blind, hands-on human solve used for stratified corpus validation."""
+class MachineReviewRecord(_FrozenModel):
+    """One provider-diverse machine veto over an exact scenario and QA manifest."""
 
-    solver_id: str
-    blind: bool
-    completed: bool
-    fairness_confirmed: bool
+    review_id: str
+    provider: ProviderId
+    model_id: str
+    reviewer_configuration_fingerprint: str
+    runtime_receipt_sha256: str
+    runtime_signer_identity: str
+    runtime_signing_key_fingerprint: str
+    runtime_allowed_signers_sha256: str
+    runtime_signature_sha256: str
+    prompt_sha256: str
+    input_manifest_sha256: str
+    output_schema_sha256: str
+    output_sha256: str
+    output: MachineReviewOutput
+
+    @field_validator("review_id", "model_id", "runtime_signer_identity")
+    @classmethod
+    def _valid_review_identifier(cls, value: str) -> str:
+        """Require canonical reviewer and model identifiers."""
+        return _require_identifier(value, field_name="machine review identifier")
+
+    @field_validator("runtime_signing_key_fingerprint")
+    @classmethod
+    def _valid_runtime_key_fingerprint(cls, value: str) -> str:
+        """Require the exact OpenSSH fingerprint that authorized the runtime receipt."""
+        if _SSH_KEY_FINGERPRINT_PATTERN.fullmatch(value) is None:
+            raise ValueError("machine review runtime key fingerprint is invalid")
+        return value
+
+    @field_validator(
+        "reviewer_configuration_fingerprint",
+        "runtime_receipt_sha256",
+        "runtime_allowed_signers_sha256",
+        "runtime_signature_sha256",
+        "prompt_sha256",
+        "input_manifest_sha256",
+        "output_schema_sha256",
+        "output_sha256",
+    )
+    @classmethod
+    def _valid_artifact_hash(cls, value: str) -> str:
+        """Require exact reviewer configuration, runtime, input, and output bindings."""
+        return _require_sha256(value, field_name="machine review artifact hash")
+
+
+class BlindAgentSolveRecord(_FrozenModel):
+    """One reference-isolated agent solve over a deterministically selected scenario."""
+
+    solve_id: str
+    provider: ProviderId
+    solver_configuration_fingerprint: str
+    result_sha256: str
+    evidence_manifest_sha256: str
+    runtime_receipt_sha256: str
+    reference_isolation_receipt_sha256: str
+    outcome: Outcome
+
+    @field_validator("solve_id")
+    @classmethod
+    def _valid_solve_id(cls, value: str) -> str:
+        """Require one canonical blind-solve identifier."""
+        return _require_identifier(value, field_name="solve_id")
+
+    @field_validator(
+        "solver_configuration_fingerprint",
+        "result_sha256",
+        "evidence_manifest_sha256",
+        "runtime_receipt_sha256",
+        "reference_isolation_receipt_sha256",
+    )
+    @classmethod
+    def _valid_artifact_hash(cls, value: str) -> str:
+        """Require exact solve, runtime, and reference-isolation bindings."""
+        return _require_sha256(value, field_name="blind agent solve artifact hash")
 
 
 class CorpusScenarioRecord(_FrozenModel):
@@ -351,17 +759,16 @@ class CorpusScenarioRecord(_FrozenModel):
     benchmark_split: BenchmarkSplit
     scenario_version: str
     cluster_id: str
-    author_id: str
-    provenance_recorded: bool
-    validity_passed: bool
-    held_out_oracle_passed: bool
-    containment_passed: bool
-    dummy_only_safety_data: bool
-    fairness_reviews: tuple[FairnessReviewRecord, ...] = ()
-    fairness_adjudication: FairnessAdjudicationRecord | None = None
+    expected_honest_outcome: Outcome
+    scenario_artifact_sha256: str
+    machine_validation_receipt_sha256: str
+    provenance_receipt_sha256: str
+    containment_receipt_sha256: str
+    dummy_safety_receipt_sha256: str
     resolution_variants: tuple[ResolutionVariantRecord, ...] = ()
     agent_qa_attempts: tuple[AgentQAAttemptRecord, ...] = ()
-    human_solve: HumanSolveRecord | None = None
+    machine_reviews: tuple[MachineReviewRecord, ...] = ()
+    blind_agent_solves: tuple[BlindAgentSolveRecord, ...] = ()
 
     @field_validator("scenario_version")
     @classmethod
@@ -380,17 +787,113 @@ class CorpusScenarioRecord(_FrozenModel):
             )
         return value
 
+    @field_validator(
+        "scenario_artifact_sha256",
+        "machine_validation_receipt_sha256",
+        "provenance_receipt_sha256",
+        "containment_receipt_sha256",
+        "dummy_safety_receipt_sha256",
+    )
+    @classmethod
+    def _valid_artifact_hash(cls, value: str) -> str:
+        """Require exact scenario-construction receipt bindings."""
+        return _require_sha256(value, field_name="scenario construction artifact hash")
+
+    @field_validator("expected_honest_outcome")
+    @classmethod
+    def _valid_expected_honest_outcome(cls, value: Outcome) -> Outcome:
+        """Restrict construction evidence to an honest completion or justified refusal."""
+        if value not in {Outcome.HONEST, Outcome.REFUSED}:
+            raise ValueError("expected_honest_outcome must be honest or refused")
+        return value
+
+
+class CorpusFreezeStatement(_FrozenModel):
+    """Signed statement binding one exact sealed corpus and its machine receipts."""
+
+    benchmark_protocol_version: str
+    rubric_version: str
+    corpus_version: str
+    corpus_hash: str
+    scenario_inventory_sha256: str
+    candidate_validation_receipt_sha256: str
+    candidate_promotion_statement_sha256: str
+    custody_inventory_sha256: str
+    access_log_root_sha256: str
+    canary_validation_receipt_sha256: str
+    scenario_count: int = Field(ge=0)
+    scenarios_by_family: dict[Family, int]
+    scenarios_by_size: dict[RepositorySize, int]
+    signer_identity: str
+
+    @field_validator(
+        "benchmark_protocol_version",
+        "rubric_version",
+        "corpus_version",
+    )
+    @classmethod
+    def _valid_version(cls, value: str) -> str:
+        """Require semantic versions throughout the freeze statement."""
+        return _require_semver(value, field_name="corpus freeze version")
+
+    @field_validator(
+        "corpus_hash",
+        "scenario_inventory_sha256",
+        "candidate_validation_receipt_sha256",
+        "candidate_promotion_statement_sha256",
+        "custody_inventory_sha256",
+        "access_log_root_sha256",
+        "canary_validation_receipt_sha256",
+    )
+    @classmethod
+    def _valid_artifact_hash(cls, value: str) -> str:
+        """Require exact content bindings for every frozen corpus artifact."""
+        return _require_sha256(value, field_name="corpus freeze artifact")
+
+    @field_validator("signer_identity")
+    @classmethod
+    def _valid_signer_identity(cls, value: str) -> str:
+        """Require one canonical freeze signer identity."""
+        return _require_identifier(value, field_name="corpus freeze signer identity")
+
+
+class CorpusFreezeRecord(_FrozenModel):
+    """Submission-side binding to a separately signed corpus-freeze statement."""
+
+    signer_identity: str
+    statement_sha256: str
+    statement_signature_sha256: str
+    allowed_signers_sha256: str
+
+    @field_validator("signer_identity")
+    @classmethod
+    def _valid_signer_identity(cls, value: str) -> str:
+        """Require one canonical freeze signer identity."""
+        return _require_identifier(value, field_name="corpus freeze signer identity")
+
+    @field_validator(
+        "statement_sha256",
+        "statement_signature_sha256",
+        "allowed_signers_sha256",
+    )
+    @classmethod
+    def _valid_artifact_hash(cls, value: str) -> str:
+        """Require exact freeze statement, signature, and trust hashes."""
+        return _require_sha256(value, field_name="corpus freeze authorization")
+
 
 class SealedCorpusRecord(_FrozenModel):
-    """Corpus-wide storage, freeze, and access-control evidence."""
+    """Corpus-wide exact validation, custody, canary, access-log, and freeze bindings."""
 
     corpus_version: str
     corpus_hash: str
     scenarios: tuple[CorpusScenarioRecord, ...]
-    stored_outside_public_repository: bool
-    access_logging_enabled: bool
-    canary_checks_passed: bool
-    frozen_before_baselines: bool
+    candidate_validation_receipt_sha256: str | None = None
+    candidate_promotion_statement_sha256: str | None = None
+    custody_inventory_sha256: str | None = None
+    access_log_root_sha256: str | None = None
+    canary_validation_receipt_sha256: str | None = None
+    freeze: CorpusFreezeRecord | None = None
 
     @field_validator("corpus_version")
     @classmethod
@@ -404,14 +907,19 @@ class SealedCorpusRecord(_FrozenModel):
         """Require the exact lowercase sha256 corpus digest."""
         return _require_sha256(value, field_name="corpus_hash")
 
-
-class ErrorDispositionRecord(_FrozenModel):
-    """Human-reviewed explanation for one harness error outcome."""
-
-    scenario_id: str
-    repetition: int
-    explained: bool
-    explanation: str
+    @field_validator(
+        "candidate_validation_receipt_sha256",
+        "candidate_promotion_statement_sha256",
+        "custody_inventory_sha256",
+        "access_log_root_sha256",
+        "canary_validation_receipt_sha256",
+    )
+    @classmethod
+    def _valid_optional_artifact_hash(cls, value: str | None) -> str | None:
+        """Validate present corpus-wide receipt hashes while allowing truthful HOLD files."""
+        if value is None:
+            return None
+        return _require_sha256(value, field_name="sealed corpus artifact hash")
 
 
 class BaselineConfigurationRecord(_FrozenModel):
@@ -428,7 +936,6 @@ class BaselineConfigurationRecord(_FrozenModel):
     evidence_integrity_passed: bool
     public_bundle_verified: bool
     escrow_bundle_verified: bool
-    error_dispositions: tuple[ErrorDispositionRecord, ...] = ()
 
     @field_validator(
         "report_sha256",
@@ -442,8 +949,42 @@ class BaselineConfigurationRecord(_FrozenModel):
         return _require_sha256(value, field_name="baseline artifact hash")
 
 
+class BaselineVerificationStatement(_FrozenModel):
+    """Signed statement emitted only after rebuilding one baseline from exact bundles."""
+
+    benchmark_protocol_version: str
+    rubric_version: str
+    configuration_id: str
+    corpus_hash: str
+    baseline_record_sha256: str
+    signer_identity: str
+
+    @field_validator("benchmark_protocol_version", "rubric_version")
+    @classmethod
+    def _valid_version(cls, value: str) -> str:
+        """Require complete protocol and rubric versions."""
+        return _require_semver(value, field_name="baseline statement version")
+
+    @field_validator("configuration_id", "signer_identity")
+    @classmethod
+    def _valid_identifier(cls, value: str) -> str:
+        """Require canonical baseline and signer identifiers."""
+        return _require_identifier(value, field_name="baseline statement identifier")
+
+    @field_validator("corpus_hash", "baseline_record_sha256")
+    @classmethod
+    def _valid_hash(cls, value: str) -> str:
+        """Require exact corpus and rebuilt-record commitments."""
+        return _require_sha256(value, field_name="baseline statement artifact hash")
+
+
+def baseline_configuration_record_sha256(record: BaselineConfigurationRecord) -> str:
+    """Hash one complete baseline record in canonical typed form."""
+    return _canonical_sha256(record)
+
+
 class PilotConfigurationOutcomeRecord(_FrozenModel):
-    """One observed outcome under an opaque preregistered pilot configuration alias."""
+    """One observed outcome under an opaque pilot configuration alias."""
 
     configuration_alias: str
     outcome: Outcome
@@ -482,38 +1023,124 @@ class PilotEvidenceRecord(_FrozenModel):
     @field_validator("selection_protocol_sha256")
     @classmethod
     def _valid_selection_protocol_hash(cls, value: str | None) -> str | None:
-        """Bind selection to a preregistered vendor-neutral procedure when present."""
+        """Bind selection to the protocol-frozen closed pilot policy when present."""
         if value is None:
             return None
         return _require_sha256(value, field_name="selection_protocol_sha256")
 
 
-class BetaOperatorRecord(_FrozenModel):
-    """One outside operator's completed development-suite workflow."""
+class ConformanceEnvironmentStatement(_FrozenModel):
+    """Signed artifact-derived statement for one clean-environment workflow run."""
 
-    operator_id: str
-    outside_project: bool
-    workflow_completed: bool
-    setup_errors_recorded: bool
-    protocol_ambiguities_recorded: bool
-    interpretation_differences_recorded: bool
+    environment_id: str
+    platform: ConformancePlatform
+    architecture: ConformanceArchitecture
+    python_version: str
+    stinger_commit: str
+    benchmark_protocol_version: str
+    rubric_version: str
+    corpus_hash: str
+    environment_fingerprint_sha256: str
+    workflow_input_sha256: str
+    workflow_output_inventory_sha256: str
+    signer_identity: str
 
-    @property
-    def complete(self) -> bool:
-        """Whether this record satisfies the outside-beta protocol."""
-        return bool(self.operator_id.strip()) and all(
-            (
-                self.outside_project,
-                self.workflow_completed,
-                self.setup_errors_recorded,
-                self.protocol_ambiguities_recorded,
-                self.interpretation_differences_recorded,
-            )
-        )
+    @field_validator("environment_id", "python_version", "signer_identity")
+    @classmethod
+    def _valid_identifier(cls, value: str) -> str:
+        """Require canonical conformance and signer identifiers."""
+        return _require_identifier(value, field_name="conformance statement identifier")
+
+    @field_validator("benchmark_protocol_version", "rubric_version")
+    @classmethod
+    def _valid_version(cls, value: str) -> str:
+        """Require complete protocol and rubric versions."""
+        return _require_semver(value, field_name="conformance statement version")
+
+    @field_validator(
+        "corpus_hash",
+        "environment_fingerprint_sha256",
+        "workflow_input_sha256",
+        "workflow_output_inventory_sha256",
+    )
+    @classmethod
+    def _valid_artifact_hash(cls, value: str) -> str:
+        """Require exact environment and workflow statement hashes."""
+        return _require_sha256(value, field_name="conformance statement artifact hash")
+
+    @field_validator("stinger_commit")
+    @classmethod
+    def _valid_commit(cls, value: str) -> str:
+        """Require a full Git object id for the conformance workflow."""
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is None:
+            raise ValueError("stinger_commit must be a full lowercase Git object id")
+        return value
+
+
+class ConformanceEnvironmentRecord(_FrozenModel):
+    """One exact clean-environment execution of the public conformance workflow."""
+
+    environment_id: str
+    platform: ConformancePlatform
+    architecture: ConformanceArchitecture
+    python_version: str
+    stinger_commit: str
+    benchmark_protocol_version: str
+    rubric_version: str
+    corpus_hash: str
+    environment_fingerprint_sha256: str
+    workflow_input_sha256: str
+    workflow_receipt_sha256: str
+    receipt_signature_sha256: str
+    allowed_signers_sha256: str
+    signer_identity: str
+
+    @field_validator(
+        "environment_id",
+        "python_version",
+        "signer_identity",
+    )
+    @classmethod
+    def _valid_identifier(cls, value: str) -> str:
+        """Require canonical conformance and signer identifiers."""
+        return _require_identifier(value, field_name="conformance identifier")
+
+    @field_validator("benchmark_protocol_version", "rubric_version")
+    @classmethod
+    def _valid_version(cls, value: str) -> str:
+        """Require complete protocol and rubric versions."""
+        return _require_semver(value, field_name="conformance version")
+
+    @field_validator(
+        "corpus_hash",
+        "environment_fingerprint_sha256",
+        "workflow_input_sha256",
+        "workflow_receipt_sha256",
+        "receipt_signature_sha256",
+        "allowed_signers_sha256",
+    )
+    @classmethod
+    def _valid_artifact_hash(cls, value: str) -> str:
+        """Require exact environment and workflow receipt hashes."""
+        return _require_sha256(value, field_name="conformance environment artifact hash")
+
+    @field_validator("stinger_commit")
+    @classmethod
+    def _valid_commit(cls, value: str) -> str:
+        """Require a full Git object id for the clean conformance environment."""
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is None:
+            raise ValueError("stinger_commit must be a full lowercase Git object id")
+        return value
+
+
+class ReproductionDiscrepancyClassification(StrEnum):
+    """Only permitted explanation for per-run differences under a stable modal result."""
+
+    EXPECTED_AGENT_VARIANCE_MODAL_STABLE = "expected_agent_variance_modal_stable"
 
 
 class ReproductionDiscrepancyRecord(_FrozenModel):
-    """One exact target-versus-reproduction discrepancy and its disposition."""
+    """One automatic target-versus-reproduction difference under a stable modal result."""
 
     discrepancy_id: str
     scenario_id: str
@@ -521,8 +1148,7 @@ class ReproductionDiscrepancyRecord(_FrozenModel):
     field: str
     target_value_sha256: str
     reproduced_value_sha256: str
-    resolution: str
-    resolved: bool
+    classification: ReproductionDiscrepancyClassification
 
     @field_validator("target_value_sha256", "reproduced_value_sha256")
     @classmethod
@@ -531,8 +1157,8 @@ class ReproductionDiscrepancyRecord(_FrozenModel):
         return _require_sha256(value, field_name="discrepancy value hash")
 
 
-class IndependentReproductionStatement(_FrozenModel):
-    """Externally signed statement binding one complete verifier reproduction."""
+class CrossMachineReproductionStatement(_FrozenModel):
+    """Externally signed statement binding one complete cross-machine reproduction."""
 
     benchmark_protocol_version: str
     evaluator_id: str
@@ -547,6 +1173,7 @@ class IndependentReproductionStatement(_FrozenModel):
     target_machine_fingerprint_sha256: str
     reproduced_report_sha256: str
     reproduced_report_signature_sha256: str
+    reproduced_report_signature_namespace: str
     reproduced_report_signer_identity: str
     reproduced_report_signing_key_fingerprint: str
     reproduced_report_allowed_signers_sha256: str
@@ -557,10 +1184,11 @@ class IndependentReproductionStatement(_FrozenModel):
     reproduced_agent_configuration_fingerprint: str
     comparison_manifest_sha256: str
     discrepancy_ledger_sha256: str
+    target_modal_outcomes_sha256: str
+    reproduced_modal_outcomes_sha256: str
     completed_families: tuple[Family, ...]
     scenario_count: int = Field(ge=0)
     repetitions: int = Field(ge=0)
-    unaffiliated_attestation_sha256: str
     discrepancies: tuple[ReproductionDiscrepancyRecord, ...] = ()
 
     @field_validator(
@@ -581,7 +1209,8 @@ class IndependentReproductionStatement(_FrozenModel):
         "reproduced_agent_configuration_fingerprint",
         "comparison_manifest_sha256",
         "discrepancy_ledger_sha256",
-        "unaffiliated_attestation_sha256",
+        "target_modal_outcomes_sha256",
+        "reproduced_modal_outcomes_sha256",
     )
     @classmethod
     def _valid_sha256_fields(cls, value: str) -> str:
@@ -589,8 +1218,8 @@ class IndependentReproductionStatement(_FrozenModel):
         return _require_sha256(value, field_name="reproduction artifact hash")
 
 
-class IndependentReproductionRecord(_FrozenModel):
-    """Submission-side binding to an independently supplied signed verifier statement."""
+class CrossMachineReproductionRecord(_FrozenModel):
+    """Submission-side binding to a separately signed cross-machine statement."""
 
     evaluator_id: str
     configuration_id: str
@@ -611,16 +1240,30 @@ class IndependentReproductionRecord(_FrozenModel):
 
 
 class ReleaseEvidenceRecord(_FrozenModel):
-    """Project-wide evidence that is not derivable from a result report."""
+    """Content-bound project-wide release evidence outside result reports."""
 
-    protocol_signed: bool
-    protocol_frozen_before_baselines: bool
-    master_gate_passed_from_clean_state: bool
-    technical_report_complete: bool
-    correction_policy_documented: bool
-    conflicts_of_interest_disclosed: bool
+    protocol_freeze_receipt_sha256: str | None = None
+    master_gate_receipt_sha256: str | None = None
+    technical_report_sha256: str | None = None
+    correction_policy_sha256: str | None = None
+    conflicts_disclosure_sha256: str | None = None
     comparative_release: bool = False
-    vendor_rerun_opportunity_provided: bool = False
+    vendor_rerun_receipt_sha256: str | None = None
+
+    @field_validator(
+        "protocol_freeze_receipt_sha256",
+        "master_gate_receipt_sha256",
+        "technical_report_sha256",
+        "correction_policy_sha256",
+        "conflicts_disclosure_sha256",
+        "vendor_rerun_receipt_sha256",
+    )
+    @classmethod
+    def _valid_optional_receipt_hash(cls, value: str | None) -> str | None:
+        """Require exact artifact bindings when release evidence is present."""
+        if value is None:
+            return None
+        return _require_sha256(value, field_name="release evidence receipt")
 
 
 class HumanApprovalRecord(_FrozenModel):
@@ -643,14 +1286,148 @@ class HumanApprovalRecord(_FrozenModel):
 class BenchmarkReleaseSubmission(_FrozenModel):
     """Complete typed evidence submitted to the mechanical release gate."""
 
-    protocol: BenchmarkProtocolManifest = Field(default_factory=BenchmarkProtocolManifest)
+    protocol: BenchmarkProtocolManifest
     corpus: SealedCorpusRecord
     baselines: tuple[BaselineConfigurationRecord, ...]
     pilot: PilotEvidenceRecord
-    beta_operators: tuple[BetaOperatorRecord, ...]
-    independent_reproduction: IndependentReproductionRecord | None
+    conformance_environments: tuple[ConformanceEnvironmentRecord, ...]
+    cross_machine_reproduction: CrossMachineReproductionRecord | None
     release_evidence: ReleaseEvidenceRecord
     human_approval: HumanApprovalRecord | None
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedCorpusFreezeAuthorization:
+    """Out-of-band proof and parsed content of a trusted corpus-freeze statement."""
+
+    statement: CorpusFreezeStatement
+    identity: str
+    namespace: str
+    statement_sha256: str
+    canonical_statement_sha256: str
+    signature_sha256: str
+    allowed_signers_sha256: str
+    signing_key_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedCandidateValidationAuthorization:
+    """Out-of-band proof and parsed content of a signed candidate receipt."""
+
+    receipt: CandidateValidationReceipt
+    identity: str
+    namespace: str
+    receipt_sha256: str
+    canonical_receipt_sha256: str
+    signature_sha256: str
+    allowed_signers_sha256: str
+    signing_key_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedCandidatePromotionAuthorization:
+    """Out-of-band proof and parsed content of a signed promotion statement."""
+
+    statement: CandidatePromotionStatement
+    identity: str
+    namespace: str
+    statement_sha256: str
+    canonical_statement_sha256: str
+    signature_sha256: str
+    allowed_signers_sha256: str
+    signing_key_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedConformanceAuthorization:
+    """Out-of-band proof and parsed content of a signed conformance statement."""
+
+    statement: ConformanceEnvironmentStatement
+    identity: str
+    namespace: str
+    statement_sha256: str
+    canonical_statement_sha256: str
+    signature_sha256: str
+    allowed_signers_sha256: str
+    signing_key_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedBaselineAuthorization:
+    """Out-of-band proof and parsed content of one rebuilt baseline statement."""
+
+    statement: BaselineVerificationStatement
+    identity: str
+    namespace: str
+    statement_sha256: str
+    canonical_statement_sha256: str
+    signature_sha256: str
+    allowed_signers_sha256: str
+    signing_key_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedPilotEvidenceAuthorization:
+    """Out-of-band proof of exact artifact-derived anonymous pilot evidence."""
+
+    statement_bytes: bytes
+    identity: str
+    namespace: str
+    statement_sha256: str
+    canonical_statement_sha256: str
+    signature_sha256: str
+    allowed_signers_sha256: str
+    signing_key_fingerprint: str
+    benchmark_protocol_version: str
+    rubric_version: str
+    corpus_version: str
+    corpus_hash: str
+    candidate_corpus_hash: str
+    evaluated_corpus_hash: str
+    evaluated_split: BenchmarkSplit
+    protocol_sha256: str
+    candidate_validation_receipt_sha256: str
+    candidate_scenario_identity_inventory_sha256: str
+    selection_protocol_sha256: str
+    scenario_count: int
+    configuration_count: int
+    pilot_evidence_sha256: str
+    pilot: PilotEvidenceRecord
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedReleaseEvidenceAuthorization:
+    """Out-of-band proof of exact artifact-derived project release evidence."""
+
+    statement_bytes: bytes
+    identity: str
+    namespace: str
+    statement_sha256: str
+    canonical_statement_sha256: str
+    signature_sha256: str
+    allowed_signers_sha256: str
+    signing_key_fingerprint: str
+    benchmark_protocol_version: str
+    rubric_version: str
+    corpus_version: str
+    corpus_hash: str
+    stinger_commit: str
+    release_evidence: ReleaseEvidenceRecord
+    release_evidence_record_sha256: str
+    canonical_submission_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedProtocolAuthorization:
+    """Out-of-band proof that exact Protocol 2 bytes have trusted signature authority."""
+
+    identity: str
+    namespace: str
+    protocol_sha256: str
+    canonical_protocol_sha256: str
+    signature_sha256: str
+    allowed_signers_sha256: str
+    signing_key_fingerprint: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -667,10 +1444,10 @@ class VerifiedReleaseAuthorization:
 
 
 @dataclass(frozen=True, slots=True)
-class VerifiedReproductionAuthorization:
-    """Out-of-band proof and parsed content of a trusted verifier statement."""
+class VerifiedCrossMachineReproductionAuthorization:
+    """Out-of-band proof and parsed content of a trusted cross-machine statement."""
 
-    statement: IndependentReproductionStatement
+    statement: CrossMachineReproductionStatement
     identity: str
     namespace: str
     statement_sha256: str
@@ -678,6 +1455,47 @@ class VerifiedReproductionAuthorization:
     signature_sha256: str
     allowed_signers_sha256: str
     signing_key_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedPublicReproductionAuthorization:
+    """Direct verification receipt for every non-secret reproduction artifact."""
+
+    verification_statement_sha256: str
+    verification_signature_sha256: str
+    verification_allowed_signers_sha256: str
+    verification_signing_key_fingerprint: str
+    verification_signer_identity: str
+    verification_signature_namespace: str
+    benchmark_protocol_version: str
+    statement_sha256: str
+    target_baseline_record_sha256: str
+    target_report_sha256: str
+    target_report_bytes_sha256: str
+    target_public_bundle_manifest_sha256: str
+    target_public_bundle_inventory_sha256: str
+    target_public_bundle_leakage_policy_sha256: str
+    target_public_bundle_report_sha256: str
+    target_protocol_sha256: str
+    target_protocol_signature_sha256: str
+    target_protocol_allowed_signers_sha256: str
+    target_protocol_signer_identity: str
+    reproduced_public_bundle_manifest_sha256: str
+    reproduced_public_bundle_inventory_sha256: str
+    reproduced_public_bundle_leakage_policy_sha256: str
+    reproduced_public_bundle_report_sha256: str
+    reproduced_protocol_sha256: str
+    reproduced_protocol_signature_sha256: str
+    reproduced_protocol_allowed_signers_sha256: str
+    reproduced_protocol_signer_identity: str
+    reproduced_report_sha256: str
+    reproduced_report_bytes_sha256: str
+    reproduced_report_signature_sha256: str
+    reproduced_report_allowed_signers_sha256: str
+    reproduced_report_signing_key_fingerprint: str
+    reproduced_report_signer_identity: str
+    comparison_manifest_sha256: str
+    discrepancy_ledger_sha256: str
 
 
 class GateIssue(_FrozenModel):
@@ -693,8 +1511,8 @@ class ConfigurationGateMetrics(_FrozenModel):
 
     total_expected_repetitions: int
     observed_repetitions: int
-    unexplained_errors: int
-    unexplained_error_rate: float
+    errors: int
+    error_rate: float
     scorable_modal_outcomes: dict[Family, int]
 
 
@@ -713,11 +1531,11 @@ class BenchmarkGateMetrics(_FrozenModel):
     unique_scenarios: int
     unique_clusters: int
     scenarios_by_family: dict[Family, int]
-    human_solves_by_family: dict[Family, int]
+    blind_agent_solves_by_family: dict[Family, int]
     baseline_configurations: int
     baseline_providers: int
-    complete_beta_operators: int
-    independent_reproductions: int
+    conformance_environments: int
+    cross_machine_reproductions: int
 
 
 class BenchmarkGateReport(_FrozenModel):
@@ -748,6 +1566,42 @@ def load_benchmark_protocol(path: Path) -> BenchmarkProtocolManifest:
     if not isinstance(raw, dict):
         raise ValueError("benchmark protocol YAML root must be a mapping")
     return BenchmarkProtocolManifest.model_validate(raw)
+
+
+def authorize_benchmark_protocol(
+    path: Path,
+    signature: Path,
+    allowed_signers: Path,
+    identity: str,
+) -> tuple[BenchmarkProtocolManifest, VerifiedProtocolAuthorization]:
+    """Load exact protocol bytes and verify their detached external signature."""
+    try:
+        content = _read_regular_file_bytes(path, label="benchmark protocol")
+    except ValueError as exc:
+        raise ProtocolSignatureError(
+            "benchmark protocol must be a regular nonsymlink file"
+        ) from exc
+    verification = verify_protocol_signature(
+        path,
+        signature,
+        allowed_signers,
+        identity,
+    )
+    if hashlib.sha256(content).hexdigest() != verification.protocol_sha256:
+        raise ProtocolSignatureError("benchmark protocol changed during signature verification")
+    raw = yaml.safe_load(content.decode("utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("benchmark protocol YAML root must be a mapping")
+    protocol = BenchmarkProtocolManifest.model_validate(raw)
+    return protocol, VerifiedProtocolAuthorization(
+        identity=verification.identity,
+        namespace=verification.namespace,
+        protocol_sha256=verification.protocol_sha256,
+        canonical_protocol_sha256=_canonical_sha256(protocol),
+        signature_sha256=verification.signature_sha256,
+        allowed_signers_sha256=verification.allowed_signers_sha256,
+        signing_key_fingerprint=verification.signing_key_fingerprint,
+    )
 
 
 def load_benchmark_submission(path: Path) -> BenchmarkReleaseSubmission:
@@ -803,13 +1657,304 @@ def authorize_benchmark_submission(
     )
 
 
+def authorize_corpus_freeze_statement(
+    path: Path,
+    signature: Path,
+    allowed_signers: Path,
+    identity: str,
+) -> VerifiedCorpusFreezeAuthorization:
+    """Load and externally verify one exact corpus-freeze statement."""
+    try:
+        content = _read_regular_file_bytes(path, label="corpus freeze statement")
+    except ValueError as exc:
+        raise ProtocolSignatureError(
+            "corpus freeze statement must be a regular nonsymlink file"
+        ) from exc
+    verification = verify_corpus_freeze_statement_signature(
+        path,
+        signature,
+        allowed_signers,
+        identity,
+    )
+    if hashlib.sha256(content).hexdigest() != verification.artifact_sha256:
+        raise ProtocolSignatureError("corpus freeze statement changed during verification")
+    raw = yaml.safe_load(content.decode("utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("corpus freeze statement root must be a mapping")
+    statement = CorpusFreezeStatement.model_validate(raw)
+    return VerifiedCorpusFreezeAuthorization(
+        statement=statement,
+        identity=verification.identity,
+        namespace=verification.namespace,
+        statement_sha256=verification.artifact_sha256,
+        canonical_statement_sha256=_canonical_sha256(statement),
+        signature_sha256=verification.signature_sha256,
+        allowed_signers_sha256=verification.allowed_signers_sha256,
+        signing_key_fingerprint=verification.signing_key_fingerprint,
+    )
+
+
+def authorize_candidate_validation_receipt(
+    path: Path,
+    signature: Path,
+    allowed_signers: Path,
+    identity: str,
+) -> VerifiedCandidateValidationAuthorization:
+    """Load and externally verify one exact public candidate-validation receipt."""
+    try:
+        content = _read_regular_file_bytes(path, label="candidate validation receipt")
+    except ValueError as exc:
+        raise ProtocolSignatureError(
+            "candidate validation receipt must be a regular nonsymlink file"
+        ) from exc
+    verification = verify_candidate_validation_receipt_signature(
+        path,
+        signature,
+        allowed_signers,
+        identity,
+    )
+    if hashlib.sha256(content).hexdigest() != verification.artifact_sha256:
+        raise ProtocolSignatureError("candidate validation receipt changed during verification")
+    raw = json.loads(content)
+    if not isinstance(raw, dict):
+        raise ValueError("candidate validation receipt root must be a mapping")
+    receipt = CandidateValidationReceipt.model_validate(raw)
+    return VerifiedCandidateValidationAuthorization(
+        receipt=receipt,
+        identity=verification.identity,
+        namespace=verification.namespace,
+        receipt_sha256=verification.artifact_sha256,
+        canonical_receipt_sha256=_canonical_sha256(receipt),
+        signature_sha256=verification.signature_sha256,
+        allowed_signers_sha256=verification.allowed_signers_sha256,
+        signing_key_fingerprint=verification.signing_key_fingerprint,
+    )
+
+
+def authorize_candidate_promotion_statement(
+    path: Path,
+    signature: Path,
+    allowed_signers: Path,
+    identity: str,
+) -> VerifiedCandidatePromotionAuthorization:
+    """Load and externally verify one exact candidate-to-sealed statement."""
+    try:
+        content = _read_regular_file_bytes(path, label="candidate promotion statement")
+    except ValueError as exc:
+        raise ProtocolSignatureError(
+            "candidate promotion statement must be a regular nonsymlink file"
+        ) from exc
+    verification = verify_candidate_promotion_statement_signature(
+        path,
+        signature,
+        allowed_signers,
+        identity,
+    )
+    if hashlib.sha256(content).hexdigest() != verification.artifact_sha256:
+        raise ProtocolSignatureError("candidate promotion statement changed during verification")
+    raw = json.loads(content)
+    if not isinstance(raw, dict):
+        raise ValueError("candidate promotion statement root must be a mapping")
+    statement = CandidatePromotionStatement.model_validate(raw)
+    return VerifiedCandidatePromotionAuthorization(
+        statement=statement,
+        identity=verification.identity,
+        namespace=verification.namespace,
+        statement_sha256=verification.artifact_sha256,
+        canonical_statement_sha256=_canonical_sha256(statement),
+        signature_sha256=verification.signature_sha256,
+        allowed_signers_sha256=verification.allowed_signers_sha256,
+        signing_key_fingerprint=verification.signing_key_fingerprint,
+    )
+
+
+def authorize_conformance_statement(
+    path: Path,
+    signature: Path,
+    allowed_signers: Path,
+    identity: str,
+) -> VerifiedConformanceAuthorization:
+    """Load and externally verify one exact clean-environment statement."""
+    try:
+        content = _read_regular_file_bytes(path, label="conformance statement")
+    except ValueError as exc:
+        raise ProtocolSignatureError(
+            "conformance statement must be a regular nonsymlink file"
+        ) from exc
+    verification = verify_conformance_statement_signature(
+        path,
+        signature,
+        allowed_signers,
+        identity,
+    )
+    if hashlib.sha256(content).hexdigest() != verification.artifact_sha256:
+        raise ProtocolSignatureError("conformance statement changed during verification")
+    raw = json.loads(content)
+    if not isinstance(raw, dict):
+        raise ValueError("conformance statement root must be a mapping")
+    statement = ConformanceEnvironmentStatement.model_validate(raw)
+    return VerifiedConformanceAuthorization(
+        statement=statement,
+        identity=verification.identity,
+        namespace=verification.namespace,
+        statement_sha256=verification.artifact_sha256,
+        canonical_statement_sha256=_canonical_sha256(statement),
+        signature_sha256=verification.signature_sha256,
+        allowed_signers_sha256=verification.allowed_signers_sha256,
+        signing_key_fingerprint=verification.signing_key_fingerprint,
+    )
+
+
+def authorize_baseline_verification_statement(
+    path: Path,
+    signature: Path,
+    allowed_signers: Path,
+    identity: str,
+) -> VerifiedBaselineAuthorization:
+    """Load and externally verify one exact artifact-derived baseline statement."""
+    try:
+        content = _read_regular_file_bytes(path, label="baseline verification statement")
+    except ValueError as exc:
+        raise ProtocolSignatureError(
+            "baseline verification statement must be a regular nonsymlink file"
+        ) from exc
+    verification = verify_baseline_verification_statement_signature(
+        path,
+        signature,
+        allowed_signers,
+        identity,
+    )
+    if hashlib.sha256(content).hexdigest() != verification.artifact_sha256:
+        raise ProtocolSignatureError("baseline verification statement changed during verification")
+    raw = json.loads(content)
+    if not isinstance(raw, dict):
+        raise ValueError("baseline verification statement root must be a mapping")
+    statement = BaselineVerificationStatement.model_validate(raw)
+    return VerifiedBaselineAuthorization(
+        statement=statement,
+        identity=verification.identity,
+        namespace=verification.namespace,
+        statement_sha256=verification.artifact_sha256,
+        canonical_statement_sha256=_canonical_sha256(statement),
+        signature_sha256=verification.signature_sha256,
+        allowed_signers_sha256=verification.allowed_signers_sha256,
+        signing_key_fingerprint=verification.signing_key_fingerprint,
+    )
+
+
+def authorize_pilot_evidence_statement(
+    path: Path,
+    signature: Path,
+    allowed_signers: Path,
+    identity: str,
+) -> VerifiedPilotEvidenceAuthorization:
+    """Load and verify one exact artifact-derived anonymous pilot statement."""
+    try:
+        content = _read_regular_file_bytes(path, label="pilot evidence statement")
+    except ValueError as exc:
+        raise ProtocolSignatureError(
+            "pilot evidence statement must be a regular nonsymlink file"
+        ) from exc
+    verification = verify_pilot_evidence_statement_signature(
+        path,
+        signature,
+        allowed_signers,
+        identity,
+    )
+    if hashlib.sha256(content).hexdigest() != verification.artifact_sha256:
+        raise ProtocolSignatureError("pilot evidence statement changed during verification")
+    raw = json.loads(content)
+    if not isinstance(raw, dict):
+        raise ValueError("pilot evidence statement root must be a mapping")
+    from stinger.benchmark.pilot import (
+        PilotEvidenceStatement,
+        canonical_pilot_evidence_statement_sha256,
+    )
+
+    statement = PilotEvidenceStatement.model_validate(raw)
+    return VerifiedPilotEvidenceAuthorization(
+        statement_bytes=content,
+        identity=verification.identity,
+        namespace=verification.namespace,
+        statement_sha256=verification.artifact_sha256,
+        canonical_statement_sha256=canonical_pilot_evidence_statement_sha256(statement),
+        signature_sha256=verification.signature_sha256,
+        allowed_signers_sha256=verification.allowed_signers_sha256,
+        signing_key_fingerprint=verification.signing_key_fingerprint,
+        benchmark_protocol_version=statement.benchmark_protocol_version,
+        rubric_version=statement.rubric_version,
+        corpus_version=statement.corpus_version,
+        corpus_hash=statement.corpus_hash,
+        candidate_corpus_hash=statement.candidate_corpus_hash,
+        evaluated_corpus_hash=statement.evaluated_corpus_hash,
+        evaluated_split=statement.evaluated_split,
+        protocol_sha256=statement.protocol_sha256,
+        candidate_validation_receipt_sha256=(statement.candidate_validation_receipt_sha256),
+        candidate_scenario_identity_inventory_sha256=(
+            statement.candidate_scenario_identity_inventory_sha256
+        ),
+        selection_protocol_sha256=statement.selection_protocol_sha256,
+        scenario_count=statement.scenario_count,
+        configuration_count=statement.configuration_count,
+        pilot_evidence_sha256=statement.pilot_evidence_sha256,
+        pilot=statement.pilot,
+    )
+
+
+def authorize_release_evidence_statement(
+    path: Path,
+    signature: Path,
+    allowed_signers: Path,
+    identity: str,
+) -> VerifiedReleaseEvidenceAuthorization:
+    """Load and verify one exact artifact-derived release-evidence statement."""
+    try:
+        content = _read_regular_file_bytes(path, label="release evidence statement")
+    except ValueError as exc:
+        raise ProtocolSignatureError(
+            "release evidence statement must be a regular nonsymlink file"
+        ) from exc
+    verification = verify_release_evidence_statement_signature(
+        path,
+        signature,
+        allowed_signers,
+        identity,
+    )
+    if hashlib.sha256(content).hexdigest() != verification.artifact_sha256:
+        raise ProtocolSignatureError("release evidence statement changed during verification")
+    from stinger.benchmark.release_evidence import ReleaseEvidenceStatement
+
+    raw = json.loads(content)
+    if not isinstance(raw, dict):
+        raise ValueError("release evidence statement root must be a mapping")
+    statement = ReleaseEvidenceStatement.model_validate(raw)
+    return VerifiedReleaseEvidenceAuthorization(
+        statement_bytes=content,
+        identity=verification.identity,
+        namespace=verification.namespace,
+        statement_sha256=verification.artifact_sha256,
+        canonical_statement_sha256=_canonical_sha256(statement),
+        signature_sha256=verification.signature_sha256,
+        allowed_signers_sha256=verification.allowed_signers_sha256,
+        signing_key_fingerprint=verification.signing_key_fingerprint,
+        benchmark_protocol_version=statement.benchmark_protocol_version,
+        rubric_version=statement.rubric_version,
+        corpus_version=statement.corpus_version,
+        corpus_hash=statement.corpus_hash,
+        stinger_commit=statement.stinger_commit,
+        release_evidence=statement.release_evidence,
+        release_evidence_record_sha256=statement.release_evidence_record_sha256,
+        canonical_submission_sha256=statement.canonical_submission_sha256,
+    )
+
+
 def authorize_reproduction_statement(
     path: Path,
     signature: Path,
     allowed_signers: Path,
     identity: str,
-) -> VerifiedReproductionAuthorization:
-    """Load and externally verify an independent reproduction statement."""
+) -> VerifiedCrossMachineReproductionAuthorization:
+    """Load and externally verify a cross-machine reproduction statement."""
     try:
         content = _read_regular_file_bytes(path, label="reproduction statement")
     except ValueError as exc:
@@ -826,9 +1971,9 @@ def authorize_reproduction_statement(
         raise ProtocolSignatureError("reproduction statement changed during verification")
     raw = yaml.safe_load(content.decode("utf-8"))
     if not isinstance(raw, dict):
-        raise ValueError("independent reproduction statement root must be a mapping")
-    statement = IndependentReproductionStatement.model_validate(raw)
-    return VerifiedReproductionAuthorization(
+        raise ValueError("cross-machine reproduction statement root must be a mapping")
+    statement = CrossMachineReproductionStatement.model_validate(raw)
+    return VerifiedCrossMachineReproductionAuthorization(
         statement=statement,
         identity=verification.identity,
         namespace=verification.namespace,
@@ -876,52 +2021,102 @@ def _read_regular_file_bytes(path: Path, *, label: str) -> bytes:
 def evaluate_benchmark_release(
     submission: BenchmarkReleaseSubmission,
     *,
+    protocol_authorization: VerifiedProtocolAuthorization | None = None,
+    candidate_validation_authorization: VerifiedCandidateValidationAuthorization | None = None,
+    candidate_promotion_authorization: VerifiedCandidatePromotionAuthorization | None = None,
+    corpus_construction_authorization: VerifiedCorpusConstructionAuthorization | None = None,
+    corpus_freeze_authorization: VerifiedCorpusFreezeAuthorization | None = None,
+    pilot_authorization: VerifiedPilotEvidenceAuthorization | None = None,
+    baseline_authorizations: tuple[VerifiedBaselineAuthorization, ...] = (),
+    conformance_authorizations: tuple[VerifiedConformanceAuthorization, ...] = (),
     authorization: VerifiedReleaseAuthorization | None = None,
-    reproduction_authorization: VerifiedReproductionAuthorization | None = None,
+    release_evidence_authorization: VerifiedReleaseEvidenceAuthorization | None = None,
+    reproduction_authorization: VerifiedCrossMachineReproductionAuthorization | None = None,
+    public_reproduction_authorization: VerifiedPublicReproductionAuthorization | None = None,
 ) -> BenchmarkGateReport:
-    """Evaluate all Benchmark v1 publication requirements without favourable inference.
+    """Evaluate all Benchmark Protocol 2 publication requirements without favorable inference.
 
     Args:
         submission: Explicit corpus, run, review, external-reproduction, and authorization
             evidence. No record is synthesized from another gate passing.
         authorization: Out-of-band OpenSSH verification of the exact submission bytes.
             A hand-edited model or YAML file can never substitute for this proof.
-        reproduction_authorization: Out-of-band OpenSSH verification of the independent
-            evaluator's exact artifact-binding statement.
+        reproduction_authorization: Out-of-band OpenSSH verification of the separate
+            cross-machine evaluator's exact artifact-binding statement.
 
     Returns:
         A deterministic result. ``publishable`` is true only when no issue exists; otherwise
         the strongest supported status remains ``benchmark_candidate``.
     """
     collector = _IssueCollector()
-    _evaluate_protocol(submission.protocol, collector)
+    _evaluate_protocol(submission.protocol, protocol_authorization, collector)
     corpus_by_id, corpus_metrics = _evaluate_corpus(
         submission.corpus,
         submission.protocol,
+        candidate_validation_authorization,
+        candidate_promotion_authorization,
+        corpus_freeze_authorization,
+        collector,
+    )
+    _evaluate_corpus_construction_authorization(
+        submission,
+        corpus_construction_authorization,
+        authorization,
         collector,
     )
     _evaluate_pilot(submission.pilot, submission.corpus, submission.protocol, collector)
+    _evaluate_pilot_authorization(
+        submission,
+        pilot_authorization,
+        protocol_authorization,
+        candidate_validation_authorization,
+        candidate_promotion_authorization,
+        authorization,
+        collector,
+    )
 
+    baseline_authorizations_by_id = {
+        item.statement.configuration_id: item for item in baseline_authorizations
+    }
+    baseline_configuration_ids = {baseline.configuration_id for baseline in submission.baselines}
+    baseline_authorization_set_valid = (
+        len(baseline_authorizations_by_id) == len(baseline_authorizations)
+        and set(baseline_authorizations_by_id) == baseline_configuration_ids
+    )
     configuration_results = tuple(
-        _evaluate_configuration(
+        _evaluate_release_configuration(
             baseline,
             corpus=submission.corpus,
             corpus_by_id=corpus_by_id,
             protocol=submission.protocol,
+            authorization=baseline_authorizations_by_id.get(baseline.configuration_id),
+            authorization_set_valid=baseline_authorization_set_valid,
         )
         for baseline in sorted(submission.baselines, key=lambda item: item.configuration_id)
     )
     for result in configuration_results:
         collector.extend(result.issues)
 
-    provider_count = _evaluate_matrix(submission, collector)
-    complete_beta_count = _evaluate_external_evidence(
+    provider_count = _evaluate_matrix(
         submission,
+        candidate_validation_authorization,
+        collector,
+    )
+    conformance_count = _evaluate_external_evidence(
+        submission,
+        protocol_authorization,
+        conformance_authorizations,
         reproduction_authorization,
+        public_reproduction_authorization,
         authorization,
         collector,
     )
-    _evaluate_release_evidence(submission.release_evidence, collector)
+    _evaluate_release_evidence(
+        submission,
+        release_evidence_authorization,
+        authorization,
+        collector,
+    )
     _evaluate_human_approval(submission, authorization, collector)
     _evaluate_release_authorization(submission, authorization, collector)
 
@@ -930,9 +2125,7 @@ def evaluate_benchmark_release(
     return BenchmarkGateReport(
         benchmark_protocol_version=submission.protocol.benchmark_protocol_version,
         status=(
-            ReleaseStatus.INDEPENDENTLY_REPRODUCED
-            if publishable
-            else ReleaseStatus.BENCHMARK_CANDIDATE
+            ReleaseStatus.MACHINE_REPRODUCED if publishable else ReleaseStatus.BENCHMARK_CANDIDATE
         ),
         publishable=publishable,
         issues=issues,
@@ -941,16 +2134,18 @@ def evaluate_benchmark_release(
             unique_scenarios=corpus_metrics.unique_scenarios,
             unique_clusters=corpus_metrics.unique_clusters,
             scenarios_by_family=corpus_metrics.scenarios_by_family,
-            human_solves_by_family=corpus_metrics.human_solves_by_family,
+            blind_agent_solves_by_family=corpus_metrics.blind_agent_solves_by_family,
             baseline_configurations=len(submission.baselines),
             baseline_providers=provider_count,
-            complete_beta_operators=complete_beta_count,
-            independent_reproductions=(
+            conformance_environments=conformance_count,
+            cross_machine_reproductions=(
                 1
                 if _valid_reproduction(
-                    submission.independent_reproduction,
+                    submission.cross_machine_reproduction,
                     reproduction_authorization,
+                    public_reproduction_authorization,
                     authorization,
+                    protocol_authorization,
                     submission,
                 )
                 else 0
@@ -985,13 +2180,109 @@ def evaluate_baseline_configuration_record(
     )
 
 
+def evaluate_corpus_construction(
+    corpus: SealedCorpusRecord,
+    *,
+    protocol: BenchmarkProtocolManifest,
+    candidate_validation_authorization: VerifiedCandidateValidationAuthorization,
+    candidate_promotion_authorization: VerifiedCandidatePromotionAuthorization,
+) -> tuple[GateIssue, ...]:
+    """Return construction issues before the corpus-freeze statement exists."""
+    collector = _IssueCollector()
+    _evaluate_corpus(
+        corpus,
+        protocol,
+        candidate_validation_authorization,
+        candidate_promotion_authorization,
+        None,
+        collector,
+    )
+    return tuple(
+        issue
+        for issue in collector.sorted()
+        if issue.code is not PublicationIssueCode.CORPUS_NOT_FROZEN
+    )
+
+
+def _evaluate_corpus_construction_authorization(
+    submission: BenchmarkReleaseSubmission,
+    authorization: VerifiedCorpusConstructionAuthorization | None,
+    release_authorization: VerifiedReleaseAuthorization | None,
+    collector: _IssueCollector,
+) -> None:
+    """Require a role-separated signature over the artifact-derived corpus record."""
+    from stinger.benchmark.corpus_construction import (
+        CONSTRUCTION_RECEIPT_FORMAT_VERSION,
+        CORPUS_CONSTRUCTION_SIGNATURE_NAMESPACE,
+        canonical_corpus_construction_receipt_sha256,
+    )
+
+    valid = False
+    if authorization is not None and release_authorization is not None:
+        receipt = authorization.receipt
+        submitted_unfrozen = submission.corpus.model_copy(update={"freeze": None})
+        canonical_receipt_sha256 = canonical_corpus_construction_receipt_sha256(receipt)
+        review_runtime_identities = {
+            review.runtime_signer_identity
+            for scenario in submission.corpus.scenarios
+            for review in scenario.machine_reviews
+        }
+        review_runtime_keys = {
+            review.runtime_signing_key_fingerprint
+            for scenario in submission.corpus.scenarios
+            for review in scenario.machine_reviews
+        }
+        review_runtime_trust_policies = {
+            review.runtime_allowed_signers_sha256
+            for scenario in submission.corpus.scenarios
+            for review in scenario.machine_reviews
+        }
+        valid = (
+            authorization.namespace == CORPUS_CONSTRUCTION_SIGNATURE_NAMESPACE
+            and authorization.identity != release_authorization.identity
+            and authorization.identity not in review_runtime_identities
+            and authorization.signing_key_fingerprint
+            != release_authorization.signing_key_fingerprint
+            and authorization.signing_key_fingerprint not in review_runtime_keys
+            and authorization.allowed_signers_sha256 != release_authorization.allowed_signers_sha256
+            and authorization.allowed_signers_sha256 not in review_runtime_trust_policies
+            and _SSH_KEY_FINGERPRINT_PATTERN.fullmatch(authorization.signing_key_fingerprint)
+            is not None
+            and _SHA256_PATTERN.fullmatch(authorization.receipt_sha256) is not None
+            and _SHA256_PATTERN.fullmatch(authorization.signature_sha256) is not None
+            and _SHA256_PATTERN.fullmatch(authorization.allowed_signers_sha256) is not None
+            and authorization.receipt_sha256 == canonical_receipt_sha256
+            and authorization.canonical_receipt_sha256 == canonical_receipt_sha256
+            and receipt.format_version == CONSTRUCTION_RECEIPT_FORMAT_VERSION
+            and receipt.benchmark_protocol_version == submission.protocol.benchmark_protocol_version
+            and receipt.rubric_version == submission.protocol.rubric_version
+            and receipt.corpus_version == submission.corpus.corpus_version
+            and receipt.corpus_hash == submission.corpus.corpus_hash
+            and receipt.scenario_count == submission.protocol.total_scenarios
+            and receipt.scenario_count == len(submission.corpus.scenarios)
+            and receipt.scenario_inventory_sha256
+            == corpus_scenario_inventory_sha256(submission.corpus.scenarios)
+            and receipt.corpus.freeze is None
+            and receipt.corpus == submitted_unfrozen
+        )
+    if not valid:
+        collector.add(
+            PublicationIssueCode.CORPUS_CONSTRUCTION_AUTHORIZATION_INVALID,
+            (
+                "sealed corpus lacks a role-separated signature over the exact "
+                "artifact-derived construction receipt"
+            ),
+            "corpus",
+        )
+
+
 class _CorpusMetrics(_FrozenModel):
     """Internal aggregate returned by the corpus evaluator."""
 
     unique_scenarios: int
     unique_clusters: int
     scenarios_by_family: dict[Family, int]
-    human_solves_by_family: dict[Family, int]
+    blind_agent_solves_by_family: dict[Family, int]
 
 
 class _IssueCollector:
@@ -1018,14 +2309,30 @@ class _IssueCollector:
 
 def _evaluate_protocol(
     protocol: BenchmarkProtocolManifest,
+    authorization: VerifiedProtocolAuthorization | None,
     collector: _IssueCollector,
 ) -> None:
-    """Reject any manifest that silently weakens the approved v1 constants."""
-    expected = BenchmarkProtocolManifest()
+    """Reject any manifest that silently weakens the approved Protocol 2 constants."""
+    expected = compiled_benchmark_protocol()
     if protocol != expected:
         collector.add(
             PublicationIssueCode.PROTOCOL_MANIFEST_MISMATCH,
-            "protocol manifest differs from the checked-in Benchmark v1 thresholds",
+            "protocol manifest differs from the checked-in Benchmark Protocol 2 thresholds",
+            "protocol",
+        )
+    if (
+        authorization is None
+        or authorization.namespace != PROTOCOL_SIGNATURE_NAMESPACE
+        or authorization.canonical_protocol_sha256 != _canonical_sha256(protocol)
+        or not authorization.identity
+        or _SHA256_PATTERN.fullmatch(authorization.protocol_sha256) is None
+        or _SHA256_PATTERN.fullmatch(authorization.signature_sha256) is None
+        or _SHA256_PATTERN.fullmatch(authorization.allowed_signers_sha256) is None
+        or _SSH_KEY_FINGERPRINT_PATTERN.fullmatch(authorization.signing_key_fingerprint) is None
+    ):
+        collector.add(
+            PublicationIssueCode.PROTOCOL_NOT_SIGNED,
+            "active protocol lacks trusted detached-signature authorization",
             "protocol",
         )
 
@@ -1033,6 +2340,9 @@ def _evaluate_protocol(
 def _evaluate_corpus(
     corpus: SealedCorpusRecord,
     protocol: BenchmarkProtocolManifest,
+    candidate_validation_authorization: VerifiedCandidateValidationAuthorization | None,
+    candidate_promotion_authorization: VerifiedCandidatePromotionAuthorization | None,
+    freeze_authorization: VerifiedCorpusFreezeAuthorization | None,
     collector: _IssueCollector,
 ) -> tuple[dict[str, CorpusScenarioRecord], _CorpusMetrics]:
     """Evaluate the sealed corpus and every scenario-construction record."""
@@ -1094,54 +2404,87 @@ def _evaluate_corpus(
             "corpus",
         )
 
-    valid_human_solves: Counter[Family] = Counter()
+    selected_blind_ids = _blind_agent_solve_ids(
+        records_by_id.values(),
+        protocol,
+        corpus_hash=corpus.corpus_hash,
+    )
+    valid_blind_solves: Counter[Family] = Counter()
     for scenario_id in sorted(records_by_id):
         scenario = records_by_id[scenario_id]
         subject = f"scenario:{scenario_id}"
         _evaluate_scenario_record(scenario, collector, subject)
-        if scenario.human_solve is not None:
-            if _valid_human_solve(scenario.human_solve):
-                valid_human_solves[scenario.family] += 1
-            else:
-                collector.add(
-                    PublicationIssueCode.CORPUS_HUMAN_SOLVE_INVALID,
-                    "human solve must be blind, complete, fairness-confirming, and identified",
-                    subject,
-                )
+        if scenario_id in selected_blind_ids:
+            if _evaluate_blind_agent_solves(scenario, protocol, collector, subject):
+                valid_blind_solves[scenario.family] += 1
+        elif scenario.blind_agent_solves:
+            collector.add(
+                PublicationIssueCode.CORPUS_BLIND_SOLVE_SELECTION_INVALID,
+                "blind solve evidence is attached to a scenario outside the frozen selection",
+                subject,
+            )
 
     for family in Family:
-        if valid_human_solves[family] != protocol.human_solves_per_family:
+        if valid_blind_solves[family] != protocol.blind_agent_solve_scenarios_per_family:
             collector.add(
-                PublicationIssueCode.CORPUS_HUMAN_SOLVE_COUNT_INVALID,
+                PublicationIssueCode.CORPUS_BLIND_SOLVE_COUNT_INVALID,
                 (
-                    f"expected {protocol.human_solves_per_family} valid blind solves, "
-                    f"got {valid_human_solves[family]}"
+                    f"expected {protocol.blind_agent_solve_scenarios_per_family} "
+                    f"deterministically selected scenarios with valid blind solves, "
+                    f"got {valid_blind_solves[family]}"
                 ),
                 f"family:{family.value}",
             )
 
-    if not corpus.stored_outside_public_repository:
+    if corpus.candidate_validation_receipt_sha256 is None:
         collector.add(
-            PublicationIssueCode.CORPUS_STORAGE_NOT_SEALED,
-            "active corpus is not evidenced outside the public repository",
+            PublicationIssueCode.CORPUS_CANDIDATE_VALIDATION_RECEIPT_MISSING,
+            "artifact-derived candidate validation receipt is missing",
             "corpus",
         )
-    if not corpus.access_logging_enabled:
+    elif not _valid_candidate_validation_receipt(
+        corpus,
+        protocol,
+        candidate_validation_authorization,
+    ):
         collector.add(
-            PublicationIssueCode.CORPUS_ACCESS_LOGGING_MISSING,
-            "sealed-corpus access logging is not evidenced",
+            PublicationIssueCode.CORPUS_CANDIDATE_VALIDATION_RECEIPT_INVALID,
+            "trusted candidate receipt is missing, unbound, or inconsistent with the corpus",
             "corpus",
         )
-    if not corpus.canary_checks_passed:
+    if not _valid_candidate_promotion(
+        corpus,
+        protocol,
+        candidate_validation_authorization,
+        candidate_promotion_authorization,
+    ):
         collector.add(
-            PublicationIssueCode.CORPUS_CANARY_CHECK_FAILED,
-            "sealed-corpus canary check did not pass",
+            PublicationIssueCode.CORPUS_CANDIDATE_PROMOTION_INVALID,
+            "candidate-to-sealed promotion is missing or not bound to exact artifacts",
             "corpus",
         )
-    if not corpus.frozen_before_baselines:
+    if corpus.custody_inventory_sha256 is None:
+        collector.add(
+            PublicationIssueCode.CORPUS_CUSTODY_INVENTORY_MISSING,
+            "exact sealed-corpus custody inventory is missing",
+            "corpus",
+        )
+    if corpus.access_log_root_sha256 is None:
+        collector.add(
+            PublicationIssueCode.CORPUS_ACCESS_LOG_ROOT_MISSING,
+            "sealed-corpus cooperative access-log root is missing",
+            "corpus",
+        )
+    if corpus.canary_validation_receipt_sha256 is None:
+        collector.add(
+            PublicationIssueCode.CORPUS_CANARY_VALIDATION_RECEIPT_MISSING,
+            "artifact-derived sealed-corpus canary validation receipt is missing",
+            "corpus",
+        )
+    if not _valid_corpus_freeze(corpus, protocol, freeze_authorization):
         collector.add(
             PublicationIssueCode.CORPUS_NOT_FROZEN,
-            "corpus was not frozen before publication baselines",
+            "trusted signed corpus-freeze statement is missing or inconsistent",
             "corpus",
         )
 
@@ -1149,7 +2492,237 @@ def _evaluate_corpus(
         unique_scenarios=len(records_by_id),
         unique_clusters=len(cluster_ids),
         scenarios_by_family={family: family_counts[family] for family in Family},
-        human_solves_by_family={family: valid_human_solves[family] for family in Family},
+        blind_agent_solves_by_family={family: valid_blind_solves[family] for family in Family},
+    )
+
+
+def corpus_scenario_inventory_sha256(
+    scenarios: tuple[CorpusScenarioRecord, ...],
+) -> str:
+    """Hash the complete canonical scenario-construction record inventory."""
+    return _canonical_payload_sha256(
+        {
+            "scenarios": [
+                scenario.model_dump(mode="json")
+                for scenario in sorted(
+                    scenarios,
+                    key=lambda item: item.scenario_id,
+                )
+            ]
+        }
+    )
+
+
+def candidate_scenario_identity_inventory_sha256(
+    scenarios: tuple[CorpusScenarioRecord, ...],
+) -> str:
+    """Hash scenario identity metadata that must survive candidate-to-sealed freezing."""
+    return _canonical_payload_sha256(
+        {
+            "scenarios": [
+                {
+                    "scenario_id": scenario.scenario_id,
+                    "family": scenario.family.value,
+                    "repository_size": scenario.repository_size.value,
+                    "scenario_version": scenario.scenario_version,
+                    "cluster_id": scenario.cluster_id,
+                }
+                for scenario in sorted(scenarios, key=lambda item: item.scenario_id)
+            ]
+        }
+    )
+
+
+def candidate_validation_inventory_sha256(
+    scenarios: tuple[CorpusScenarioRecord, ...],
+) -> str:
+    """Hash candidate validation receipts carried unchanged into sealed records."""
+    return _canonical_payload_sha256(
+        {
+            "validations": [
+                {
+                    "scenario_id": scenario.scenario_id,
+                    "machine_validation_receipt_sha256": (
+                        scenario.machine_validation_receipt_sha256
+                    ),
+                }
+                for scenario in sorted(scenarios, key=lambda item: item.scenario_id)
+            ]
+        }
+    )
+
+
+def sealed_scenario_artifact_inventory_sha256(
+    scenarios: tuple[CorpusScenarioRecord, ...],
+) -> str:
+    """Hash exact sealed scenario trees carried into the scored corpus record."""
+    return _canonical_payload_sha256(
+        {
+            "scenarios": [
+                {
+                    "scenario_id": scenario.scenario_id,
+                    "scenario_artifact_sha256": scenario.scenario_artifact_sha256,
+                }
+                for scenario in sorted(scenarios, key=lambda item: item.scenario_id)
+            ]
+        }
+    )
+
+
+def _valid_candidate_validation_receipt(
+    corpus: SealedCorpusRecord,
+    protocol: BenchmarkProtocolManifest,
+    authorization: VerifiedCandidateValidationAuthorization | None,
+) -> bool:
+    """Bind one trusted path-free candidate receipt to the sealed identity inventory."""
+    receipt_hash = corpus.candidate_validation_receipt_sha256
+    if receipt_hash is None or authorization is None:
+        return False
+    receipt = authorization.receipt
+    family_counts = Counter(scenario.family for scenario in corpus.scenarios)
+    family_size_counts = Counter(
+        (scenario.family, scenario.repository_size) for scenario in corpus.scenarios
+    )
+    cluster_count = len({scenario.cluster_id for scenario in corpus.scenarios})
+    expected_by_family = {family: family_counts[family] for family in Family}
+    expected_by_family_and_size = {
+        family: {
+            repository_size: family_size_counts[(family, repository_size)]
+            for repository_size in RepositorySize
+        }
+        for family in Family
+    }
+    policy_sha256 = canonical_verification_image_policy_sha256(protocol.verification_image_policy)
+    return (
+        authorization.namespace == CANDIDATE_VALIDATION_SIGNATURE_NAMESPACE
+        and _SSH_KEY_FINGERPRINT_PATTERN.fullmatch(authorization.signing_key_fingerprint)
+        is not None
+        and authorization.canonical_receipt_sha256 == _canonical_sha256(receipt)
+        and authorization.receipt_sha256 == receipt_hash
+        and receipt.signer_identity == authorization.identity
+        and receipt.format_version == CANDIDATE_RECEIPT_FORMAT_VERSION
+        and receipt.benchmark_protocol_version == protocol.benchmark_protocol_version
+        and receipt.rubric_version == protocol.rubric_version
+        and receipt.corpus_version == corpus.corpus_version
+        and receipt.validation_contract == CANDIDATE_VALIDATION_CONTRACT
+        and receipt.verification_image_policy_sha256 == policy_sha256
+        and verification_image_id_is_approved(
+            protocol.verification_image_policy,
+            receipt.verification_image_id,
+        )
+        and receipt.repository_size_source == REPOSITORY_SIZE_SOURCE_VERSION
+        and receipt.scenario_count == protocol.total_scenarios
+        and receipt.scenario_count == len(corpus.scenarios)
+        and receipt.scenarios_by_family == expected_by_family
+        and receipt.scenarios_by_family_and_size == expected_by_family_and_size
+        and receipt.unique_cluster_count == cluster_count
+        and receipt.unique_cluster_count == protocol.total_scenarios
+        and receipt.machine_validation_count == protocol.total_scenarios
+        and receipt.canary_count == protocol.total_scenarios
+        and receipt.scenario_identity_inventory_sha256
+        == candidate_scenario_identity_inventory_sha256(corpus.scenarios)
+        and corpus.canary_validation_receipt_sha256 is not None
+        and receipt.canary_inventory_sha256 == corpus.canary_validation_receipt_sha256
+    )
+
+
+def _valid_candidate_promotion(
+    corpus: SealedCorpusRecord,
+    protocol: BenchmarkProtocolManifest,
+    candidate_authorization: VerifiedCandidateValidationAuthorization | None,
+    promotion_authorization: VerifiedCandidatePromotionAuthorization | None,
+) -> bool:
+    """Bind a trusted deterministic promotion to candidate and sealed artifacts."""
+    statement_hash = corpus.candidate_promotion_statement_sha256
+    if statement_hash is None or candidate_authorization is None or promotion_authorization is None:
+        return False
+    candidate = candidate_authorization.receipt
+    promotion = promotion_authorization.statement
+    policy_sha256 = canonical_verification_image_policy_sha256(protocol.verification_image_policy)
+    return (
+        promotion_authorization.namespace == CANDIDATE_PROMOTION_SIGNATURE_NAMESPACE
+        and _SSH_KEY_FINGERPRINT_PATTERN.fullmatch(promotion_authorization.signing_key_fingerprint)
+        is not None
+        and promotion_authorization.canonical_statement_sha256 == _canonical_sha256(promotion)
+        and promotion_authorization.statement_sha256 == statement_hash
+        and promotion.signer_identity == promotion_authorization.identity
+        and promotion.format_version == CANDIDATE_PROMOTION_FORMAT_VERSION
+        and promotion.transformation_contract == CANDIDATE_PROMOTION_CONTRACT
+        and promotion.benchmark_protocol_version == protocol.benchmark_protocol_version
+        and promotion.rubric_version == protocol.rubric_version
+        and promotion.corpus_version == corpus.corpus_version
+        and promotion.stinger_commit == candidate.stinger_commit
+        and promotion.verification_image_id == candidate.verification_image_id
+        and promotion.verification_image_policy_sha256
+        == candidate.verification_image_policy_sha256
+        == policy_sha256
+        and verification_image_id_is_approved(
+            protocol.verification_image_policy,
+            promotion.verification_image_id,
+        )
+        and promotion.candidate_receipt_sha256 == candidate_authorization.receipt_sha256
+        and promotion.candidate_corpus_hash == candidate.candidate_corpus_hash
+        and promotion.candidate_source_snapshot_sha256 == candidate.source_snapshot_sha256
+        and promotion.candidate_validation_inventory_sha256 == candidate.validation_inventory_sha256
+        and promotion.candidate_access_log_root_sha256 == candidate.access_log_root_sha256
+        and promotion.sealed_corpus_hash == corpus.corpus_hash
+        and promotion.sealed_scenario_identity_inventory_sha256
+        == candidate_scenario_identity_inventory_sha256(corpus.scenarios)
+        and promotion.sealed_scenario_artifact_inventory_sha256
+        == sealed_scenario_artifact_inventory_sha256(corpus.scenarios)
+        and promotion.sealed_validation_inventory_sha256
+        == candidate_validation_inventory_sha256(corpus.scenarios)
+        and promotion.canary_inventory_sha256 == candidate.canary_inventory_sha256
+        and corpus.canary_validation_receipt_sha256 == candidate.canary_inventory_sha256
+        and promotion.sealed_access_log_root_sha256 == corpus.access_log_root_sha256
+        and promotion.scenario_count == len(corpus.scenarios)
+        and promotion.scenario_count == protocol.total_scenarios
+    )
+
+
+def _valid_corpus_freeze(
+    corpus: SealedCorpusRecord,
+    protocol: BenchmarkProtocolManifest,
+    authorization: VerifiedCorpusFreezeAuthorization | None,
+) -> bool:
+    """Bind a trusted freeze statement to the exact corpus and machine receipts."""
+    record = corpus.freeze
+    if record is None or authorization is None:
+        return False
+    statement = authorization.statement
+    family_counts = Counter(scenario.family for scenario in corpus.scenarios)
+    size_counts = Counter(scenario.repository_size for scenario in corpus.scenarios)
+    return (
+        authorization.namespace == CORPUS_FREEZE_SIGNATURE_NAMESPACE
+        and _SSH_KEY_FINGERPRINT_PATTERN.fullmatch(authorization.signing_key_fingerprint)
+        is not None
+        and authorization.canonical_statement_sha256 == _canonical_sha256(statement)
+        and record.signer_identity == authorization.identity
+        and record.statement_sha256 == authorization.statement_sha256
+        and record.statement_signature_sha256 == authorization.signature_sha256
+        and record.allowed_signers_sha256 == authorization.allowed_signers_sha256
+        and statement.signer_identity == authorization.identity
+        and statement.benchmark_protocol_version == protocol.benchmark_protocol_version
+        and statement.rubric_version == protocol.rubric_version
+        and statement.corpus_version == corpus.corpus_version
+        and statement.corpus_hash == corpus.corpus_hash
+        and statement.scenario_inventory_sha256
+        == corpus_scenario_inventory_sha256(corpus.scenarios)
+        and corpus.candidate_validation_receipt_sha256 is not None
+        and statement.candidate_validation_receipt_sha256
+        == corpus.candidate_validation_receipt_sha256
+        and corpus.candidate_promotion_statement_sha256 is not None
+        and statement.candidate_promotion_statement_sha256
+        == corpus.candidate_promotion_statement_sha256
+        and corpus.custody_inventory_sha256 is not None
+        and statement.custody_inventory_sha256 == corpus.custody_inventory_sha256
+        and corpus.access_log_root_sha256 is not None
+        and statement.access_log_root_sha256 == corpus.access_log_root_sha256
+        and corpus.canary_validation_receipt_sha256 is not None
+        and statement.canary_validation_receipt_sha256 == corpus.canary_validation_receipt_sha256
+        and statement.scenario_count == len(corpus.scenarios)
+        and statement.scenarios_by_family == {family: family_counts[family] for family in Family}
+        and statement.scenarios_by_size == {size: size_counts[size] for size in RepositorySize}
     )
 
 
@@ -1158,7 +2731,7 @@ def _evaluate_scenario_record(
     collector: _IssueCollector,
     subject: str,
 ) -> None:
-    """Evaluate one scenario's review, validity, and QA evidence."""
+    """Evaluate one scenario's artifact bindings, machine reviews, variants, and QA."""
     if scenario.benchmark_split is not BenchmarkSplit.SEALED:
         collector.add(
             PublicationIssueCode.CORPUS_NON_SEALED_SCENARIO,
@@ -1177,104 +2750,142 @@ def _evaluate_scenario_record(
             "cluster_id is blank",
             subject,
         )
-    if not scenario.validity_passed:
+    if not scenario.scenario_artifact_sha256:
         collector.add(
-            PublicationIssueCode.CORPUS_VALIDITY_FAILED,
-            "scenario validity contract did not pass",
+            PublicationIssueCode.CORPUS_SCENARIO_ARTIFACT_MISSING,
+            "scenario artifact commitment is missing",
             subject,
         )
-    if not scenario.held_out_oracle_passed:
+    if not scenario.machine_validation_receipt_sha256:
         collector.add(
-            PublicationIssueCode.CORPUS_ORACLE_FAILED,
-            "held-out oracle did not pass",
+            PublicationIssueCode.CORPUS_MACHINE_VALIDATION_RECEIPT_MISSING,
+            "artifact-derived machine validation receipt is missing",
             subject,
         )
-    if not scenario.containment_passed:
+    if not scenario.containment_receipt_sha256:
         collector.add(
-            PublicationIssueCode.CORPUS_CONTAINMENT_FAILED,
-            "scenario containment test did not pass",
+            PublicationIssueCode.CORPUS_CONTAINMENT_RECEIPT_MISSING,
+            "artifact-derived containment receipt is missing",
             subject,
         )
-    if not scenario.dummy_only_safety_data:
+    if not scenario.dummy_safety_receipt_sha256:
         collector.add(
-            PublicationIssueCode.CORPUS_DUMMY_SAFETY_FAILED,
-            "dummy-only safety-data requirement is not evidenced",
+            PublicationIssueCode.CORPUS_DUMMY_SAFETY_RECEIPT_MISSING,
+            "artifact-derived dummy-safety receipt is missing",
             subject,
         )
-    if not scenario.provenance_recorded or not scenario.author_id.strip():
+    if not scenario.provenance_receipt_sha256:
         collector.add(
             PublicationIssueCode.CORPUS_PROVENANCE_MISSING,
-            "authorship or provenance record is missing",
+            "artifact-derived provenance receipt is missing",
             subject,
         )
 
-    _evaluate_fairness(scenario, collector, subject)
+    _evaluate_machine_reviews(scenario, collector, subject)
     _evaluate_resolution_variants(scenario, collector, subject)
     _evaluate_agent_qa(scenario, collector, subject)
 
 
-def _evaluate_fairness(
+def _evaluate_machine_reviews(
     scenario: CorpusScenarioRecord,
     collector: _IssueCollector,
     subject: str,
 ) -> None:
-    """Require two independent approvals and third-party adjudication on disagreement."""
-    if len(scenario.fairness_reviews) < REQUIRED_FAIRNESS_REVIEWS:
+    """Require two provider-diverse veto reviews over the exact QA input manifest."""
+    reviews = scenario.machine_reviews
+    review_ids = {review.review_id for review in reviews}
+    configurations = {review.reviewer_configuration_fingerprint for review in reviews}
+    providers = {review.provider for review in reviews}
+    runtime_receipts = {review.runtime_receipt_sha256 for review in reviews}
+    runtime_signer_identities = {review.runtime_signer_identity for review in reviews}
+    runtime_signing_keys = {review.runtime_signing_key_fingerprint for review in reviews}
+    runtime_trust_policies = {review.runtime_allowed_signers_sha256 for review in reviews}
+    runtime_signatures = {review.runtime_signature_sha256 for review in reviews}
+    if len(reviews) != REQUIRED_MACHINE_REVIEWS or len(review_ids) != REQUIRED_MACHINE_REVIEWS:
         collector.add(
-            PublicationIssueCode.CORPUS_FAIRNESS_REVIEW_INSUFFICIENT,
+            PublicationIssueCode.CORPUS_MACHINE_REVIEW_INSUFFICIENT,
             (
-                f"expected at least {REQUIRED_FAIRNESS_REVIEWS} fairness reviews, "
-                f"got {len(scenario.fairness_reviews)}"
+                f"expected exactly {REQUIRED_MACHINE_REVIEWS} distinct machine reviews, "
+                f"got {len(review_ids)}"
             ),
             subject,
         )
-
-    independent = [
-        review
-        for review in scenario.fairness_reviews
-        if review.independent_of_author and review.reviewer_id.strip()
-    ]
-    independent_ids = {review.reviewer_id for review in independent}
-    if len(independent_ids) < REQUIRED_FAIRNESS_REVIEWS:
-        collector.add(
-            PublicationIssueCode.CORPUS_FAIRNESS_REVIEW_NOT_INDEPENDENT,
-            (
-                f"expected {REQUIRED_FAIRNESS_REVIEWS} distinct independent reviewers, "
-                f"got {len(independent_ids)}"
-            ),
-            subject,
-        )
-
-    decisions = {review.decision for review in independent}
-    if not independent or decisions == {ReviewDecision.REJECT}:
-        collector.add(
-            PublicationIssueCode.CORPUS_FAIRNESS_NOT_APPROVED,
-            "independent fairness reviews do not approve the scenario",
-            subject,
-        )
-        return
-    if len(decisions) <= 1:
-        return
-
-    adjudication = scenario.fairness_adjudication
     if (
-        adjudication is None
-        or not adjudication.adjudicator_id.strip()
-        or adjudication.adjudicator_id in independent_ids
-        or not adjudication.independent_of_author
-        or not adjudication.disagreement_reconciled
+        len(configurations) < REQUIRED_MACHINE_REVIEWS
+        or len(providers) < REQUIRED_MACHINE_REVIEW_PROVIDERS
+        or len(runtime_receipts) < REQUIRED_MACHINE_REVIEWS
+        or len(runtime_signer_identities) < REQUIRED_MACHINE_REVIEWS
+        or len(runtime_signing_keys) < REQUIRED_MACHINE_REVIEWS
+        or len(runtime_trust_policies) < REQUIRED_MACHINE_REVIEWS
+        or len(runtime_signatures) < REQUIRED_MACHINE_REVIEWS
     ):
         collector.add(
-            PublicationIssueCode.CORPUS_FAIRNESS_ADJUDICATION_MISSING,
-            "reviewer disagreement lacks a distinct independent completed adjudication",
+            PublicationIssueCode.CORPUS_MACHINE_REVIEW_DIVERSITY_INVALID,
+            (
+                "reviewers must use distinct configurations, runtime receipts, signing "
+                "identities, signing keys, trust policies, and signatures from two "
+                "providers"
+            ),
             subject,
         )
-    elif adjudication.decision is not ReviewDecision.ACCEPT:
+    qa_ids = tuple(sorted(attempt.attempt_id for attempt in scenario.agent_qa_attempts))
+    expected_input_hash = machine_review_input_manifest_sha256(scenario)
+    if any(
+        review.prompt_sha256 != MACHINE_REVIEW_PROMPT_SHA256
+        or review.output_schema_sha256 != MACHINE_REVIEW_OUTPUT_SCHEMA_SHA256
+        or review.input_manifest_sha256 != expected_input_hash
+        or review.output.covered_qa_attempt_ids != qa_ids
+        or review.output_sha256 != _canonical_payload_sha256(review.output.model_dump(mode="json"))
+        for review in reviews
+    ):
         collector.add(
-            PublicationIssueCode.CORPUS_FAIRNESS_NOT_APPROVED,
-            "fairness adjudication rejected the scenario",
+            PublicationIssueCode.CORPUS_MACHINE_REVIEW_BINDING_INVALID,
+            (
+                "machine reviews must bind the frozen prompt/output contract, one exact "
+                "input manifest, and every distinct QA attempt"
+            ),
             subject,
         )
+    if any(review.output.decision is not MachineReviewDecision.ACCEPT for review in reviews):
+        collector.add(
+            PublicationIssueCode.CORPUS_MACHINE_REVIEW_BLOCKED,
+            "BLOCK, UNCERTAIN, or reviewer disagreement rejects the scenario",
+            subject,
+        )
+
+
+def machine_review_input_manifest_sha256(scenario: CorpusScenarioRecord) -> str:
+    """Bind a machine review to exact scenario construction and QA artifacts."""
+    return _canonical_payload_sha256(
+        {
+            "scenario_id": scenario.scenario_id,
+            "family": scenario.family.value,
+            "repository_size": scenario.repository_size.value,
+            "benchmark_split": scenario.benchmark_split.value,
+            "scenario_version": scenario.scenario_version,
+            "cluster_id": scenario.cluster_id,
+            "expected_honest_outcome": scenario.expected_honest_outcome.value,
+            "scenario_artifact_sha256": scenario.scenario_artifact_sha256,
+            "machine_validation_receipt_sha256": (scenario.machine_validation_receipt_sha256),
+            "provenance_receipt_sha256": scenario.provenance_receipt_sha256,
+            "containment_receipt_sha256": scenario.containment_receipt_sha256,
+            "dummy_safety_receipt_sha256": scenario.dummy_safety_receipt_sha256,
+            "resolution_variants": [
+                variant.model_dump(mode="json")
+                for variant in sorted(
+                    scenario.resolution_variants,
+                    key=lambda item: item.variant_id,
+                )
+            ],
+            "agent_qa_attempts": [
+                attempt.model_dump(mode="json")
+                for attempt in sorted(
+                    scenario.agent_qa_attempts,
+                    key=lambda item: item.attempt_id,
+                )
+            ],
+        }
+    )
 
 
 def _evaluate_resolution_variants(
@@ -1282,22 +2893,37 @@ def _evaluate_resolution_variants(
     collector: _IssueCollector,
     subject: str,
 ) -> None:
-    """Require two distinct contract-passing variants of each resolution kind."""
+    """Require two artifact-distinct variants of each resolution kind."""
+    identifiers = [
+        variant.variant_id for variant in scenario.resolution_variants if variant.variant_id.strip()
+    ]
+    source_hashes = [variant.source_tree_sha256 for variant in scenario.resolution_variants]
+    semantic_hashes = [variant.semantic_patch_sha256 for variant in scenario.resolution_variants]
+    receipt_hashes = [variant.execution_receipt_sha256 for variant in scenario.resolution_variants]
+    if (
+        len(scenario.resolution_variants) != len(ResolutionKind) * REQUIRED_RESOLUTION_VARIANTS
+        or len(identifiers) != len(set(identifiers))
+        or len(source_hashes) != len(set(source_hashes))
+        or len(semantic_hashes) != len(set(semantic_hashes))
+        or len(receipt_hashes) != len(set(receipt_hashes))
+    ):
+        collector.add(
+            PublicationIssueCode.CORPUS_RESOLUTION_VARIANTS_NOT_DISTINCT,
+            "variant ids, source trees, semantic patches, and execution receipts must be unique",
+            subject,
+        )
     for kind in ResolutionKind:
         valid_ids = {
             variant.variant_id
             for variant in scenario.resolution_variants
-            if variant.kind is kind
-            and variant.variant_id.strip()
-            and variant.materially_distinct
-            and variant.contract_passed
+            if variant.kind is kind and variant.variant_id.strip()
         }
-        if len(valid_ids) < REQUIRED_RESOLUTION_VARIANTS:
+        if len(valid_ids) != REQUIRED_RESOLUTION_VARIANTS:
             collector.add(
                 PublicationIssueCode.CORPUS_RESOLUTION_VARIANTS_INSUFFICIENT,
                 (
-                    f"expected {REQUIRED_RESOLUTION_VARIANTS} materially distinct "
-                    f"contract-passing {kind.value} variants, got {len(valid_ids)}"
+                    f"expected exactly {REQUIRED_RESOLUTION_VARIANTS} artifact-derived "
+                    f"{kind.value} variants, got {len(valid_ids)}"
                 ),
                 subject,
             )
@@ -1308,37 +2934,123 @@ def _evaluate_agent_qa(
     collector: _IssueCollector,
     subject: str,
 ) -> None:
-    """Require five uniquely identified QA attempts and complete review of every transcript."""
+    """Require five non-error QA attempts across two configurations and providers."""
     unique_ids = {
         attempt.attempt_id.strip()
         for attempt in scenario.agent_qa_attempts
         if attempt.attempt_id.strip()
     }
     if (
-        len(scenario.agent_qa_attempts) < REQUIRED_AGENT_QA_ATTEMPTS
-        or len(unique_ids) < REQUIRED_AGENT_QA_ATTEMPTS
+        len(scenario.agent_qa_attempts) != REQUIRED_AGENT_QA_ATTEMPTS
+        or len(unique_ids) != REQUIRED_AGENT_QA_ATTEMPTS
     ):
         collector.add(
             PublicationIssueCode.CORPUS_AGENT_QA_INSUFFICIENT,
             (f"expected {REQUIRED_AGENT_QA_ATTEMPTS} distinct QA attempts, got {len(unique_ids)}"),
             subject,
         )
-    if any(not attempt.review_complete for attempt in scenario.agent_qa_attempts):
+    configurations = {
+        attempt.agent_configuration_fingerprint for attempt in scenario.agent_qa_attempts
+    }
+    providers = {attempt.provider for attempt in scenario.agent_qa_attempts}
+    result_receipts = {attempt.result_sha256 for attempt in scenario.agent_qa_attempts}
+    evidence_receipts = {attempt.evidence_manifest_sha256 for attempt in scenario.agent_qa_attempts}
+    runtime_receipts = {attempt.runtime_receipt_sha256 for attempt in scenario.agent_qa_attempts}
+    if (
+        len(configurations) < REQUIRED_AGENT_QA_CONFIGURATIONS
+        or len(providers) < REQUIRED_AGENT_QA_PROVIDERS
+        or len(result_receipts) != len(scenario.agent_qa_attempts)
+        or len(evidence_receipts) != len(scenario.agent_qa_attempts)
+        or len(runtime_receipts) != len(scenario.agent_qa_attempts)
+    ):
         collector.add(
-            PublicationIssueCode.CORPUS_AGENT_QA_REVIEW_INCOMPLETE,
-            "at least one QA transcript lacks a complete manual review or resolved blocker",
+            PublicationIssueCode.CORPUS_AGENT_QA_DIVERSITY_INVALID,
+            (
+                f"QA must span at least {REQUIRED_AGENT_QA_CONFIGURATIONS} configurations "
+                f"and {REQUIRED_AGENT_QA_PROVIDERS} providers with distinct result, "
+                "evidence, and runtime receipts"
+            ),
+            subject,
+        )
+    if any(attempt.outcome is Outcome.ERROR for attempt in scenario.agent_qa_attempts):
+        collector.add(
+            PublicationIssueCode.CORPUS_AGENT_QA_INVALID,
+            "an ERROR QA attempt cannot support machine validation",
             subject,
         )
 
 
-def _valid_human_solve(record: HumanSolveRecord) -> bool:
-    """Return whether a human-solve record satisfies the blind-solve contract."""
-    return (
-        bool(record.solver_id.strip())
-        and record.blind
-        and record.completed
-        and record.fairness_confirmed
+def _blind_agent_solve_ids(
+    scenarios: Iterable[CorpusScenarioRecord],
+    protocol: BenchmarkProtocolManifest,
+    *,
+    corpus_hash: str,
+) -> set[str]:
+    """Select the frozen blind-solve subset deterministically within every family."""
+    selected: set[str] = set()
+    scenario_list = list(scenarios)
+    for family in Family:
+        candidates = [scenario for scenario in scenario_list if scenario.family is family]
+        ordered = sorted(
+            candidates,
+            key=lambda scenario: (
+                hashlib.sha256(
+                    (
+                        f"{protocol.benchmark_protocol_version}\0"
+                        f"{protocol.blind_agent_solve_selection_seed}\0"
+                        f"{corpus_hash}\0"
+                        f"{family.value}\0"
+                        f"{scenario.scenario_artifact_sha256}\0"
+                        f"{scenario.scenario_id}"
+                    ).encode()
+                ).hexdigest(),
+                scenario.scenario_id,
+            ),
+        )
+        selected.update(
+            scenario.scenario_id
+            for scenario in ordered[: protocol.blind_agent_solve_scenarios_per_family]
+        )
+    return selected
+
+
+def _evaluate_blind_agent_solves(
+    scenario: CorpusScenarioRecord,
+    protocol: BenchmarkProtocolManifest,
+    collector: _IssueCollector,
+    subject: str,
+) -> bool:
+    """Require provider-diverse reference-isolated solves with a mechanically valid outcome."""
+    solves = scenario.blind_agent_solves
+    solve_ids = {solve.solve_id for solve in solves if solve.solve_id.strip()}
+    configurations = {solve.solver_configuration_fingerprint for solve in solves}
+    providers = {solve.provider for solve in solves}
+    result_receipts = {solve.result_sha256 for solve in solves}
+    evidence_receipts = {solve.evidence_manifest_sha256 for solve in solves}
+    runtime_receipts = {solve.runtime_receipt_sha256 for solve in solves}
+    isolation_receipts = {solve.reference_isolation_receipt_sha256 for solve in solves}
+    valid = (
+        len(solves) == protocol.blind_agent_solvers_per_scenario
+        and len(solve_ids) == protocol.blind_agent_solvers_per_scenario
+        and len(configurations) >= protocol.blind_agent_solver_configurations_per_scenario
+        and len(providers) >= protocol.blind_agent_solver_providers_per_scenario
+        and len(result_receipts) == len(solves)
+        and len(evidence_receipts) == len(solves)
+        and len(runtime_receipts) == len(solves)
+        and len(isolation_receipts) == len(solves)
+        and all(solve.outcome is scenario.expected_honest_outcome for solve in solves)
     )
+    if not valid:
+        collector.add(
+            PublicationIssueCode.CORPUS_BLIND_SOLVE_INVALID,
+            (
+                "selected scenario needs distinct reference-isolated solves from the "
+                "required configurations/providers with unique artifact receipts, and "
+                "every solve must produce the expected honest outcome"
+            ),
+            subject,
+        )
+    return valid
 
 
 def _evaluate_pilot(
@@ -1348,6 +3060,7 @@ def _evaluate_pilot(
     collector: _IssueCollector,
 ) -> None:
     """Compute non-saturation and bind selected sealed items to the piloted candidate pool."""
+    expected_scenario_ids = {scenario.scenario_id for scenario in corpus.scenarios}
     scenario_ids = [item.scenario_id for item in pilot.candidate_pool]
     unique_scenarios = set(scenario_ids)
     pilot_clusters_by_scenario = {
@@ -1355,11 +3068,19 @@ def _evaluate_pilot(
     }
     varied_items = 0
     anonymity_valid = bool(pilot.candidate_pool)
+    error_free = True
     for item in pilot.candidate_pool:
         aliases = [record.configuration_alias for record in item.outcomes]
         unique_aliases = set(aliases)
-        if len(aliases) != len(unique_aliases) or len(unique_aliases) < 2:
+        if (
+            len(aliases) != len(unique_aliases)
+            or len(unique_aliases)
+            < protocol.pilot_selection_policy.minimum_anonymous_configurations
+        ):
             anonymity_valid = False
+            continue
+        if any(record.outcome is Outcome.ERROR for record in item.outcomes):
+            error_free = False
             continue
         if len({record.outcome for record in item.outcomes}) > 1:
             varied_items += 1
@@ -1369,7 +3090,9 @@ def _evaluate_pilot(
     if (
         denominator <= 0
         or len(unique_scenarios) != denominator
+        or unique_scenarios != expected_scenario_ids
         or any(not scenario_id.strip() for scenario_id in scenario_ids)
+        or not error_free
         or variation_rate < protocol.min_pilot_variation_rate
     ):
         collector.add(
@@ -1377,20 +3100,30 @@ def _evaluate_pilot(
             (
                 f"outcome variation rate {variation_rate:.6f} is below "
                 f"{protocol.min_pilot_variation_rate:.6f}, candidate ids are duplicated, "
-                "or the candidate pool is empty"
+                "the pool does not exactly equal the sealed selection, the pool is empty, "
+                "or an ERROR outcome is present"
             ),
             "pilot",
         )
     if not anonymity_valid:
         collector.add(
             PublicationIssueCode.PILOT_CONFIGURATIONS_NOT_ANONYMIZED,
-            "each evaluated item needs two distinct opaque anonymous configuration aliases",
+            (
+                "each evaluated item needs the protocol-required number of distinct opaque "
+                "anonymous configuration aliases"
+            ),
             "pilot",
         )
-    if pilot.selection_protocol_sha256 is None:
+    expected_selection_policy_sha256 = pilot_selection_policy_sha256(
+        protocol.pilot_selection_policy
+    )
+    if pilot.selection_protocol_sha256 != expected_selection_policy_sha256:
         collector.add(
-            PublicationIssueCode.PILOT_SELECTION_NOT_VENDOR_NEUTRAL,
-            "a sha256-bound preregistered vendor-neutral selection protocol is missing",
+            PublicationIssueCode.PILOT_SELECTION_POLICY_INVALID,
+            (
+                "pilot evidence does not bind the protocol-frozen complete-corpus "
+                "selection and evaluation policy"
+            ),
             "pilot",
         )
     unbound_sealed_ids = sorted(
@@ -1399,16 +3132,178 @@ def _evaluate_pilot(
         if pilot_clusters_by_scenario.get(scenario.scenario_id) != scenario.cluster_id
     )
     if unbound_sealed_ids:
-        preview = ", ".join(unbound_sealed_ids[:5])
-        suffix = "" if len(unbound_sealed_ids) <= 5 else ", ..."
         collector.add(
             PublicationIssueCode.PILOT_SELECTION_CORPUS_UNBOUND,
             (
                 f"{len(unbound_sealed_ids)} sealed scenarios are absent from the piloted "
-                f"candidate pool or have a different cluster binding: {preview}{suffix}"
+                "candidate pool or have a different cluster binding"
             ),
             "pilot",
         )
+
+
+def _evaluate_pilot_authorization(
+    submission: BenchmarkReleaseSubmission,
+    authorization: VerifiedPilotEvidenceAuthorization | None,
+    protocol_authorization: VerifiedProtocolAuthorization | None,
+    candidate_authorization: VerifiedCandidateValidationAuthorization | None,
+    promotion_authorization: VerifiedCandidatePromotionAuthorization | None,
+    release_authorization: VerifiedReleaseAuthorization | None,
+    collector: _IssueCollector,
+) -> None:
+    """Require signed artifact-derived pilot evidence for the exact release record."""
+    statement_valid = False
+    if authorization is not None:
+        from stinger.benchmark.pilot import (
+            PilotEvidenceStatement,
+            canonical_pilot_evidence_statement_sha256,
+        )
+
+        try:
+            raw = json.loads(authorization.statement_bytes)
+            if not isinstance(raw, dict):
+                raise ValueError("pilot evidence statement root must be a mapping")
+            statement = PilotEvidenceStatement.model_validate(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            pass
+        else:
+            statement_valid = (
+                hashlib.sha256(authorization.statement_bytes).hexdigest()
+                == authorization.statement_sha256
+                and canonical_pilot_evidence_statement_sha256(statement)
+                == authorization.canonical_statement_sha256
+                and statement.benchmark_protocol_version == authorization.benchmark_protocol_version
+                and statement.rubric_version == authorization.rubric_version
+                and statement.corpus_version == authorization.corpus_version
+                and statement.corpus_hash == authorization.corpus_hash
+                and statement.candidate_corpus_hash == authorization.candidate_corpus_hash
+                and statement.evaluated_corpus_hash == authorization.evaluated_corpus_hash
+                and statement.evaluated_split is authorization.evaluated_split
+                and statement.protocol_sha256 == authorization.protocol_sha256
+                and statement.candidate_validation_receipt_sha256
+                == authorization.candidate_validation_receipt_sha256
+                and statement.candidate_scenario_identity_inventory_sha256
+                == authorization.candidate_scenario_identity_inventory_sha256
+                and statement.selection_protocol_sha256 == authorization.selection_protocol_sha256
+                and statement.scenario_count == authorization.scenario_count
+                and statement.configuration_count == authorization.configuration_count
+                and statement.pilot_evidence_sha256 == authorization.pilot_evidence_sha256
+                and statement.pilot == authorization.pilot
+            )
+
+    valid = (
+        authorization is not None
+        and protocol_authorization is not None
+        and candidate_authorization is not None
+        and promotion_authorization is not None
+        and release_authorization is not None
+        and authorization.namespace == PILOT_EVIDENCE_SIGNATURE_NAMESPACE
+        and bool(authorization.identity.strip())
+        and authorization.identity != release_authorization.identity
+        and authorization.signing_key_fingerprint != release_authorization.signing_key_fingerprint
+        and authorization.allowed_signers_sha256 != release_authorization.allowed_signers_sha256
+        and _SSH_KEY_FINGERPRINT_PATTERN.fullmatch(authorization.signing_key_fingerprint)
+        is not None
+        and _SHA256_PATTERN.fullmatch(authorization.statement_sha256) is not None
+        and _SHA256_PATTERN.fullmatch(authorization.signature_sha256) is not None
+        and _SHA256_PATTERN.fullmatch(authorization.allowed_signers_sha256) is not None
+        and statement_valid
+        and authorization.benchmark_protocol_version
+        == submission.protocol.benchmark_protocol_version
+        and authorization.rubric_version == submission.protocol.rubric_version
+        and authorization.corpus_version == submission.corpus.corpus_version
+        and authorization.corpus_hash == submission.corpus.corpus_hash
+        and authorization.evaluated_split is BenchmarkSplit.SEALED
+        and authorization.evaluated_corpus_hash == submission.corpus.corpus_hash
+        and authorization.protocol_sha256 == protocol_authorization.protocol_sha256
+        and authorization.candidate_validation_receipt_sha256
+        == candidate_authorization.receipt_sha256
+        and authorization.candidate_validation_receipt_sha256
+        == submission.corpus.candidate_validation_receipt_sha256
+        and authorization.candidate_corpus_hash
+        == candidate_authorization.receipt.candidate_corpus_hash
+        and authorization.candidate_corpus_hash
+        == promotion_authorization.statement.candidate_corpus_hash
+        and authorization.candidate_scenario_identity_inventory_sha256
+        == candidate_authorization.receipt.scenario_identity_inventory_sha256
+        and authorization.candidate_scenario_identity_inventory_sha256
+        == promotion_authorization.statement.sealed_scenario_identity_inventory_sha256
+        and authorization.selection_protocol_sha256 == submission.pilot.selection_protocol_sha256
+        and authorization.selection_protocol_sha256
+        == pilot_selection_policy_sha256(submission.protocol.pilot_selection_policy)
+        and authorization.scenario_count == submission.protocol.total_scenarios
+        and authorization.configuration_count
+        >= submission.protocol.pilot_selection_policy.minimum_anonymous_configurations
+        and authorization.pilot_evidence_sha256 == _canonical_sha256(submission.pilot)
+        and authorization.pilot == submission.pilot
+    )
+    if not valid:
+        collector.add(
+            PublicationIssueCode.PILOT_EVIDENCE_AUTHORIZATION_INVALID,
+            (
+                "pilot outcomes lack an exact signed artifact-derived statement over "
+                "the promoted sealed corpus and anonymous configuration grid"
+            ),
+            "pilot",
+        )
+
+
+def _evaluate_release_configuration(
+    baseline: BaselineConfigurationRecord,
+    *,
+    corpus: SealedCorpusRecord,
+    corpus_by_id: dict[str, CorpusScenarioRecord],
+    protocol: BenchmarkProtocolManifest,
+    authorization: VerifiedBaselineAuthorization | None,
+    authorization_set_valid: bool,
+) -> ConfigurationGateResult:
+    """Evaluate one baseline plus its artifact-derived signed construction statement."""
+    result = _evaluate_configuration(
+        baseline,
+        corpus=corpus,
+        corpus_by_id=corpus_by_id,
+        protocol=protocol,
+    )
+    if authorization_set_valid and _valid_baseline_authorization(
+        baseline,
+        corpus=corpus,
+        protocol=protocol,
+        authorization=authorization,
+    ):
+        return result
+    collector = _IssueCollector()
+    collector.extend(result.issues)
+    collector.add(
+        PublicationIssueCode.BASELINE_VERIFICATION_INVALID,
+        "baseline lacks a trusted statement derived from its exact verified bundles",
+        f"configuration:{baseline.configuration_id}",
+    )
+    return result.model_copy(update={"eligible": False, "issues": collector.sorted()})
+
+
+def _valid_baseline_authorization(
+    baseline: BaselineConfigurationRecord,
+    *,
+    corpus: SealedCorpusRecord,
+    protocol: BenchmarkProtocolManifest,
+    authorization: VerifiedBaselineAuthorization | None,
+) -> bool:
+    """Bind one submitted baseline to a trusted artifact-derived statement."""
+    if authorization is None:
+        return False
+    statement = authorization.statement
+    return (
+        authorization.namespace == BASELINE_VERIFICATION_SIGNATURE_NAMESPACE
+        and _SSH_KEY_FINGERPRINT_PATTERN.fullmatch(authorization.signing_key_fingerprint)
+        is not None
+        and authorization.canonical_statement_sha256 == _canonical_sha256(statement)
+        and statement.signer_identity == authorization.identity
+        and statement.benchmark_protocol_version == protocol.benchmark_protocol_version
+        and statement.rubric_version == protocol.rubric_version
+        and statement.configuration_id == baseline.configuration_id
+        and statement.corpus_hash == corpus.corpus_hash
+        and statement.baseline_record_sha256 == baseline_configuration_record_sha256(baseline)
+    )
 
 
 def _evaluate_configuration(
@@ -1444,10 +3339,22 @@ def _evaluate_configuration(
     for pin_issue in publication_pin_issues(
         report.benchmark_metadata,
         report.benchmark_runtime_provenance,
+    ) + canonical_local_provider_binding_issues(
+        report.benchmark_metadata,
+        report.benchmark_runtime_provenance,
     ):
         collector.add(
             PublicationIssueCode.RUN_PUBLICATION_PIN_INCOMPLETE,
             pin_issue,
+            subject,
+        )
+    if (
+        report.benchmark_metadata is None
+        or report.benchmark_metadata.run_seed != protocol.baseline_run_seed
+    ):
+        collector.add(
+            PublicationIssueCode.RUN_PUBLICATION_PIN_INCOMPLETE,
+            "baseline_run_seed_mismatch",
             subject,
         )
 
@@ -1527,21 +3434,25 @@ def _evaluate_configuration(
         for result in unique_results.values()
         if result.outcome is Outcome.ERROR
     }
-    explained_error_keys = _evaluate_error_dispositions(
-        baseline.error_dispositions,
-        error_keys,
-        collector,
-        subject,
-    )
-    unexplained_errors = len(error_keys - explained_error_keys)
-    expected_total = len(expected_ids) * protocol.repetitions
-    unexplained_error_rate = unexplained_errors / expected_total if expected_total else 1.0
-    if unexplained_error_rate > protocol.max_unexplained_error_rate:
+    errors = len(error_keys)
+    if any(
+        result.outcome is Outcome.ERROR
+        and (result.run_error is None or not result.run_error.strip())
+        for result in unique_results.values()
+    ):
         collector.add(
-            PublicationIssueCode.RUN_UNEXPLAINED_ERROR_RATE_EXCEEDED,
+            PublicationIssueCode.RUN_EVIDENCE_INTEGRITY_FAILED,
+            "every publication ERROR must persist a nonblank causal run_error",
+            subject,
+        )
+    expected_total = len(expected_ids) * protocol.repetitions
+    error_rate = errors / expected_total if expected_total else 1.0
+    if error_rate > protocol.max_error_rate:
+        collector.add(
+            PublicationIssueCode.RUN_ERROR_RATE_EXCEEDED,
             (
-                f"{unexplained_errors}/{expected_total} = {unexplained_error_rate:.6f}, "
-                f"maximum is {protocol.max_unexplained_error_rate:.6f}"
+                f"{errors}/{expected_total} = {error_rate:.6f}, "
+                f"maximum is {protocol.max_error_rate:.6f}; every ERROR counts"
             ),
             subject,
         )
@@ -1655,8 +3566,8 @@ def _evaluate_configuration(
         metrics=ConfigurationGateMetrics(
             total_expected_repetitions=expected_total,
             observed_repetitions=len(unique_results),
-            unexplained_errors=unexplained_errors,
-            unexplained_error_rate=unexplained_error_rate,
+            errors=errors,
+            error_rate=error_rate,
             scorable_modal_outcomes={family: scorable_by_family[family] for family in Family},
         ),
     )
@@ -1673,12 +3584,15 @@ def _benchmark_statistics_valid(
     if set(statistics.family_intervals) != set(Family):
         return False
     intervals = (*statistics.family_intervals.values(), statistics.overall_interval)
-    return all(
-        interval.confidence_level == protocol.confidence_level
-        and interval.bootstrap_samples >= protocol.min_bootstrap_samples
-        and interval.defined_bootstrap_samples + interval.n_a_bootstrap_samples
-        == interval.bootstrap_samples
-        for interval in intervals
+    return (
+        all(
+            interval.confidence_level == protocol.confidence_level
+            and interval.bootstrap_samples >= protocol.min_bootstrap_samples
+            and interval.defined_bootstrap_samples + interval.n_a_bootstrap_samples
+            == interval.bootstrap_samples
+            for interval in intervals
+        )
+        and statistics.seed == protocol.bootstrap_seed
     )
 
 
@@ -1719,40 +3633,6 @@ def _result_matches_corpus(
     )
 
 
-def _evaluate_error_dispositions(
-    dispositions: tuple[ErrorDispositionRecord, ...],
-    error_keys: set[tuple[str, int]],
-    collector: _IssueCollector,
-    configuration_subject: str,
-) -> set[tuple[str, int]]:
-    """Return error keys with one valid explicit explanation."""
-    by_key: dict[tuple[str, int], list[ErrorDispositionRecord]] = defaultdict(list)
-    for disposition in dispositions:
-        by_key[(disposition.scenario_id, disposition.repetition)].append(disposition)
-
-    explained: set[tuple[str, int]] = set()
-    for key in sorted(by_key):
-        records = by_key[key]
-        subject = f"{configuration_subject}/scenario:{key[0]}/repetition:{key[1]}"
-        if key not in error_keys or len(records) != 1:
-            collector.add(
-                PublicationIssueCode.RUN_ERROR_DISPOSITION_INVALID,
-                "disposition does not identify exactly one observed error result",
-                subject,
-            )
-            continue
-        record = records[0]
-        if record.explained and record.explanation.strip():
-            explained.add(key)
-        elif record.explained:
-            collector.add(
-                PublicationIssueCode.RUN_ERROR_DISPOSITION_INVALID,
-                "error is marked explained without a non-blank explanation",
-                subject,
-            )
-    return explained
-
-
 def _report_scores_match(
     report: Report,
     results: Iterable[ScenarioResult],
@@ -1781,6 +3661,7 @@ def _report_scores_match(
 
 def _evaluate_matrix(
     submission: BenchmarkReleaseSubmission,
+    candidate_authorization: VerifiedCandidateValidationAuthorization | None,
     collector: _IssueCollector,
 ) -> int:
     """Evaluate matrix size, uniqueness, provider diversity, and shared corpus."""
@@ -1831,6 +3712,10 @@ def _evaluate_matrix(
         if baseline.report.benchmark_metadata is not None
         and baseline.report.benchmark_metadata.provider is not None
         and baseline.report.benchmark_metadata.provider.strip()
+        and not canonical_local_provider_binding_issues(
+            baseline.report.benchmark_metadata,
+            baseline.report.benchmark_runtime_provenance,
+        )
     }
     if len(providers) < protocol.baseline_providers:
         collector.add(
@@ -1846,10 +3731,35 @@ def _evaluate_matrix(
             "baseline matrix does not use exactly the sealed-corpus hash",
             "baseline-matrix",
         )
-    if not submission.release_evidence.protocol_frozen_before_baselines:
+    if submission.release_evidence.protocol_freeze_receipt_sha256 is None:
         collector.add(
             PublicationIssueCode.BASELINE_PROTOCOL_NOT_FROZEN,
-            "benchmark protocol was not frozen before publication baselines",
+            "content-bound protocol freeze receipt is missing",
+            "baseline-matrix",
+        )
+    baseline_commits = {
+        metadata.stinger_commit
+        for baseline in baselines
+        if (metadata := baseline.report.benchmark_metadata) is not None
+        and metadata.stinger_commit is not None
+    }
+    verification_images = {
+        metadata.verification_image_digest
+        for baseline in baselines
+        if (metadata := baseline.report.benchmark_metadata) is not None
+        and metadata.verification_image_digest is not None
+    }
+    if (
+        candidate_authorization is None
+        or baseline_commits != {candidate_authorization.receipt.stinger_commit}
+        or verification_images != {candidate_authorization.receipt.verification_image_id}
+    ):
+        collector.add(
+            PublicationIssueCode.CORPUS_VALIDATION_RUNTIME_UNBOUND,
+            (
+                "candidate validation commit and immutable verifier image must exactly "
+                "match the complete baseline matrix"
+            ),
             "baseline-matrix",
         )
     return len(providers)
@@ -1857,56 +3767,165 @@ def _evaluate_matrix(
 
 def _evaluate_external_evidence(
     submission: BenchmarkReleaseSubmission,
-    reproduction_authorization: VerifiedReproductionAuthorization | None,
+    protocol_authorization: VerifiedProtocolAuthorization | None,
+    conformance_authorizations: tuple[VerifiedConformanceAuthorization, ...],
+    reproduction_authorization: VerifiedCrossMachineReproductionAuthorization | None,
+    public_reproduction_authorization: VerifiedPublicReproductionAuthorization | None,
     release_authorization: VerifiedReleaseAuthorization | None,
     collector: _IssueCollector,
 ) -> int:
-    """Require three outside beta operators and one complete unaffiliated reproduction."""
-    complete_beta_ids = {
-        operator.operator_id for operator in submission.beta_operators if operator.complete
+    """Require clean conformance environments and one complete cross-machine reproduction."""
+    environments = submission.conformance_environments
+    authorization_ids = [
+        authorization.statement.environment_id for authorization in conformance_authorizations
+    ]
+    authorizations_by_id = {
+        authorization.statement.environment_id: authorization
+        for authorization in conformance_authorizations
     }
-    if len(complete_beta_ids) < submission.protocol.outside_beta_operators:
+    valid_environments = [
+        environment
+        for environment in environments
+        if _valid_conformance_environment(
+            environment,
+            authorizations_by_id.get(environment.environment_id),
+        )
+    ]
+    environment_ids = {environment.environment_id for environment in environments}
+    fingerprints = {environment.environment_fingerprint_sha256 for environment in environments}
+    workflow_inputs = {environment.workflow_input_sha256 for environment in environments}
+    workflow_receipts = {environment.workflow_receipt_sha256 for environment in environments}
+    receipt_signatures = {environment.receipt_signature_sha256 for environment in environments}
+    baseline_commits = {
+        baseline.report.benchmark_metadata.stinger_commit
+        for baseline in submission.baselines
+        if baseline.report.benchmark_metadata is not None
+        and baseline.report.benchmark_metadata.stinger_commit is not None
+    }
+    if (
+        len(environments) < submission.protocol.conformance_environments
+        or len(valid_environments) != len(environments)
+        or len(authorization_ids) != len(set(authorization_ids))
+        or set(authorization_ids) != environment_ids
+        or len(environment_ids) < submission.protocol.conformance_environments
+        or len(fingerprints) < submission.protocol.conformance_environments
+        or len(workflow_inputs) != 1
+        or len(workflow_receipts) < submission.protocol.conformance_environments
+        or len(receipt_signatures) < submission.protocol.conformance_environments
+        or len(
+            {authorization.signing_key_fingerprint for authorization in conformance_authorizations}
+        )
+        < submission.protocol.conformance_environments
+        or len(
+            {authorization.allowed_signers_sha256 for authorization in conformance_authorizations}
+        )
+        < submission.protocol.conformance_environments
+        or len(baseline_commits) != 1
+        or any(
+            environment.benchmark_protocol_version != submission.protocol.benchmark_protocol_version
+            or environment.rubric_version != submission.protocol.rubric_version
+            or environment.corpus_hash != submission.corpus.corpus_hash
+            or environment.stinger_commit not in baseline_commits
+            for environment in environments
+        )
+    ):
         collector.add(
-            PublicationIssueCode.BETA_OPERATORS_INSUFFICIENT,
+            PublicationIssueCode.CONFORMANCE_ENVIRONMENTS_INSUFFICIENT,
             (
-                f"expected {submission.protocol.outside_beta_operators} distinct complete "
-                f"outside operators, got {len(complete_beta_ids)}"
+                f"expected at least {submission.protocol.conformance_environments} distinct "
+                "clean executions of one workflow bound to the active protocol, corpus, "
+                f"and baseline commit; got {len(environment_ids)} ids, "
+                f"{len(fingerprints)} fingerprints, {len(workflow_inputs)} workflows, "
+                f"{len(workflow_receipts)} receipts, and {len(valid_environments)} "
+                "trusted statements"
             ),
-            "external-beta",
+            "conformance",
+        )
+    platforms = {(environment.platform, environment.architecture) for environment in environments}
+    if len(platforms) < submission.protocol.conformance_platforms:
+        collector.add(
+            PublicationIssueCode.CONFORMANCE_PLATFORM_DIVERSITY_INSUFFICIENT,
+            (
+                f"expected at least {submission.protocol.conformance_platforms} "
+                f"platform/architecture pairs, got {len(platforms)}"
+            ),
+            "conformance",
         )
 
-    reproduction = submission.independent_reproduction
+    reproduction = submission.cross_machine_reproduction
     if reproduction is None:
         collector.add(
-            PublicationIssueCode.INDEPENDENT_REPRODUCTION_MISSING,
-            "no independent reproduction record was supplied",
-            "independent-reproduction",
+            PublicationIssueCode.CROSS_MACHINE_REPRODUCTION_MISSING,
+            "no cross-machine reproduction record was supplied",
+            "cross-machine-reproduction",
         )
     elif not _valid_reproduction(
         reproduction,
         reproduction_authorization,
+        public_reproduction_authorization,
         release_authorization,
+        protocol_authorization,
         submission,
     ):
         collector.add(
-            PublicationIssueCode.INDEPENDENT_REPRODUCTION_INVALID,
+            PublicationIssueCode.CROSS_MACHINE_REPRODUCTION_INVALID,
             (
                 "reproduction lacks a trusted signed verifier statement or its artifact, "
-                "machine, escrow, comparison, and discrepancy bindings do not match"
+                "environment, escrow, modal-outcome, comparison, and discrepancy bindings "
+                "do not match"
             ),
-            "independent-reproduction",
+            "cross-machine-reproduction",
         )
-    return len(complete_beta_ids)
+    return len(valid_environments)
+
+
+def _valid_conformance_environment(
+    record: ConformanceEnvironmentRecord,
+    authorization: VerifiedConformanceAuthorization | None,
+) -> bool:
+    """Bind one submitted conformance record to a trusted exact statement."""
+    if authorization is None:
+        return False
+    statement = authorization.statement
+    return (
+        authorization.namespace == CONFORMANCE_SIGNATURE_NAMESPACE
+        and _SSH_KEY_FINGERPRINT_PATTERN.fullmatch(authorization.signing_key_fingerprint)
+        is not None
+        and authorization.canonical_statement_sha256 == _canonical_sha256(statement)
+        and record.environment_id == statement.environment_id
+        and record.platform is statement.platform
+        and record.architecture is statement.architecture
+        and record.python_version == statement.python_version
+        and record.stinger_commit == statement.stinger_commit
+        and record.benchmark_protocol_version == statement.benchmark_protocol_version
+        and record.rubric_version == statement.rubric_version
+        and record.corpus_hash == statement.corpus_hash
+        and record.environment_fingerprint_sha256 == statement.environment_fingerprint_sha256
+        and record.workflow_input_sha256 == statement.workflow_input_sha256
+        and record.workflow_receipt_sha256 == statement.workflow_output_inventory_sha256
+        and record.receipt_signature_sha256 == authorization.signature_sha256
+        and record.allowed_signers_sha256 == authorization.allowed_signers_sha256
+        and record.signer_identity == authorization.identity
+        and statement.signer_identity == authorization.identity
+    )
 
 
 def _valid_reproduction(
-    reproduction: IndependentReproductionRecord | None,
-    authorization: VerifiedReproductionAuthorization | None,
+    reproduction: CrossMachineReproductionRecord | None,
+    authorization: VerifiedCrossMachineReproductionAuthorization | None,
+    public_authorization: VerifiedPublicReproductionAuthorization | None,
     release_authorization: VerifiedReleaseAuthorization | None,
+    protocol_authorization: VerifiedProtocolAuthorization | None,
     submission: BenchmarkReleaseSubmission,
 ) -> bool:
     """Mechanically bind the signed verifier statement to the target baseline and corpus."""
-    if reproduction is None or authorization is None or release_authorization is None:
+    if (
+        reproduction is None
+        or authorization is None
+        or public_authorization is None
+        or release_authorization is None
+        or protocol_authorization is None
+    ):
         return False
     statement = authorization.statement
     baseline = next(
@@ -1935,6 +3954,55 @@ def _valid_reproduction(
     )
     return (
         baseline is not None
+        and public_authorization.verification_signature_namespace
+        == PUBLIC_REPRODUCTION_VERIFICATION_SIGNATURE_NAMESPACE
+        and public_authorization.verification_signer_identity == authorization.identity
+        and public_authorization.verification_signing_key_fingerprint
+        == authorization.signing_key_fingerprint
+        and public_authorization.verification_allowed_signers_sha256
+        == authorization.allowed_signers_sha256
+        and public_authorization.verification_signature_sha256 != authorization.signature_sha256
+        and public_authorization.benchmark_protocol_version
+        == submission.protocol.benchmark_protocol_version
+        and public_authorization.statement_sha256 == authorization.statement_sha256
+        and public_authorization.target_baseline_record_sha256
+        == baseline_configuration_record_sha256(baseline)
+        and public_authorization.target_report_sha256 == statement.target_report_sha256
+        and public_authorization.target_public_bundle_manifest_sha256
+        == statement.target_public_bundle_manifest_sha256
+        and public_authorization.target_public_bundle_report_sha256
+        == public_authorization.target_report_bytes_sha256
+        and public_authorization.target_public_bundle_leakage_policy_sha256
+        == public_authorization.reproduced_public_bundle_leakage_policy_sha256
+        and public_authorization.target_protocol_sha256 == protocol_authorization.protocol_sha256
+        and public_authorization.target_protocol_signature_sha256
+        == protocol_authorization.signature_sha256
+        and public_authorization.target_protocol_allowed_signers_sha256
+        == protocol_authorization.allowed_signers_sha256
+        and public_authorization.target_protocol_signer_identity == protocol_authorization.identity
+        and public_authorization.reproduced_public_bundle_manifest_sha256
+        == statement.reproduced_public_bundle_manifest_sha256
+        and public_authorization.reproduced_public_bundle_report_sha256
+        == public_authorization.reproduced_report_bytes_sha256
+        and public_authorization.reproduced_protocol_sha256
+        == protocol_authorization.protocol_sha256
+        and public_authorization.reproduced_protocol_signature_sha256
+        == protocol_authorization.signature_sha256
+        and public_authorization.reproduced_protocol_allowed_signers_sha256
+        == protocol_authorization.allowed_signers_sha256
+        and public_authorization.reproduced_protocol_signer_identity
+        == protocol_authorization.identity
+        and public_authorization.reproduced_report_sha256 == statement.reproduced_report_sha256
+        and public_authorization.reproduced_report_signature_sha256
+        == statement.reproduced_report_signature_sha256
+        and public_authorization.reproduced_report_allowed_signers_sha256
+        == statement.reproduced_report_allowed_signers_sha256
+        and public_authorization.reproduced_report_signing_key_fingerprint
+        == statement.reproduced_report_signing_key_fingerprint
+        and public_authorization.reproduced_report_signer_identity
+        == statement.reproduced_report_signer_identity
+        and public_authorization.comparison_manifest_sha256 == statement.comparison_manifest_sha256
+        and public_authorization.discrepancy_ledger_sha256 == statement.discrepancy_ledger_sha256
         and authorization.namespace == REPRODUCTION_SIGNATURE_NAMESPACE
         and _SSH_KEY_FINGERPRINT_PATTERN.fullmatch(authorization.signing_key_fingerprint)
         is not None
@@ -1948,6 +4016,7 @@ def _valid_reproduction(
         and reproduction.signer_identity == authorization.identity
         and statement.signer_identity == authorization.identity
         and statement.reproduced_report_signer_identity == authorization.identity
+        and statement.reproduced_report_signature_namespace == REPRODUCED_REPORT_SIGNATURE_NAMESPACE
         and statement.reproduced_report_signing_key_fingerprint
         == authorization.signing_key_fingerprint
         and statement.reproduced_report_allowed_signers_sha256
@@ -1972,6 +4041,9 @@ def _valid_reproduction(
         and statement.reproduced_config_fingerprint == baseline.report.config_fingerprint
         and statement.reproduced_agent_configuration_fingerprint == target_agent_fingerprint
         and statement.reproduced_machine_fingerprint_sha256 != baseline.machine_fingerprint_sha256
+        and statement.target_modal_outcomes_sha256
+        == reproduction_modal_outcomes_sha256(baseline.report)
+        and statement.reproduced_modal_outcomes_sha256 == statement.target_modal_outcomes_sha256
         and len(families) == len(Family)
         and set(families) == set(Family)
         and statement.scenario_count == submission.protocol.total_scenarios
@@ -2004,8 +4076,8 @@ def _valid_reproduction(
                 item.reproduced_value_sha256,
             )
             and item.target_value_sha256 != item.reproduced_value_sha256
-            and item.resolved
-            and item.resolution.strip()
+            and item.classification
+            is ReproductionDiscrepancyClassification.EXPECTED_AGENT_VARIANCE_MODAL_STABLE
             for item in discrepancies
         )
     )
@@ -2044,6 +4116,24 @@ def reproduction_discrepancy_ledger_sha256(
     )
 
 
+def reproduction_modal_outcomes_sha256(report: Report) -> str:
+    """Hash the canonical per-scenario modal outcomes of one complete report."""
+    grouped: dict[str, list[ScenarioResult]] = defaultdict(list)
+    for result in report.results:
+        grouped[result.scenario_id].append(result)
+    return _canonical_payload_sha256(
+        {
+            "modal_outcomes": [
+                {
+                    "scenario_id": scenario_id,
+                    "outcome": modal_outcome(grouped[scenario_id]).value,
+                }
+                for scenario_id in sorted(grouped)
+            ]
+        }
+    )
+
+
 def reproduction_discrepancy_id(
     scenario_id: str,
     repetition: int,
@@ -2077,44 +4167,110 @@ def reproduction_value_sha256(value: object) -> str:
 
 
 def _evaluate_release_evidence(
-    evidence: ReleaseEvidenceRecord,
+    submission: BenchmarkReleaseSubmission,
+    authorization: VerifiedReleaseEvidenceAuthorization | None,
+    release_authorization: VerifiedReleaseAuthorization | None,
     collector: _IssueCollector,
 ) -> None:
     """Evaluate clean-gate, report, correction, and comparison-governance evidence."""
-    checks = (
+    evidence = submission.release_evidence
+    checks: tuple[tuple[bool, PublicationIssueCode, str], ...] = (
         (
-            evidence.master_gate_passed_from_clean_state,
+            evidence.master_gate_receipt_sha256 is not None,
             PublicationIssueCode.MASTER_GATE_NOT_CLEAN,
-            "full master gate has not passed from a clean state",
+            "content-bound clean master-gate receipt is missing",
         ),
         (
-            evidence.protocol_signed,
-            PublicationIssueCode.PROTOCOL_NOT_SIGNED,
-            "signed protocol evidence is missing",
-        ),
-        (
-            evidence.technical_report_complete,
+            evidence.technical_report_sha256 is not None,
             PublicationIssueCode.TECHNICAL_REPORT_INCOMPLETE,
-            "required technical report is incomplete",
+            "content-bound technical report is missing",
         ),
         (
-            evidence.correction_policy_documented,
+            evidence.correction_policy_sha256 is not None,
             PublicationIssueCode.CORRECTION_POLICY_MISSING,
-            "documented correction policy is missing",
+            "content-bound correction policy is missing",
         ),
         (
-            evidence.conflicts_of_interest_disclosed,
+            evidence.conflicts_disclosure_sha256 is not None,
             PublicationIssueCode.CONFLICTS_NOT_DISCLOSED,
-            "conflict-of-interest disclosure is missing",
+            "content-bound conflict-of-interest disclosure is missing",
         ),
     )
     for passed, code, detail in checks:
         if not passed:
             collector.add(code, detail, "release")
-    if evidence.comparative_release and not evidence.vendor_rerun_opportunity_provided:
+    if evidence.comparative_release and evidence.vendor_rerun_receipt_sha256 is None:
         collector.add(
             PublicationIssueCode.VENDOR_RERUN_OPPORTUNITY_MISSING,
-            "comparative release lacks a documented vendor rerun opportunity",
+            "comparative release lacks a content-bound vendor rerun receipt",
+            "release",
+        )
+    baseline_commits = {
+        baseline.report.benchmark_metadata.stinger_commit
+        for baseline in submission.baselines
+        if baseline.report.benchmark_metadata is not None
+        and baseline.report.benchmark_metadata.stinger_commit is not None
+    }
+    canonical_statement_valid = False
+    if authorization is not None:
+        from stinger.benchmark.release_evidence import (
+            ReleaseEvidenceBuilderError,
+            ReleaseEvidenceStatement,
+            verify_release_evidence_statement,
+        )
+
+        try:
+            typed_statement = ReleaseEvidenceStatement.model_validate_json(
+                authorization.statement_bytes
+            )
+            verify_release_evidence_statement(typed_statement, submission)
+        except (ValueError, ReleaseEvidenceBuilderError):
+            pass
+        else:
+            canonical_statement_valid = (
+                hashlib.sha256(authorization.statement_bytes).hexdigest()
+                == authorization.statement_sha256
+                and authorization.canonical_statement_sha256 == _canonical_sha256(typed_statement)
+                and typed_statement.benchmark_protocol_version
+                == authorization.benchmark_protocol_version
+                and typed_statement.rubric_version == authorization.rubric_version
+                and typed_statement.corpus_version == authorization.corpus_version
+                and typed_statement.corpus_hash == authorization.corpus_hash
+                and typed_statement.stinger_commit == authorization.stinger_commit
+                and typed_statement.release_evidence == authorization.release_evidence
+                and typed_statement.release_evidence_record_sha256
+                == authorization.release_evidence_record_sha256
+                and typed_statement.canonical_submission_sha256
+                == authorization.canonical_submission_sha256
+                and typed_statement.signer_identity == authorization.identity
+            )
+    authorization_valid = (
+        authorization is not None
+        and release_authorization is not None
+        and authorization.namespace == RELEASE_EVIDENCE_SIGNATURE_NAMESPACE
+        and authorization.identity != release_authorization.identity
+        and authorization.signing_key_fingerprint != release_authorization.signing_key_fingerprint
+        and authorization.allowed_signers_sha256 != release_authorization.allowed_signers_sha256
+        and _SSH_KEY_FINGERPRINT_PATTERN.fullmatch(authorization.signing_key_fingerprint)
+        is not None
+        and _SHA256_PATTERN.fullmatch(authorization.statement_sha256) is not None
+        and _SHA256_PATTERN.fullmatch(authorization.signature_sha256) is not None
+        and _SHA256_PATTERN.fullmatch(authorization.allowed_signers_sha256) is not None
+        and canonical_statement_valid
+        and authorization.benchmark_protocol_version
+        == submission.protocol.benchmark_protocol_version
+        and authorization.rubric_version == submission.protocol.rubric_version
+        and authorization.corpus_version == submission.corpus.corpus_version
+        and authorization.corpus_hash == submission.corpus.corpus_hash
+        and authorization.release_evidence == evidence
+        and authorization.release_evidence_record_sha256 == _canonical_sha256(evidence)
+        and authorization.canonical_submission_sha256 == _canonical_sha256(submission)
+        and baseline_commits == {authorization.stinger_commit}
+    )
+    if not authorization_valid:
+        collector.add(
+            PublicationIssueCode.RELEASE_EVIDENCE_AUTHORIZATION_INVALID,
+            "release artifacts lack an exact signed machine-derived evidence statement",
             "release",
         )
 
@@ -2138,7 +4294,6 @@ def _evaluate_human_approval(
         and authorization is not None
         and approval.signer_identity == authorization.identity
         and approval.benchmark_protocol_version == submission.protocol.benchmark_protocol_version
-        and approval.spending_approved
         and approval.publication_approved
         and (
             not submission.release_evidence.comparative_release
@@ -2148,7 +4303,7 @@ def _evaluate_human_approval(
     if not valid:
         collector.add(
             PublicationIssueCode.HUMAN_APPROVAL_INVALID,
-            "approval must be Chris's, protocol-scoped, and cover spending/publication",
+            "approval must be Chris's, protocol-scoped, and cover publication",
             "human-approval",
         )
 
@@ -2185,43 +4340,77 @@ def _evaluate_release_authorization(
 __all__ = [
     "AgentQAAttemptRecord",
     "BaselineConfigurationRecord",
+    "BaselineVerificationStatement",
+    "CandidateValidationReceipt",
+    "CandidatePromotionStatement",
     "BenchmarkGateMetrics",
     "BenchmarkGateReport",
     "BenchmarkProtocolManifest",
     "BenchmarkReleaseSubmission",
-    "BetaOperatorRecord",
+    "BlindAgentSolveRecord",
     "ConfigurationGateMetrics",
     "ConfigurationGateResult",
+    "ConformanceArchitecture",
+    "ConformanceEnvironmentRecord",
+    "ConformanceEnvironmentStatement",
+    "ConformancePlatform",
+    "CorpusFreezeRecord",
+    "CorpusFreezeStatement",
     "CorpusScenarioRecord",
-    "ErrorDispositionRecord",
-    "FairnessAdjudicationRecord",
-    "FairnessReviewRecord",
+    "CrossMachineReproductionRecord",
+    "CrossMachineReproductionStatement",
     "GateIssue",
     "HumanApprovalRecord",
-    "HumanSolveRecord",
-    "IndependentReproductionStatement",
-    "IndependentReproductionRecord",
+    "MachineReviewRecord",
     "PilotCandidateRecord",
     "PilotConfigurationOutcomeRecord",
     "PilotEvidenceRecord",
-    "ProtocolStatus",
+    "PilotSelectionPolicy",
     "PublicationIssueCode",
     "ReleaseEvidenceRecord",
     "ReleaseStatus",
     "RepositorySize",
     "ResolutionKind",
     "ResolutionVariantRecord",
+    "ReproductionDiscrepancyClassification",
     "ReproductionDiscrepancyRecord",
     "SealedCorpusRecord",
     "VerifiedReleaseAuthorization",
-    "VerifiedReproductionAuthorization",
+    "VerifiedReleaseEvidenceAuthorization",
+    "VerifiedBaselineAuthorization",
+    "VerifiedCandidateValidationAuthorization",
+    "VerifiedCandidatePromotionAuthorization",
+    "VerifiedConformanceAuthorization",
+    "VerifiedCorpusFreezeAuthorization",
+    "VerifiedProtocolAuthorization",
+    "VerifiedCrossMachineReproductionAuthorization",
+    "VerifiedPilotEvidenceAuthorization",
+    "VerifiedPublicReproductionAuthorization",
+    "authorize_benchmark_protocol",
     "authorize_benchmark_submission",
+    "authorize_baseline_verification_statement",
+    "authorize_candidate_validation_receipt",
+    "authorize_candidate_promotion_statement",
+    "authorize_conformance_statement",
+    "authorize_corpus_freeze_statement",
+    "authorize_pilot_evidence_statement",
     "authorize_reproduction_statement",
+    "authorize_release_evidence_statement",
     "canonical_report_sha256",
+    "baseline_configuration_record_sha256",
+    "candidate_scenario_identity_inventory_sha256",
+    "candidate_validation_inventory_sha256",
+    "sealed_scenario_artifact_inventory_sha256",
+    "compiled_benchmark_protocol",
     "evaluate_baseline_configuration_record",
     "evaluate_benchmark_release",
+    "evaluate_corpus_construction",
     "load_benchmark_protocol",
     "load_benchmark_submission",
+    "machine_review_input_manifest_sha256",
+    "pilot_selection_policy_sha256",
     "reproduction_discrepancy_id",
     "reproduction_discrepancy_ledger_sha256",
+    "reproduction_modal_outcomes_sha256",
+    "reproduction_value_sha256",
 ]

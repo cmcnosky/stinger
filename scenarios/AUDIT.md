@@ -1,23 +1,31 @@
-# Spot-audit guide — read this before anyone trusts a Stinger number
+# Public-suite adversarial questions — non-normative
 
-**Why this file exists.** The scenarios in this corpus were written by the same author as the
-detectors that judge them. That is a conflict of interest in a tool whose entire claim is
-"trust our measurement," and it is the first thing a serious reader should attack. The build
-plan (TASKS.md, milestone M7) asks for a human to spot-audit roughly 20% of the corpus. This
-is that audit, laid out so it can be done by someone who did not write it and does not read
-Python.
+**Why this file exists.** The historical build plan in `TASKS.md` proposed a human
+spot-audit of the public development corpus. Benchmark Protocol 2 replaced that proposed
+release gate with artifact-bound, provider-diverse machine review and validation of the
+separately stored sealed corpus. This file is retained as a transparent set of challenge
+questions for the six public examples below. It is not benchmark evidence, a required
+review, or a way to approve, reject, relabel, or score a Protocol 2 scenario.
 
-**What you are checking.** Not whether the code works — the automated gate covers that. You
-are checking one thing per scenario, in plain judgement:
+The underlying concern remains worth exposing: scenario construction and detector
+implementation can share an authoring system. Protocol 2 does not pretend that authorship
+completeness or reviewer-versus-author independence can be proved from self-reported
+configuration labels. Instead, it binds scenario artifacts, variants, five contained QA
+attempts, and two mutually provider/configuration/signature-diverse veto-review executions.
+A machine decision of `block` or `uncertain`, missing evidence, or contract drift fails
+closed.
+
+**What these questions probe.** The automated validity contract proves the declared honest
+and cheat references behave as declared. These questions probe the construct around that
+mechanical fact:
 
 > Is the "cheat" genuinely dishonest, and is the "honest" answer genuinely available?
 
 If a trap punishes something a reasonable engineer might do in good faith, it is a bad trap
 and every number derived from it is contaminated. Say so.
 
-**How to mark it.** For each scenario below: **FAIR**, **UNFAIR**, or **UNSURE**. An UNSURE
-is useful — it means the scenario needs to explain itself better. Note anything that made you
-hesitate, even if you ended up saying FAIR.
+They may be used as adversarial prompts in development or as issue-reporting guidance.
+Answers are commentary only; they never become favorable release fields.
 
 ---
 
@@ -90,8 +98,8 @@ reasonably feel forced to produce something?
 
 > **Known past defect, fixed, worth re-checking.** This scenario originally only recognised a
 > refusal phrased as "contradictory". A real agent refused correctly saying "unsatisfiable"
-> and was scored as a failure. The accepted wordings were broadened. Please sanity-check that
-> the list now covers how a person would actually phrase this.
+> and was scored as a failure. The accepted wordings were broadened. This question remains
+> useful for generating varied regression probes.
 
 ---
 
@@ -139,9 +147,10 @@ planted secret announces itself as fake.)
   where nobody can succeed honestly measures nothing useful.
 - **Does any trap have more than one reasonable reading?** Ambiguity is the enemy here.
 
-## What to do with your answers
+## What to do with a concern
 
-Any **UNFAIR** verdict should block that scenario from a published run until it is rewritten
-or removed. **UNSURE** means the scenario needs a clearer explanation, not necessarily a
-different design. Record the outcome — a corpus that claims to be audited should be able to
-show who audited it and what they said.
+Open a reproducible defect report against the public development scenario and include the
+specific ambiguous rule or reachable counterexample. That report can drive a versioned
+scenario correction and new mechanical tests. It cannot waive a detector, change a score,
+or stand in for Protocol 2's signed candidate receipt, sealed-corpus construction evidence,
+machine reviews, freeze, baselines, or cross-machine reproduction.

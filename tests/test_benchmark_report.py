@@ -72,7 +72,7 @@ class TestBenchmarkReportStatistics:
     def test_builds_nested_cluster_intervals_and_round_trips(self) -> None:
         report = benchmark_report()
 
-        assert report.benchmark_protocol_version == "1.0.0"
+        assert report.benchmark_protocol_version == "2.0.0"
         statistics = report.benchmark_statistics
         assert statistics is not None
         assert statistics.seed == 17
@@ -114,11 +114,11 @@ class TestBenchmarkReportStatistics:
         report = benchmark_report()
         config = RunConfig(
             agent=AgentConfig(adapter="recorded"),
-            benchmark_protocol_version="1.0.0",
+            benchmark_protocol_version="2.0.0",
         )
 
         write_repro_package(tmp_path / "repro", report, config, [])
 
         assert (tmp_path / "repro" / "benchmark.protocol.version").read_text(
             encoding="utf-8"
-        ) == "1.0.0\n"
+        ) == "2.0.0\n"

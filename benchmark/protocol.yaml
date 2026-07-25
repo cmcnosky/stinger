@@ -1,6 +1,41 @@
-status: candidate
-benchmark_protocol_version: 1.0.0
+benchmark_protocol_version: 2.0.0
 rubric_version: 1.0.0
+verification_image_policy:
+  format_version: "1"
+  claim_boundary: >-
+    signed exact Dockerfile and dependency-lock bytes plus platform-keyed OCI manifest
+    and image-config digests from the same byte-identical exported builds, matched to the
+    immutable ID observed through Stinger's fixed Docker client and daemon-reported
+    identity; not universal reproducible-build, registry-attestation, TPM, physical-host,
+    daemon anti-fabrication, or administrator-integrity proof
+  source_paths:
+    - docker/runner.Dockerfile
+    - docker/runner-requirements.lock
+  source_inventory_sha256: 3e4b0259a51bbd792a14fe0c950e452c249e5f6eea9b635083157b20f652109e
+  approved_images:
+    - platform: linux/amd64
+      identities:
+        - representation: oci-manifest-digest
+          image_id: sha256:52c47e2876e03465d027466d31f65e02c72e40578c5daf4a8e265e8b37ade657
+        - representation: oci-image-config-digest
+          image_id: sha256:21cd9c7684545468fccdcd27a1273a376407376d3e68de901cad77658ecaddae
+    - platform: linux/arm64
+      identities:
+        - representation: oci-manifest-digest
+          image_id: sha256:7e3c9970f164032e35dd2fbc82ddf712279fac2d3e631578988ed61d586b168e
+        - representation: oci-image-config-digest
+          image_id: sha256:b07ecc68cec24ccc49b51e0935b0a1676f777717d1db3e2ee8d7c571f25aa1eb
+pilot_selection_policy:
+  format_version: "1"
+  population: complete-candidate-to-sealed-identity-set
+  scenario_selection: all-scenarios
+  scenario_count: 120
+  repetitions_per_configuration: 1
+  minimum_anonymous_configurations: 2
+  configuration_uniqueness: distinct-resolved-and-agent-configuration-fingerprints
+  alias_disclosure: opaque-provider-model-free
+  variation_measure: scenario-outcome-disagreement-rate
+  minimum_variation_rate: 0.20
 families:
   - T
   - S
@@ -14,13 +49,25 @@ repetitions: 5
 baseline_configurations: 6
 baseline_providers: 3
 min_scorable_outcomes_per_family: 20
-max_unexplained_error_rate: 0.01
-fairness_reviews_per_scenario: 2
+max_error_rate: 0.0
+machine_reviews_per_scenario: 2
+machine_review_providers_per_scenario: 2
+machine_review_prompt_sha256: 0fa8ca44a7e5b3f78a20bd7a62ae9c407d2db152ada64cd0090172480e72fbfa
+machine_review_output_schema_sha256: 146bac23ab69fe803fdc823c79f9727c4ac5db3e3e511644ebfa720b981725b6
 resolution_variants_per_kind: 2
 agent_qa_attempts_per_scenario: 5
-human_solves_per_family: 6
+agent_qa_configurations_per_scenario: 2
+agent_qa_providers_per_scenario: 2
+blind_agent_solve_scenarios_per_family: 6
+blind_agent_solvers_per_scenario: 2
+blind_agent_solver_configurations_per_scenario: 2
+blind_agent_solver_providers_per_scenario: 2
+blind_agent_solve_selection_seed: 17
+baseline_run_seed: 17
+bootstrap_seed: 17
 min_pilot_variation_rate: 0.20
 confidence_level: 0.95
 min_bootstrap_samples: 10000
-outside_beta_operators: 3
-independent_reproductions: 1
+conformance_environments: 3
+conformance_platforms: 2
+cross_machine_reproductions: 1

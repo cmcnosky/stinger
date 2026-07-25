@@ -15,15 +15,18 @@ from stinger.benchmark.gates import (
     evaluate_benchmark_release,
 )
 from stinger.benchmark.signing import (
+    PILOT_EVIDENCE_SIGNATURE_NAMESPACE,
     PROTOCOL_SIGNATURE_NAMESPACE,
     RELEASE_SIGNATURE_NAMESPACE,
     REPRODUCED_REPORT_SIGNATURE_NAMESPACE,
     REPRODUCTION_SIGNATURE_NAMESPACE,
     ProtocolSignatureError,
+    sign_pilot_evidence_statement,
     sign_protocol,
     sign_release_submission,
     sign_reproduced_report,
     sign_reproduction_statement,
+    verify_pilot_evidence_statement_signature,
     verify_protocol_signature,
     verify_release_submission_signature,
     verify_reproduced_report_signature,
@@ -37,7 +40,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture
 def signing_material(tmp_path: Path) -> dict[str, Path]:
-    """Generate an ephemeral Ed25519 key and verifier trust file."""
+    """Generate an ephemeral Ed25519 key and separately supplied trust file."""
     private_key = tmp_path / "release-key"
     generated = subprocess.run(
         [
@@ -61,7 +64,7 @@ def signing_material(tmp_path: Path) -> dict[str, Path]:
 
     protocol = tmp_path / "protocol.yaml"
     protocol.write_text(
-        "benchmark_protocol_version: 1.0.0\nstatus: candidate\n",
+        "benchmark_protocol_version: 2.0.0\nbaseline_run_seed: 17\n",
         encoding="utf-8",
     )
     public_key = private_key.with_suffix(".pub").read_text(encoding="utf-8").strip()
@@ -107,7 +110,7 @@ class TestProtocolSigning:
             signing_material["private_key"],
         )
         signing_material["protocol"].write_text(
-            "benchmark_protocol_version: 1.0.0\nstatus: released\n",
+            "benchmark_protocol_version: 2.0.0\nbaseline_run_seed: 18\n",
             encoding="utf-8",
         )
 
@@ -251,6 +254,125 @@ class TestProtocolSigning:
 
         assert verification == expected
 
+    def test_sign_and_verify_use_fixed_client_and_closed_environment(
+        self,
+        signing_material: dict[str, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Both operations ignore ambient executable, loader, askpass, and Git controls."""
+        hostile = {
+            "PATH": "/attacker/bin",
+            "LD_PRELOAD": "/attacker/lib.so",
+            "DYLD_INSERT_LIBRARIES": "/attacker/lib.dylib",
+            "SSH_ASKPASS": "/attacker/askpass",
+            "GIT_DIR": "/attacker/git",
+            "GIT_WORK_TREE": "/attacker/worktree",
+            "BASH_ENV": "/attacker/bash-env",
+            "ENV": "/attacker/shell-env",
+        }
+        for name, value in hostile.items():
+            monkeypatch.setenv(name, value)
+
+        observed: list[tuple[list[str], dict[str, str]]] = []
+        original = signing_module._run_ssh_keygen_process
+
+        def capture(
+            argv: list[str],
+            *,
+            input: bytes | None,
+            env: dict[str, str],
+        ) -> subprocess.CompletedProcess[bytes]:
+            observed.append((argv, env))
+            return original(argv, input=input, env=env)
+
+        monkeypatch.setattr(signing_module, "_run_ssh_keygen_process", capture)
+        signature = sign_protocol(
+            signing_material["protocol"],
+            signing_material["private_key"],
+        )
+        verify_protocol_signature(
+            signing_material["protocol"],
+            signature,
+            signing_material["allowed_signers"],
+            IDENTITY,
+        )
+
+        assert len(observed) == 2
+        assert all(Path(argv[0]).is_absolute() for argv, _env in observed)
+        assert len({argv[0] for argv, _env in observed}) == 1
+        for _argv, environment in observed:
+            assert environment == signing_module._ssh_environment()
+            assert environment["PATH"] != hostile["PATH"]
+            assert (hostile.keys() - {"PATH"}).isdisjoint(environment)
+
+    def test_path_shim_cannot_authorize_a_tampered_artifact(
+        self,
+        tmp_path: Path,
+        signing_material: dict[str, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A fake successful verifier on PATH is never executed."""
+        signature = sign_protocol(
+            signing_material["protocol"],
+            signing_material["private_key"],
+        )
+        signing_material["protocol"].write_text(
+            "benchmark_protocol_version: 2.0.0\nbaseline_run_seed: 999\n",
+            encoding="utf-8",
+        )
+        shim_directory = tmp_path / "shim"
+        shim_directory.mkdir()
+        marker = tmp_path / "fake-verifier-ran"
+        shim = shim_directory / "ssh-keygen"
+        shim.write_text(
+            "#!/bin/sh\n"
+            f"printf ran > '{marker}'\n"
+            "printf 'Good signature with ED25519 key SHA256:AAAAAAAAAAAAAAAAAAAA\\n'\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        monkeypatch.setenv("PATH", str(shim_directory))
+        monkeypatch.setenv("LD_PRELOAD", "/attacker/lib.so")
+        monkeypatch.setenv("DYLD_INSERT_LIBRARIES", "/attacker/lib.dylib")
+        monkeypatch.setenv("GIT_DIR", str(tmp_path / "attacker.git"))
+        monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "attacker-tree"))
+        monkeypatch.setenv("SSH_ASKPASS", str(tmp_path / "attacker-askpass"))
+
+        with pytest.raises(ProtocolSignatureError, match="verification failed"):
+            verify_protocol_signature(
+                signing_material["protocol"],
+                signature,
+                signing_material["allowed_signers"],
+                IDENTITY,
+            )
+
+        assert not marker.exists()
+
+    def test_excessive_verifier_output_fails_closed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """External diagnostics cannot become an unbounded memory or log channel."""
+
+        def excessive(
+            _argv: list[str],
+            *,
+            input: bytes | None,
+            env: dict[str, str],
+        ) -> subprocess.CompletedProcess[bytes]:
+            del input, env
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=b"x" * (signing_module._MAX_OPENSSH_OUTPUT_BYTES + 1),
+                stderr=b"",
+            )
+
+        monkeypatch.setattr(signing_module, "_run_ssh_keygen_process", excessive)
+        with pytest.raises(ProtocolSignatureError, match="excessive output"):
+            signing_module._run(["ssh-keygen", "-Y", "verify"], stdin=b"artifact")
+
 
 def test_signature_namespaces_are_distinct_while_the_signing_key_remains_visible(
     signing_material: dict[str, Path],
@@ -258,9 +380,9 @@ def test_signature_namespaces_are_distinct_while_the_signing_key_remains_visible
 ) -> None:
     """Namespaces prevent artifact substitution but do not impersonate signer independence."""
     release = tmp_path / "release.yaml"
-    release.write_text("human_approval:\n  operator_id: Chris\n", encoding="utf-8")
+    release.write_text("release_authorization:\n  operator_id: Chris\n", encoding="utf-8")
     statement = tmp_path / "reproduction.yaml"
-    statement.write_text("evaluator_id: outside-1\n", encoding="utf-8")
+    statement.write_text("evaluator_id: cross-machine-role\n", encoding="utf-8")
 
     release_signature = sign_release_submission(release, signing_material["private_key"])
     statement_signature = sign_reproduction_statement(
@@ -304,6 +426,90 @@ def test_signature_namespaces_are_distinct_while_the_signing_key_remains_visible
         )
 
 
+class TestPilotEvidenceSigning:
+    """Pilot evidence signatures have an exact, non-substitutable trust domain."""
+
+    def test_signs_and_verifies_exact_pilot_evidence_bytes(
+        self,
+        signing_material: dict[str, Path],
+        tmp_path: Path,
+    ) -> None:
+        statement = tmp_path / "pilot-evidence.json"
+        statement.write_bytes(b'{"format_version":"2","scenario_count":120}\n')
+
+        signature = sign_pilot_evidence_statement(
+            statement,
+            signing_material["private_key"],
+        )
+        verification = verify_pilot_evidence_statement_signature(
+            statement,
+            signature,
+            signing_material["allowed_signers"],
+            IDENTITY,
+        )
+
+        assert verification.identity == IDENTITY
+        assert verification.namespace == PILOT_EVIDENCE_SIGNATURE_NAMESPACE
+        assert verification.artifact_sha256
+        assert verification.signature_sha256
+        assert verification.allowed_signers_sha256
+        assert verification.signing_key_fingerprint.startswith("SHA256:")
+        assert PILOT_EVIDENCE_SIGNATURE_NAMESPACE not in {
+            PROTOCOL_SIGNATURE_NAMESPACE,
+            RELEASE_SIGNATURE_NAMESPACE,
+            REPRODUCTION_SIGNATURE_NAMESPACE,
+        }
+
+    def test_pilot_signature_cannot_substitute_for_other_governance_namespaces(
+        self,
+        signing_material: dict[str, Path],
+        tmp_path: Path,
+    ) -> None:
+        statement = tmp_path / "pilot-evidence.json"
+        statement.write_bytes(b'{"format_version":"2","scenario_count":120}\n')
+        signature = sign_pilot_evidence_statement(
+            statement,
+            signing_material["private_key"],
+        )
+
+        verifiers = (
+            verify_protocol_signature,
+            verify_release_submission_signature,
+            verify_reproduction_statement_signature,
+        )
+        for verifier in verifiers:
+            with pytest.raises(ProtocolSignatureError, match="verification failed"):
+                verifier(
+                    statement,
+                    signature,
+                    signing_material["allowed_signers"],
+                    IDENTITY,
+                )
+
+    def test_other_governance_signature_cannot_substitute_for_pilot_evidence(
+        self,
+        signing_material: dict[str, Path],
+        tmp_path: Path,
+    ) -> None:
+        artifacts_and_signers = (
+            ("protocol.yaml", sign_protocol),
+            ("release.json", sign_release_submission),
+            ("reproduction.json", sign_reproduction_statement),
+        )
+        for filename, signer in artifacts_and_signers:
+            artifact = tmp_path / filename
+            artifact.write_bytes(b'{"artifact":"same bytes"}\n')
+            signature = signer(artifact, signing_material["private_key"])
+
+            with pytest.raises(ProtocolSignatureError, match="verification failed"):
+                verify_pilot_evidence_statement_signature(
+                    artifact,
+                    signature,
+                    signing_material["allowed_signers"],
+                    IDENTITY,
+                )
+
+
 class TestReproducedReportSigning:
     """Evaluator report signatures bind exact bytes, identity, trust, and namespace."""
 
@@ -343,7 +549,7 @@ class TestReproducedReportSigning:
         report = tmp_path / "report.json"
         report.write_bytes(b'{"results":[]}\n')
         statement = tmp_path / "statement.json"
-        statement.write_bytes(b'{"evaluator_id":"outside-1"}\n')
+        statement.write_bytes(b'{"evaluator_id":"cross-machine-role"}\n')
         report_signature = sign_reproduced_report(
             report,
             signing_material["private_key"],

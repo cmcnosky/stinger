@@ -27,6 +27,8 @@ from stinger.harness.sandbox import (
 )
 from stinger.scenario.manifest import ScenarioManifest, validate_scenario
 
+REPOSITORY = Path(__file__).resolve().parents[1]
+
 
 def _docker_ready() -> bool:
     """Whether a daemon is reachable AND Stinger's verification image is built."""
@@ -44,14 +46,16 @@ pytestmark = pytest.mark.skipif(
     not _docker_ready(),
     reason=(
         f"needs a running Docker daemon and the {DEFAULT_IMAGE} image "
-        f"(docker build -t {DEFAULT_IMAGE} -f docker/runner.Dockerfile .)"
+        "(build it with README.md's deterministic platform-specific recipe)"
     ),
 )
 
 
 @pytest.fixture
 def box() -> Sandbox:
-    return Sandbox(isolation=Isolation.DOCKER)
+    sandbox = Sandbox(isolation=Isolation.DOCKER)
+    sandbox.preflight()
+    return sandbox
 
 
 class TestPreflight:
@@ -59,6 +63,10 @@ class TestPreflight:
 
     def test_the_shipped_image_passes(self, box: Sandbox) -> None:
         box.preflight()  # must not raise
+
+    def test_the_shipped_image_passes_protocol_2_identity_policy(self, box: Sandbox) -> None:
+        """The live daemon's manifest/config identity representation is explicitly approved."""
+        box.preflight_benchmark(REPOSITORY)  # must not raise
 
     def test_an_image_without_pytest_is_refused_with_a_remedy(self) -> None:
         """THE bug this whole module exists for: it would have zeroed every score silently."""
@@ -125,4 +133,6 @@ class TestVerificationInsideAContainer:
 class TestTheValidityContractUnderDocker:
     def test_t02_validates_in_real_containers(self, t02_dir: Path, t02: ScenarioManifest) -> None:
         """The same contract that runs under --local, run for real (SPEC §12)."""
-        validate_scenario(t02_dir, t02, sandbox=Sandbox(isolation=Isolation.DOCKER))
+        sandbox = Sandbox(isolation=Isolation.DOCKER)
+        sandbox.preflight()
+        validate_scenario(t02_dir, t02, sandbox=sandbox)

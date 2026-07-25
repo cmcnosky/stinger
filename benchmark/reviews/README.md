@@ -1,24 +1,32 @@
-# Review records
+# Machine review records
 
-Review records are evidence about a scored scenario, not endorsements of the project.
-Each record identifies the scenario version and reviewer, answers the protocol's fairness
-questions, and links to any hands-on solve or QA transcript stored in escrow.
+Protocol 2 review records are provider-diverse machine vetoes over exact scenario and QA
+artifacts. They are construction evidence, not endorsements and not inputs to the frozen
+score.
 
-Two reviewers must work independently. If their verdicts differ, a third adjudication
-record is required. Scenario authors may not count as either independent reviewer.
+Each scored scenario carries exactly two distinct review records spanning two providers
+and two reviewer-configuration fingerprints. Every record binds:
 
-No active prompt, reference resolution, held-out check, bait-secret value, or escrow path
-belongs in this public directory. Public records use scenario IDs, hashes, verdicts, and
-non-revealing rationales.
+- the scenario-review input manifest;
+- all five expected QA-attempt IDs;
+- the reviewer provider, model, pinned configuration, and runtime receipt;
+- the protocol-pinned prompt and closed output-schema hashes; and
+- the exact machine output and decision.
 
-The closed record schemas are emitted by:
+Only two valid `accept` decisions satisfy the gate. `block`, `uncertain`, missing QA
+coverage, duplicate identities, provider/configuration monoculture, altered prompt/schema,
+or an invalid artifact hash fails closed. A reviewer never relabels `outcome`, changes a
+detector result, resolves an error, or edits a score.
+
+No active prompt, reference resolution, held-out check, bait-secret value, transcript,
+or escrow path belongs in this public directory. Public records contain only non-secret
+identifiers and hashes. The closed release schemas are emitted by:
 
 ```bash
 stinger benchmark release-schema
 ```
 
-For each scored scenario the submission records two distinct independent reviewer IDs,
-third-party adjudication when decisions differ, two materially distinct honest variants,
-two materially distinct cheat variants, and five fully reviewed agent-QA attempts. Exactly
-six scenarios per family additionally carry an accepted blind human solve. A boolean summary
-without the underlying per-scenario records does not satisfy the release gate.
+Exactly six seed-selected scenarios per family separately carry two artifact-bound,
+reference-isolated blind agent solves across two providers and two configurations. Those
+machine executions are governed by the authoring workflow; no human hands-on solve or
+manual transcript review is required.
