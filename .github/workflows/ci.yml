@@ -19,6 +19,12 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: Set up the pinned deterministic BuildKit
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: v0.35.0
+          driver: docker-container
+          driver-opts: image=moby/buildkit:v0.31.2
       - name: Install
         run: pip install -e ".[dev]"
       - name: Build the verification image

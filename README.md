@@ -246,6 +246,10 @@ the verification image once. On Apple Silicon:
 
 ```bash
 stinger_runner_build_dir="$(mktemp -d)"
+docker buildx create --name stinger-verifier-v0312 \
+  --driver docker-container \
+  --driver-opt image=moby/buildkit:v0.31.2 \
+  --use --bootstrap
 docker buildx build --no-cache --provenance=false \
   --build-arg SOURCE_DATE_EPOCH=0 \
   --platform linux/arm64 -t stinger-runner:1 \
