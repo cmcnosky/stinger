@@ -15,7 +15,6 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-import shutil
 import stat
 import subprocess
 import tempfile
@@ -23,26 +22,63 @@ from dataclasses import dataclass
 from pathlib import Path
 
 PROTOCOL_SIGNATURE_NAMESPACE = "stinger-benchmark-protocol"
+CANDIDATE_VALIDATION_SIGNATURE_NAMESPACE = "stinger-benchmark-candidate-validation"
+CANDIDATE_PROMOTION_SIGNATURE_NAMESPACE = "stinger-benchmark-candidate-promotion"
+CORPUS_FREEZE_SIGNATURE_NAMESPACE = "stinger-benchmark-corpus-freeze"
+CONFORMANCE_SIGNATURE_NAMESPACE = "stinger-benchmark-conformance"
+BASELINE_VERIFICATION_SIGNATURE_NAMESPACE = "stinger-benchmark-baseline-verification"
+PILOT_EVIDENCE_SIGNATURE_NAMESPACE = "stinger-benchmark-pilot-evidence"
+RELEASE_EVIDENCE_SIGNATURE_NAMESPACE = "stinger-benchmark-release-evidence"
 RELEASE_SIGNATURE_NAMESPACE = "stinger-benchmark-release"
 REPRODUCTION_SIGNATURE_NAMESPACE = "stinger-benchmark-reproduction"
 REPRODUCED_REPORT_SIGNATURE_NAMESPACE = "stinger-benchmark-reproduced-report"
+PUBLIC_REPRODUCTION_VERIFICATION_SIGNATURE_NAMESPACE = (
+    "stinger-benchmark-public-reproduction-verification"
+)
 _KEY_FINGERPRINT_PATTERN = re.compile(rb"\bkey (SHA256:[A-Za-z0-9+/]+={0,2})(?:\s|$)")
+_MAX_OPENSSH_OUTPUT_BYTES = 256 * 1024
+_MAX_DIAGNOSTIC_BYTES = 4096
+_OPENSSH_TIMEOUT_SECONDS = 60
 
 __all__ = [
     "PROTOCOL_SIGNATURE_NAMESPACE",
+    "CANDIDATE_VALIDATION_SIGNATURE_NAMESPACE",
+    "CANDIDATE_PROMOTION_SIGNATURE_NAMESPACE",
+    "CORPUS_FREEZE_SIGNATURE_NAMESPACE",
+    "CONFORMANCE_SIGNATURE_NAMESPACE",
+    "BASELINE_VERIFICATION_SIGNATURE_NAMESPACE",
+    "PILOT_EVIDENCE_SIGNATURE_NAMESPACE",
+    "RELEASE_EVIDENCE_SIGNATURE_NAMESPACE",
     "RELEASE_SIGNATURE_NAMESPACE",
     "REPRODUCTION_SIGNATURE_NAMESPACE",
     "REPRODUCED_REPORT_SIGNATURE_NAMESPACE",
+    "PUBLIC_REPRODUCTION_VERIFICATION_SIGNATURE_NAMESPACE",
     "ArtifactSignatureVerification",
     "ProtocolSignatureError",
     "ProtocolSignatureVerification",
     "sign_release_submission",
+    "sign_candidate_validation_receipt",
+    "sign_candidate_promotion_statement",
+    "sign_conformance_statement",
+    "sign_baseline_verification_statement",
+    "sign_pilot_evidence_statement",
+    "sign_release_evidence_statement",
+    "sign_corpus_freeze_statement",
     "sign_reproduced_report",
     "sign_reproduction_statement",
+    "sign_public_reproduction_verification_statement",
     "sign_protocol",
     "verify_release_submission_signature",
+    "verify_candidate_validation_receipt_signature",
+    "verify_candidate_promotion_statement_signature",
+    "verify_conformance_statement_signature",
+    "verify_baseline_verification_statement_signature",
+    "verify_pilot_evidence_statement_signature",
+    "verify_release_evidence_statement_signature",
+    "verify_corpus_freeze_statement_signature",
     "verify_reproduced_report_signature",
     "verify_reproduction_statement_signature",
+    "verify_public_reproduction_verification_statement_signature",
     "verify_protocol_signature",
 ]
 
@@ -112,6 +148,97 @@ def sign_release_submission(
     )
 
 
+def sign_candidate_validation_receipt(
+    receipt: Path,
+    private_key: Path,
+) -> Path:
+    """Sign exact candidate-validation receipt bytes in their dedicated namespace."""
+    return _sign_artifact(
+        receipt,
+        private_key,
+        namespace=CANDIDATE_VALIDATION_SIGNATURE_NAMESPACE,
+        label="candidate validation receipt",
+    )
+
+
+def sign_candidate_promotion_statement(
+    statement: Path,
+    private_key: Path,
+) -> Path:
+    """Sign an exact candidate-to-sealed transformation statement."""
+    return _sign_artifact(
+        statement,
+        private_key,
+        namespace=CANDIDATE_PROMOTION_SIGNATURE_NAMESPACE,
+        label="candidate promotion statement",
+    )
+
+
+def sign_conformance_statement(
+    statement: Path,
+    private_key: Path,
+) -> Path:
+    """Sign exact conformance statement bytes in their dedicated namespace."""
+    return _sign_artifact(
+        statement,
+        private_key,
+        namespace=CONFORMANCE_SIGNATURE_NAMESPACE,
+        label="conformance statement",
+    )
+
+
+def sign_baseline_verification_statement(
+    statement: Path,
+    private_key: Path,
+) -> Path:
+    """Sign exact artifact-derived baseline statement bytes."""
+    return _sign_artifact(
+        statement,
+        private_key,
+        namespace=BASELINE_VERIFICATION_SIGNATURE_NAMESPACE,
+        label="baseline verification statement",
+    )
+
+
+def sign_pilot_evidence_statement(
+    statement: Path,
+    private_key: Path,
+) -> Path:
+    """Sign exact artifact-derived pilot evidence in its dedicated namespace."""
+    return _sign_artifact(
+        statement,
+        private_key,
+        namespace=PILOT_EVIDENCE_SIGNATURE_NAMESPACE,
+        label="pilot evidence statement",
+    )
+
+
+def sign_release_evidence_statement(
+    statement: Path,
+    private_key: Path,
+) -> Path:
+    """Sign exact artifact-derived release evidence in its dedicated namespace."""
+    return _sign_artifact(
+        statement,
+        private_key,
+        namespace=RELEASE_EVIDENCE_SIGNATURE_NAMESPACE,
+        label="release evidence statement",
+    )
+
+
+def sign_corpus_freeze_statement(
+    statement: Path,
+    private_key: Path,
+) -> Path:
+    """Sign exact corpus-freeze statement bytes in their dedicated namespace."""
+    return _sign_artifact(
+        statement,
+        private_key,
+        namespace=CORPUS_FREEZE_SIGNATURE_NAMESPACE,
+        label="corpus freeze statement",
+    )
+
+
 def sign_reproduction_statement(
     statement: Path,
     private_key: Path,
@@ -135,6 +262,19 @@ def sign_reproduced_report(
         private_key,
         namespace=REPRODUCED_REPORT_SIGNATURE_NAMESPACE,
         label="reproduced report",
+    )
+
+
+def sign_public_reproduction_verification_statement(
+    statement: Path,
+    private_key: Path,
+) -> Path:
+    """Sign an exact public-reproduction verification statement."""
+    return _sign_artifact(
+        statement,
+        private_key,
+        namespace=PUBLIC_REPRODUCTION_VERIFICATION_SIGNATURE_NAMESPACE,
+        label="public reproduction verification statement",
     )
 
 
@@ -207,6 +347,125 @@ def verify_release_submission_signature(
     )
 
 
+def verify_candidate_validation_receipt_signature(
+    receipt: Path,
+    signature: Path,
+    allowed_signers: Path,
+    identity: str,
+) -> ArtifactSignatureVerification:
+    """Verify exact candidate-validation receipt bytes against external signer trust."""
+    return _verify_artifact_signature(
+        receipt,
+        signature,
+        allowed_signers,
+        identity,
+        namespace=CANDIDATE_VALIDATION_SIGNATURE_NAMESPACE,
+        label="candidate validation receipt",
+    )
+
+
+def verify_candidate_promotion_statement_signature(
+    statement: Path,
+    signature: Path,
+    allowed_signers: Path,
+    identity: str,
+) -> ArtifactSignatureVerification:
+    """Verify an exact candidate-to-sealed statement against external trust."""
+    return _verify_artifact_signature(
+        statement,
+        signature,
+        allowed_signers,
+        identity,
+        namespace=CANDIDATE_PROMOTION_SIGNATURE_NAMESPACE,
+        label="candidate promotion statement",
+    )
+
+
+def verify_conformance_statement_signature(
+    statement: Path,
+    signature: Path,
+    allowed_signers: Path,
+    identity: str,
+) -> ArtifactSignatureVerification:
+    """Verify exact conformance statement bytes against external signer trust."""
+    return _verify_artifact_signature(
+        statement,
+        signature,
+        allowed_signers,
+        identity,
+        namespace=CONFORMANCE_SIGNATURE_NAMESPACE,
+        label="conformance statement",
+    )
+
+
+def verify_pilot_evidence_statement_signature(
+    statement: Path,
+    signature: Path,
+    allowed_signers: Path,
+    identity: str,
+) -> ArtifactSignatureVerification:
+    """Verify exact artifact-derived pilot evidence against external signer trust."""
+    return _verify_artifact_signature(
+        statement,
+        signature,
+        allowed_signers,
+        identity,
+        namespace=PILOT_EVIDENCE_SIGNATURE_NAMESPACE,
+        label="pilot evidence statement",
+    )
+
+
+def verify_baseline_verification_statement_signature(
+    statement: Path,
+    signature: Path,
+    allowed_signers: Path,
+    identity: str,
+) -> ArtifactSignatureVerification:
+    """Verify exact baseline verification statement bytes against external trust."""
+    return _verify_artifact_signature(
+        statement,
+        signature,
+        allowed_signers,
+        identity,
+        namespace=BASELINE_VERIFICATION_SIGNATURE_NAMESPACE,
+        label="baseline verification statement",
+    )
+
+
+def verify_release_evidence_statement_signature(
+    statement: Path,
+    signature: Path,
+    allowed_signers: Path,
+    identity: str,
+) -> ArtifactSignatureVerification:
+    """Verify exact release-evidence statement bytes against external trust."""
+    return _verify_artifact_signature(
+        statement,
+        signature,
+        allowed_signers,
+        identity,
+        namespace=RELEASE_EVIDENCE_SIGNATURE_NAMESPACE,
+        label="release evidence statement",
+    )
+
+
+def verify_corpus_freeze_statement_signature(
+    statement: Path,
+    signature: Path,
+    allowed_signers: Path,
+    identity: str,
+) -> ArtifactSignatureVerification:
+    """Verify exact corpus-freeze statement bytes against external signer trust."""
+    return _verify_artifact_signature(
+        statement,
+        signature,
+        allowed_signers,
+        identity,
+        namespace=CORPUS_FREEZE_SIGNATURE_NAMESPACE,
+        label="corpus freeze statement",
+    )
+
+
 def verify_reproduction_statement_signature(
     statement: Path,
     signature: Path,
@@ -238,6 +497,23 @@ def verify_reproduced_report_signature(
         identity,
         namespace=REPRODUCED_REPORT_SIGNATURE_NAMESPACE,
         label="reproduced report",
+    )
+
+
+def verify_public_reproduction_verification_statement_signature(
+    statement: Path,
+    signature: Path,
+    allowed_signers: Path,
+    identity: str,
+) -> ArtifactSignatureVerification:
+    """Verify an exact public-reproduction verification statement."""
+    return _verify_artifact_signature(
+        statement,
+        signature,
+        allowed_signers,
+        identity,
+        namespace=PUBLIC_REPRODUCTION_VERIFICATION_SIGNATURE_NAMESPACE,
+        label="public reproduction verification statement",
     )
 
 
@@ -388,25 +664,70 @@ def _run_verification(
 
 
 def _run(argv: list[str], *, stdin: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
-    """Run OpenSSH without a shell and capture bounded text diagnostics."""
+    """Run the fixed OpenSSH client with a closed environment and bounded output."""
+    if not argv or argv[0] != "ssh-keygen":
+        raise ProtocolSignatureError("invalid protocol signature operation")
+    executable = _ssh_keygen()
+    command = [str(executable), *argv[1:]]
     try:
-        return subprocess.run(
-            argv,
+        completed = _run_ssh_keygen_process(
+            command,
             input=stdin,
-            capture_output=True,
-            check=False,
-            timeout=60,
+            env=_ssh_environment(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ProtocolSignatureError(
-            f"could not execute protocol signature operation: {exc}"
-        ) from exc
+        raise ProtocolSignatureError("could not execute protocol signature operation") from exc
+    if (
+        len(completed.stdout) > _MAX_OPENSSH_OUTPUT_BYTES
+        or len(completed.stderr) > _MAX_OPENSSH_OUTPUT_BYTES
+    ):
+        raise ProtocolSignatureError("protocol signature operation produced excessive output")
+    return completed
+
+
+def _run_ssh_keygen_process(
+    argv: list[str],
+    *,
+    input: bytes | None,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[bytes]:
+    """Launch the already-resolved OpenSSH client without a shell."""
+    return subprocess.run(
+        argv,
+        input=input,
+        stdin=subprocess.DEVNULL if input is None else None,
+        capture_output=True,
+        check=False,
+        timeout=_OPENSSH_TIMEOUT_SECONDS,
+        env=env,
+    )
+
+
+def _ssh_environment() -> dict[str, str]:
+    """Return the entire environment supplied to OpenSSH.
+
+    Constructing the mapping from scratch prevents caller-controlled ``PATH``, dynamic
+    loader, askpass, shell-startup, Git, or locale variables from changing the verifier.
+    """
+    if os.name == "nt":
+        return {
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": r"C:\Windows\System32",
+            "SYSTEMROOT": r"C:\Windows",
+        }
+    return {
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+    }
 
 
 def _diagnostic(completed: subprocess.CompletedProcess[bytes], fallback: str) -> str:
     """Decode OpenSSH diagnostics without letting locale bytes hide the real failure."""
     raw = completed.stderr.strip() or completed.stdout.strip()
-    return fallback if not raw else raw.decode("utf-8", errors="replace")
+    bounded = raw[:_MAX_DIAGNOSTIC_BYTES]
+    return fallback if not bounded else bounded.decode("utf-8", errors="replace")
 
 
 def _verified_key_fingerprint(completed: subprocess.CompletedProcess[bytes]) -> str:
@@ -437,12 +758,28 @@ def _verified_key_fingerprint(completed: subprocess.CompletedProcess[bytes]) -> 
     return next(iter(fingerprints))
 
 
-def _ssh_keygen() -> None:
-    """Require the external verifier explicitly rather than failing mid-operation."""
-    if shutil.which("ssh-keygen") is None:
-        raise ProtocolSignatureError(
-            "ssh-keygen with OpenSSH signature support is required for benchmark protocols"
-        )
+def _ssh_keygen() -> Path:
+    """Resolve OpenSSH only from a fixed platform allowlist.
+
+    Ambient ``PATH`` is deliberately irrelevant: a same-user executable must not be able
+    to claim that an arbitrary governance artifact verified successfully.
+    """
+    candidates = (
+        (Path(r"C:\Windows\System32\OpenSSH\ssh-keygen.exe"),)
+        if os.name == "nt"
+        else (Path("/usr/bin/ssh-keygen"),)
+    )
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+            metadata = resolved.stat()
+        except OSError:
+            continue
+        if stat.S_ISREG(metadata.st_mode) and os.access(resolved, os.X_OK):
+            return resolved
+    raise ProtocolSignatureError(
+        "a fixed system ssh-keygen with OpenSSH signature support is required"
+    )
 
 
 def _require_regular_file(path: Path, label: str) -> bytes:

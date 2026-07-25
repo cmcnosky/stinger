@@ -1,25 +1,39 @@
-# Outside validation workflow
+# Machine conformance and cross-machine workflow
 
-Benchmark v1 needs evidence from people who did not build Stinger.
+Protocol 2 uses artifact-bound environment evidence instead of beta-operator reports.
 
-Three outside beta operators each run the public development suite and record whether setup
-errors, protocol ambiguities, and interpretation differences occurred—even when the answer
-is “none.” Their records contain identities and non-secret findings, never active sealed
-material.
+The public development/conformance workflow must complete in at least three clean,
+fingerprint-distinct environments spanning at least two platform/architecture pairs. Each
+`ConformanceEnvironmentRecord` binds its environment ID, platform, architecture, Python
+version, exact Stinger commit, benchmark protocol version, rubric version, active corpus
+hash, environment fingerprint, workflow input and receipt hashes, receipt signature hash,
+signer identity, and supplied trust-policy hash. All records must bind the same workflow
+input and the one baseline commit; the required environment, receipt, and signature
+distinctness and platform diversity fail closed.
 
-After the protocol and corpus freeze, one unaffiliated evaluator receives the
-access-controlled escrow bundle and reproduces one complete five-family baseline on a
-separate machine. The evaluator verifies the independently obtained protocol signer trust
-policy, exact inventories, score and interval recomputation, corpus hash, configuration
-pins, and every discrepancy. An unreconciled discrepancy blocks release.
+The record is an artifact binding, not an assertion that merely naming a signer proves
+execution. The workflow that creates it must preserve the separately supplied trust
+evidence whose exact hashes the record carries.
 
-The evaluator records those checks in an `IndependentReproductionStatement` that binds the
-target and reproduced reports, canonical agent-configuration fingerprints, public and
-escrow manifest hashes, distinct machine fingerprints, comparison artifact, and exact
-discrepancy ledger. The evaluator signs the statement under the dedicated reproduction
-signature namespace. Release verification receives the evaluator's `allowed_signers`
-policy out of band; project-supplied trust is not accepted as proof of independence.
+After protocol and corpus freeze, one complete five-family sealed baseline is reproduced
+under the same protocol, corpus, configuration, and agent fingerprints with separately
+constructed public/escrow bundles, a distinct host-derived environment commitment, and
+separately signed workflow evidence.
 
-These are human coordination gates. The repository supplies schemas and verification tools;
-it cannot truthfully manufacture outside operators, independence, separate-machine
-execution, or Chris's final approval.
+The artifact-derived builder verifies both target and reproduced bundle pairs, target
+baseline equality, report signatures, structural identity, modal outcomes, deterministic
+ordering, statistics, containment, pins, and leakage policy. It emits an automatic
+classification-only discrepancy ledger. Structural or modal mismatch is fatal; a
+per-repetition difference may carry only
+`expected_agent_variance_modal_stable`. There is no free-text resolution or override.
+
+The cross-machine role signs the exact reproduced report and then the derived reproduction
+statement under separate namespaces. `release-check` receives the signed statement and
+separately supplied trust policy; it does not receive the active corpus or escrow.
+
+These controls establish machine evidence and cryptographic role separation. The
+host-derived commitments detect environment reuse or disagreement, but do not prove TPM
+or physical hardware identity, cloud-provider origin, organizational affiliation,
+operator independence, or resistance to cloning. Chris's separate final release signature
+remains required after all machine gates pass; it authorizes publication and is not a run
+review.

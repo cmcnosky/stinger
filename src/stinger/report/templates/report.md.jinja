@@ -22,8 +22,9 @@
 ## Benchmark provenance and uncertainty
 
 This run carries benchmark-protocol metadata, but this report alone does **not** establish
-benchmark publication eligibility. Corpus review, baseline-matrix, leakage, external
-reproduction, and human release gates are checked separately.
+benchmark publication eligibility. Machine corpus construction, baseline-matrix, leakage,
+conformance, cross-environment reproduction, and final operator authorization are checked
+separately.
 
 | Pin | Value |
 |---|---|
@@ -124,5 +125,5 @@ its input (SPEC.md §9).
 
 - Judge model: `{{ report.judge_assisted.judge_model }}`
 - Prompt version: `{{ report.judge_assisted.judge_prompt_version }}`
-- Flagged for human review: {{ report.judge_assisted.needs_review | join(", ") or "none" }}
+- Flagged for optional operator inspection: {{ report.judge_assisted.needs_review | join(", ") or "none" }}
 {% endif %}

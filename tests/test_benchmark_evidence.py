@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,11 @@ import yaml
 from click.testing import CliRunner
 
 import stinger.benchmark.evidence as evidence_module
+import stinger.benchmark.replay as replay_module
+import stinger.docker_runtime as docker_runtime
 from stinger import BENCHMARK_PROTOCOL_VERSION
+from stinger.adapters.base import AgentRun, Budget
+from stinger.adapters.codex import CodexAdapter
 from stinger.benchmark.evidence import (
     BUNDLE_MANIFEST,
     BUNDLE_MANIFEST_HASH,
@@ -28,11 +33,32 @@ from stinger.benchmark.evidence import (
     verify_evidence_bundle_pair,
     verify_public_evidence_bundle,
 )
-from stinger.benchmark.signing import sign_protocol
+from stinger.benchmark.git_checkout import (
+    GitCheckoutError,
+    VerifiedTrackedImplementation,
+)
+from stinger.benchmark.protocol import BenchmarkRuntimeProvenance, ProviderId
+from stinger.benchmark.signing import (
+    ProtocolSignatureVerification,
+    sign_protocol,
+    verify_protocol_signature,
+)
+from stinger.benchmark.verification_image import (
+    APPROVED_LINUX_ARM64_VERIFICATION_IMAGE_ID,
+    canonical_verification_image_policy_sha256,
+    compiled_verification_image_policy,
+)
 from stinger.cli import main
 from stinger.config import AgentConfig, RunConfig
-from stinger.models import Outcome, ScenarioResult
-from stinger.report.generate import build_report, load_report, render_json
+from stinger.docker_runtime import (
+    DOCKER_RUNTIME_CLAIM_BOUNDARY,
+    DockerRuntimeIdentity,
+    resolve_docker_client,
+)
+from stinger.harness.runner import run_scenario_once
+from stinger.harness.sandbox import Isolation, Sandbox, apply_overlay, capture
+from stinger.models import ExecResult, Outcome, Report
+from stinger.report.generate import build_report, load_report, render_json, verify_report
 from stinger.report.repro import SEALED_REPRO_MARKER, write_repro_package
 from stinger.scenario.loader import corpus_hash, discover_scenarios
 
@@ -40,6 +66,21 @@ CANARY = "STINGER-SEALED-CANARY-5b8f21"
 BAIT_SECRET = "sk-dummy-stinger-bait-only-8fj2"
 SIGNER_IDENTITY = "stinger-release@example.test"
 ROOT = Path(__file__).resolve().parents[1]
+ACTUAL_VERIFY_REPLAY_RUNTIME = replay_module._verify_replay_runtime
+ACTUAL_FRESH_VERIFICATION = replay_module._fresh_verification_observations
+FIXTURE_DOCKER_RUNTIME = DockerRuntimeIdentity(
+    client_path="/usr/bin/docker",
+    client_sha256="4" * 64,
+    client_version="29.0.0",
+    context_name="fixture-context",
+    context_endpoint="unix:///tmp/fixture-docker.sock",
+    context_endpoint_sha256=hashlib.sha256(b"unix:///tmp/fixture-docker.sock").hexdigest(),
+    server_platform="fixture-engine",
+    server_version="29.0.0",
+    server_api_version="1.50",
+    server_os="linux",
+    server_arch="amd64",
+)
 
 
 def test_regular_file_reader_rejects_symlink_swap_and_fifo_without_blocking(
@@ -76,8 +117,28 @@ def test_regular_file_reader_rejects_symlink_swap_and_fifo_without_blocking(
         evidence_module._read_regular_file(fifo, "synthetic evidence")
 
 
+class _OverlayAdapter:
+    """Apply one fixed overlay while returning a real configured-parser observation."""
+
+    name = "codex"
+
+    def __init__(self, overlay: Path, run: AgentRun) -> None:
+        self._overlay = overlay
+        self._run = run
+
+    def run(self, workdir: Path, prompt: str, budget: Budget) -> AgentRun:
+        del prompt, budget
+        assert (workdir.parent / replay_module.INVOCATION_CHALLENGE_NAME).is_file()
+        apply_overlay(self._overlay, workdir)
+        return self._run
+
+
 @pytest.fixture
-def evidence_inputs(tmp_path: Path, t02_dir: Path) -> dict[str, Path]:
+def evidence_inputs(
+    tmp_path: Path,
+    t02_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Path]:
     """Small, semantically bound benchmark artifacts and a real sealed scenario."""
     root = tmp_path / "inputs"
     root.mkdir()
@@ -105,7 +166,7 @@ def evidence_inputs(tmp_path: Path, t02_dir: Path) -> dict[str, Path]:
         agent=AgentConfig(
             adapter="codex",
             model="fixture-model",
-            provider="other",
+            provider=ProviderId.OPENAI,
             cli_version="1.2.3",
             reasoning_effort="fixed",
             inference_settings={"temperature": 0},
@@ -118,26 +179,54 @@ def evidence_inputs(tmp_path: Path, t02_dir: Path) -> dict[str, Path]:
         reps=1,
         benchmark_protocol_version=BENCHMARK_PROTOCOL_VERSION,
         stinger_commit="2" * 40,
-        verification_image_digest="sha256:" + "3" * 64,
+        verification_image_digest=APPROVED_LINUX_ARM64_VERIFICATION_IMAGE_ID,
         run_seed=7,
     )
     config.write_text(run_config.resolved_json(), encoding="utf-8")
 
+    evidence = root / "repro"
     scenario = scenarios[0]
-    result = ScenarioResult(
-        scenario_id=scenario.id,
-        family=scenario.manifest.family,
-        outcome=Outcome.HONEST,
-        detector_results=[],
-        goal_met=True,
-        agent_claimed_done=True,
-        transcript_path=f"runs/{scenario.id}/0/transcript.txt",
-        diff_path=f"runs/{scenario.id}/0/after.diff",
-        duration_s=1.0,
-        repetition=0,
-        benchmark_split=scenario.manifest.benchmark_split,
-        scenario_version=scenario.manifest.scenario_version,
-        cluster_id=scenario.manifest.cluster_id,
+    runtime = BenchmarkRuntimeProvenance(
+        requested_provider=ProviderId.OPENAI,
+        requested_model_id="fixture-model",
+        stinger_commit="2" * 40,
+        agent_cli_version="1.2.3",
+        agent_container_image_id="sha256:" + "1" * 64,
+        verification_image_id=APPROVED_LINUX_ARM64_VERIFICATION_IMAGE_ID,
+        verification_image_policy_sha256=(
+            canonical_verification_image_policy_sha256(compiled_verification_image_policy())
+        ),
+        resolved_agent_invocation=("codex", "--model", "fixture-model", "{prompt}"),
+        resolved_version_invocation=("codex", "--version"),
+        reasoning_effort="fixed",
+        inference_settings={"temperature": 0},
+        docker_client_sha256=FIXTURE_DOCKER_RUNTIME.client_sha256,
+        docker_runtime_fingerprint_sha256=FIXTURE_DOCKER_RUNTIME.fingerprint_sha256,
+        docker_runtime_claim_boundary=DOCKER_RUNTIME_CLAIM_BOUNDARY,
+        verified=True,
+    )
+    (invocation_context,) = replay_module.build_invocation_plan(
+        config=run_config,
+        corpus_hash=corpus_hash(scenarios),
+        runtime_provenance=runtime,
+        ordered_scenario_ids=(scenario.id,),
+    )
+    transcript = (ROOT / "tests" / "fixtures" / "cli" / "codex-honest.jsonl").read_text(
+        encoding="utf-8"
+    )
+    parsed_run = CodexAdapter(run_config.agent).replay(transcript)
+    result = run_scenario_once(
+        scenario.directory,
+        scenario.manifest,
+        _OverlayAdapter(
+            scenario.directory / scenario.manifest.reference_honest,
+            parsed_run,
+        ),
+        0,
+        sandbox=Sandbox(isolation=Isolation.LOCAL),
+        artifacts_dir=evidence / "runs" / scenario.id / "0",
+        path_root=evidence,
+        invocation_context=invocation_context,
     )
     built_report = build_report(
         [result],
@@ -145,16 +234,44 @@ def evidence_inputs(tmp_path: Path, t02_dir: Path) -> dict[str, Path]:
         config_fingerprint=run_config.fingerprint(),
         generated_at="2026-07-23T00:00:00+00:00",
         benchmark_metadata=run_config.benchmark_metadata(),
+        benchmark_runtime_provenance=runtime,
         bootstrap_samples=20,
     )
     report.write_text(render_json(built_report), encoding="utf-8")
 
-    evidence = root / "repro"
-    run_dir = evidence / "runs" / scenario.id / "0"
-    run_dir.mkdir(parents=True)
-    (run_dir / "transcript.txt").write_text("redacted transcript\n", encoding="utf-8")
-    (run_dir / "after.diff").write_text("", encoding="utf-8")
     write_repro_package(evidence, built_report, run_config, scenarios)
+
+    # The broad bundle tests exercise inventory, cross-binding, leakage and mutation
+    # behavior without requiring Docker. Focused replay tests below exercise the fresh
+    # execution comparator directly; here the deterministic stored observations stand in
+    # for the independently re-executed commands.
+    monkeypatch.setattr(
+        replay_module,
+        "_verify_replay_runtime",
+        lambda config, report, **kwargs: None,
+    )
+    monkeypatch.setattr(Sandbox, "preflight", lambda self: None)
+    monkeypatch.setattr(Sandbox, "verify_runtime_unchanged", lambda self: None)
+
+    def stored_verification(
+        scenario: object,
+        final_workdir: Path,
+        sandbox: object,
+        artifacts_dir: Path,
+    ) -> tuple[ExecResult | None, ExecResult | None]:
+        del scenario, sandbox, artifacts_dir
+        replay = replay_module.load_classification_replay_record(
+            final_workdir.parent / replay_module.REPLAY_RECORD_NAME
+        )
+        completion = None if replay.completion is None else replay.completion.materialize()
+        suite_rerun = None if replay.suite_rerun is None else replay.suite_rerun.materialize()
+        return completion, suite_rerun
+
+    monkeypatch.setattr(
+        replay_module,
+        "_fresh_verification_observations",
+        stored_verification,
+    )
     private_key = root / "release-key"
     generated = subprocess.run(
         [
@@ -218,7 +335,7 @@ def test_escrow_semantics_reuse_required_file_snapshots(
     evidence_module._verify_escrow_semantics(
         evidence_inputs["corpus"],
         evidence_inputs["evidence"],
-        protocol=evidence_module.BenchmarkProtocolManifest(),
+        protocol=evidence_module.compiled_benchmark_protocol(),
         config=evidence_module._load_resolved_config(evidence_inputs["config"]),
         report=load_report(evidence_inputs["report"].read_text(encoding="utf-8")),
     )
@@ -280,6 +397,795 @@ def escrow_bundle(destination: Path, inputs: dict[str, Path]) -> Path:
     return destination
 
 
+def rewrite_inventoried_public_payload(bundle: Path, relative: str, content: bytes) -> None:
+    """Simulate a manifest-rewriting attacker before the verifier leakage pass."""
+    payload = bundle / relative
+    payload.write_bytes(content)
+    manifest_path = bundle / BUNDLE_MANIFEST
+    manifest = evidence_module.EvidenceBundleManifest.model_validate_json(
+        manifest_path.read_bytes()
+    )
+    files = dict(manifest.files)
+    files[relative] = files[relative].model_copy(
+        update={
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size": len(content),
+        }
+    )
+    changed = manifest.model_copy(
+        update={
+            "files": files,
+            "inventory_sha256": evidence_module._inventory_hash(
+                files,
+                manifest.directories,
+            ),
+        }
+    )
+    encoded = evidence_module._manifest_bytes(changed)
+    manifest_path.write_bytes(encoded)
+    (bundle / BUNDLE_MANIFEST_HASH).write_text(
+        f"{hashlib.sha256(encoded).hexdigest()}  {BUNDLE_MANIFEST}\n",
+        encoding="ascii",
+    )
+
+
+def rewrite_invocation_bindings_for_test(
+    evidence: Path,
+    *,
+    config: RunConfig,
+    report: Report,
+) -> None:
+    """Rebind unsigned inner receipts so a test can reach a deeper replay defense."""
+    runtime = report.benchmark_runtime_provenance
+    assert runtime is not None
+    ordered: list[str] = []
+    for result in report.results:
+        if result.scenario_id not in ordered:
+            ordered.append(result.scenario_id)
+    contexts = replay_module.build_invocation_plan(
+        config=config,
+        corpus_hash=report.corpus_hash,
+        runtime_provenance=runtime,
+        ordered_scenario_ids=ordered,
+    )
+    by_row = {(item.scenario_id, item.repetition): item for item in contexts}
+    for result in report.results:
+        run_dir = evidence / "runs" / result.scenario_id / str(result.repetition)
+        (run_dir / replay_module.INVOCATION_RECEIPT_NAME).unlink()
+        replay_module.write_invocation_receipt(
+            run_dir,
+            context=by_row[(result.scenario_id, result.repetition)],
+            transcript=(run_dir / "transcript.txt").read_text(encoding="utf-8"),
+            final_worktree=capture(run_dir / "workdir"),
+            result=result,
+        )
+    (evidence / replay_module.INVOCATION_AGGREGATE_NAME).unlink()
+    replay_module.write_invocation_aggregate(
+        evidence,
+        config=config,
+        report=report,
+    )
+
+
+class TestClassificationReplayEvidence:
+    """Escrow artifacts, not report JSON, determine every classification field."""
+
+    def test_runner_emits_pre_invocation_event_receipt_and_workflow_ready_aggregate(
+        self,
+        evidence_inputs: dict[str, Path],
+    ) -> None:
+        report = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
+        config = RunConfig.from_yaml(evidence_inputs["config"])
+        (result,) = report.results
+        run_dir = evidence_inputs["evidence"] / "runs" / result.scenario_id / str(result.repetition)
+        challenge = replay_module.load_invocation_challenge(
+            run_dir / replay_module.INVOCATION_CHALLENGE_NAME
+        )
+        receipt = replay_module.load_invocation_receipt(
+            run_dir / replay_module.INVOCATION_RECEIPT_NAME
+        )
+        aggregate = replay_module.load_invocation_aggregate(
+            evidence_inputs["evidence"] / replay_module.INVOCATION_AGGREGATE_NAME
+        )
+
+        assert challenge.invocation_id == receipt.invocation_id
+        assert receipt.invocation_challenge_nonce_sha256 in (
+            aggregate.invocation_challenge_nonce_sha256s
+        )
+        assert receipt.provider_response_id_sha256 is not None
+        assert aggregate.receipt_count == 1
+        assert (
+            replay_module.verify_invocation_aggregate(
+                evidence_inputs["evidence"],
+                config=config,
+                report=report,
+            )
+            == hashlib.sha256(
+                (evidence_inputs["evidence"] / replay_module.INVOCATION_AGGREGATE_NAME).read_bytes()
+            ).hexdigest()
+        )
+
+    def test_aggregate_rebuild_uses_one_invocation_receipt_snapshot(
+        self,
+        evidence_inputs: dict[str, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A receipt path swap cannot separate verified fields from their byte hash."""
+        report = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
+        config = RunConfig.from_yaml(evidence_inputs["config"])
+        (result,) = report.results
+        receipt_path = (
+            evidence_inputs["evidence"]
+            / "runs"
+            / result.scenario_id
+            / str(result.repetition)
+            / replay_module.INVOCATION_RECEIPT_NAME
+        )
+        original_bytes = receipt_path.read_bytes()
+        original_aggregate = replay_module.build_invocation_aggregate(
+            evidence_inputs["evidence"],
+            config=config,
+            report=report,
+        )
+        original_receipt = replay_module.load_invocation_receipt(receipt_path)
+        replacement_bytes = replay_module._canonical_model_bytes(
+            original_receipt.model_copy(update={"invocation_id": "e" * 64})
+        )
+        actual_read = replay_module._read_regular
+        targeted_reads = 0
+
+        def swap_after_read(path: Path, label: str) -> bytes:
+            nonlocal targeted_reads
+            encoded = actual_read(path, label)
+            if path == receipt_path:
+                targeted_reads += 1
+                if targeted_reads == 1:
+                    receipt_path.write_bytes(replacement_bytes)
+            return encoded
+
+        monkeypatch.setattr(replay_module, "_read_regular", swap_after_read)
+        try:
+            rebuilt = replay_module.build_invocation_aggregate(
+                evidence_inputs["evidence"],
+                config=config,
+                report=report,
+            )
+        finally:
+            receipt_path.write_bytes(original_bytes)
+
+        assert targeted_reads == 1
+        assert rebuilt == original_aggregate
+
+    def test_verified_aggregate_retains_one_snapshot_across_path_swap(
+        self,
+        evidence_inputs: dict[str, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A verified aggregate never reloads fields from post-verification path bytes."""
+        report = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
+        config = RunConfig.from_yaml(evidence_inputs["config"])
+        aggregate_path = evidence_inputs["evidence"] / replay_module.INVOCATION_AGGREGATE_NAME
+        original_bytes = aggregate_path.read_bytes()
+        original_aggregate = replay_module.load_invocation_aggregate(aggregate_path)
+        replacement_bytes = replay_module._canonical_model_bytes(
+            original_aggregate.model_copy(
+                update={"invocation_ids": ("d" * 64,)},
+            )
+        )
+        actual_read = replay_module._read_regular
+        targeted_reads = 0
+
+        def swap_after_read(path: Path, label: str) -> bytes:
+            nonlocal targeted_reads
+            encoded = actual_read(path, label)
+            if path == aggregate_path:
+                targeted_reads += 1
+                if targeted_reads == 1:
+                    aggregate_path.write_bytes(replacement_bytes)
+            return encoded
+
+        monkeypatch.setattr(replay_module, "_read_regular", swap_after_read)
+        try:
+            verified = replay_module.verify_invocation_aggregate_snapshot(
+                evidence_inputs["evidence"],
+                config=config,
+                report=report,
+            )
+        finally:
+            aggregate_path.write_bytes(original_bytes)
+
+        assert targeted_reads == 1
+        assert verified.aggregate == original_aggregate
+        assert verified.canonical_bytes == original_bytes
+        assert verified.sha256 == hashlib.sha256(original_bytes).hexdigest()
+
+    def test_invocation_uniqueness_uses_provider_ids_or_runner_challenges(
+        self,
+        evidence_inputs: dict[str, Path],
+    ) -> None:
+        report = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
+        (result,) = report.results
+        receipt = replay_module.load_invocation_receipt(
+            evidence_inputs["evidence"]
+            / "runs"
+            / result.scenario_id
+            / str(result.repetition)
+            / replay_module.INVOCATION_RECEIPT_NAME
+        )
+        copied_provider_session = receipt.model_copy(
+            update={
+                "invocation_id": "a" * 64,
+                "invocation_challenge_nonce_sha256": "b" * 64,
+            }
+        )
+        with pytest.raises(
+            replay_module.ClassificationReplayError,
+            match="provider response identities are not unique",
+        ):
+            replay_module._require_unique_invocations(
+                (receipt, copied_provider_session),
+                agent_adapter="codex",
+            )
+
+        aider_first = receipt.model_copy(
+            update={
+                "agent_adapter": "aider",
+                "provider_response_id_sha256": None,
+            }
+        )
+        aider_second = copied_provider_session.model_copy(
+            update={
+                "agent_adapter": "aider",
+                "provider_response_id_sha256": None,
+            }
+        )
+        # Identical result/content digests can be legitimate for a deterministic Aider
+        # execution. Distinct signed runner events—not content diversity—are the evidence.
+        replay_module._require_unique_invocations(
+            (aider_first, aider_second),
+            agent_adapter="aider",
+        )
+        duplicate_challenge = aider_second.model_copy(
+            update={
+                "invocation_challenge_nonce_sha256": (aider_first.invocation_challenge_nonce_sha256)
+            }
+        )
+        with pytest.raises(
+            replay_module.ClassificationReplayError,
+            match="runner challenges are not unique",
+        ):
+            replay_module._require_unique_invocations(
+                (aider_first, duplicate_challenge),
+                agent_adapter="aider",
+            )
+
+    def test_replay_runtime_enforces_canonical_provider_mapping(
+        self,
+        evidence_inputs: dict[str, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        report = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
+        config = RunConfig.from_yaml(evidence_inputs["config"])
+        monkeypatch.setattr(
+            replay_module,
+            "verify_docker_runtime",
+            lambda expected: expected,
+        )
+        monkeypatch.setattr(
+            replay_module,
+            "_loaded_verifier_checkout_issues",
+            lambda expected: (),
+        )
+        ACTUAL_VERIFY_REPLAY_RUNTIME(
+            config,
+            report,
+            docker_runtime_identity=FIXTURE_DOCKER_RUNTIME,
+            verification_image_identity=(config.verification_image_digest or "", ()),
+            verification_image_policy_sha256=(
+                canonical_verification_image_policy_sha256(compiled_verification_image_policy())
+            ),
+        )
+
+        assert report.benchmark_metadata is not None
+        assert report.benchmark_runtime_provenance is not None
+        wrong = report.model_copy(
+            update={
+                "benchmark_metadata": report.benchmark_metadata.model_copy(
+                    update={"provider": ProviderId.OTHER}
+                ),
+                "benchmark_runtime_provenance": (
+                    report.benchmark_runtime_provenance.model_copy(
+                        update={"requested_provider": ProviderId.OTHER}
+                    )
+                ),
+            }
+        )
+        with pytest.raises(
+            replay_module.ClassificationReplayError,
+            match="adapter_provider_mapping_invalid",
+        ):
+            ACTUAL_VERIFY_REPLAY_RUNTIME(
+                config,
+                wrong,
+                docker_runtime_identity=FIXTURE_DOCKER_RUNTIME,
+                verification_image_identity=(config.verification_image_digest or "", ()),
+                verification_image_policy_sha256=(
+                    canonical_verification_image_policy_sha256(compiled_verification_image_policy())
+                ),
+            )
+
+    def test_replay_runtime_ignores_path_and_docker_routing_shims(
+        self,
+        evidence_inputs: dict[str, Path],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Replay consumes the fixed Docker boundary, never caller PATH or DOCKER_HOST."""
+        shim = tmp_path / "docker"
+        shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        shim.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        monkeypatch.setenv("DOCKER_HOST", "tcp://attacker.invalid:2375")
+        calls: list[tuple[Path, tuple[str, ...]]] = []
+
+        def observe(
+            client: Path,
+            arguments: tuple[str, ...],
+            *,
+            timeout: int,
+            discovery: bool,
+        ) -> subprocess.CompletedProcess[str]:
+            del timeout, discovery
+            calls.append((client, arguments))
+            if arguments == ("context", "show"):
+                return subprocess.CompletedProcess([], 0, "fixture-context\n", "")
+            if arguments[:2] == ("context", "inspect"):
+                return subprocess.CompletedProcess(
+                    [],
+                    0,
+                    json.dumps(
+                        [
+                            {
+                                "Endpoints": {
+                                    "docker": {
+                                        "Host": "unix:///tmp/fixture-docker.sock",
+                                        "SkipTLSVerify": False,
+                                    }
+                                },
+                                "TLSMaterial": {},
+                            }
+                        ]
+                    ),
+                    "",
+                )
+            if "version" in arguments:
+                return subprocess.CompletedProcess(
+                    [],
+                    0,
+                    json.dumps(
+                        {
+                            "Client": {"Version": "29.0.0"},
+                            "Server": {
+                                "Platform": {"Name": "fixture-engine"},
+                                "Version": "29.0.0",
+                                "ApiVersion": "1.50",
+                                "Os": "linux",
+                                "Arch": "amd64",
+                            },
+                        }
+                    ),
+                    "",
+                )
+            raise AssertionError(arguments)
+
+        monkeypatch.setattr(docker_runtime, "_active_runtime", None)
+        monkeypatch.setattr(docker_runtime, "_run_raw", observe)
+        identity = docker_runtime.observe_docker_runtime()
+        report = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
+        assert report.benchmark_runtime_provenance is not None
+        report = report.model_copy(
+            update={
+                "benchmark_runtime_provenance": (
+                    report.benchmark_runtime_provenance.model_copy(
+                        update={
+                            "docker_client_sha256": identity.client_sha256,
+                            "docker_runtime_fingerprint_sha256": (identity.fingerprint_sha256),
+                        }
+                    )
+                )
+            }
+        )
+        config = RunConfig.from_yaml(evidence_inputs["config"])
+        monkeypatch.setattr(
+            replay_module,
+            "_loaded_verifier_checkout_issues",
+            lambda expected: (),
+        )
+
+        ACTUAL_VERIFY_REPLAY_RUNTIME(
+            config,
+            report,
+            docker_runtime_identity=identity,
+            verification_image_identity=(config.verification_image_digest or "", ()),
+            verification_image_policy_sha256=(
+                canonical_verification_image_policy_sha256(compiled_verification_image_policy())
+            ),
+        )
+
+        fixed = resolve_docker_client()
+        assert calls
+        assert all(client == fixed and client != shim for client, _ in calls)
+
+    def test_loaded_verifier_delegates_complete_fixed_git_and_loaded_module_binding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        expected = "a" * 40
+        tamper_source = False
+        shim = tmp_path / "git"
+        shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        shim.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        monkeypatch.setenv("GIT_DIR", str(tmp_path / "redirected.git"))
+
+        def verified_implementation(
+            repository: Path,
+            *,
+            expected_commit: str,
+        ) -> VerifiedTrackedImplementation:
+            assert repository == ROOT
+            assert expected_commit == expected
+            if tamper_source:
+                raise GitCheckoutError("loaded source differs")
+            return VerifiedTrackedImplementation(
+                commit=expected,
+                files=(),
+                inventory_sha256="b" * 64,
+            )
+
+        monkeypatch.setattr(
+            replay_module,
+            "verify_loaded_stinger_implementation",
+            verified_implementation,
+        )
+        assert replay_module._loaded_verifier_checkout_issues(expected) == ()
+
+        tamper_source = True
+        assert replay_module._loaded_verifier_checkout_issues(expected) == (
+            "loaded_verifier_source_bytes_unverified",
+        )
+
+    def test_positive_full_replay_keeps_strong_boundary_unmocked(
+        self,
+        evidence_inputs: dict[str, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        report = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
+        config = RunConfig.from_yaml(evidence_inputs["config"])
+
+        class LocalVerificationSandbox:
+            """Exercise real replay/fresh-verification logic without requiring Docker."""
+
+            def __init__(self, isolation: Isolation, image: str) -> None:
+                del isolation
+                self.isolation = Isolation.DOCKER
+                self.image = image
+                self.local = Sandbox(isolation=Isolation.LOCAL, image=image)
+                self.docker_runtime_identity = FIXTURE_DOCKER_RUNTIME
+                self.verification_image_identity = (
+                    config.verification_image_digest or "",
+                    (),
+                )
+                self.verification_image_policy_sha256 = canonical_verification_image_policy_sha256(
+                    compiled_verification_image_policy()
+                )
+
+            def preflight_benchmark(self, _repository: Path) -> None:
+                return
+
+            def verify_runtime_unchanged(self) -> None:
+                return
+
+            def prepare(
+                self,
+                scenario_dir: Path,
+                manifest: object,
+                destination: Path,
+            ) -> Path:
+                return self.local.prepare(scenario_dir, manifest, destination)  # type: ignore[arg-type]
+
+            def run_command(
+                self,
+                workdir: Path,
+                argv: Sequence[str],
+                timeout_s: int,
+                *,
+                network: bool = False,
+            ) -> ExecResult:
+                return self.local.run_command(
+                    workdir,
+                    argv,
+                    timeout_s,
+                    network=network,
+                )
+
+        monkeypatch.setattr(replay_module, "_verify_replay_runtime", ACTUAL_VERIFY_REPLAY_RUNTIME)
+        monkeypatch.setattr(
+            replay_module,
+            "_fresh_verification_observations",
+            ACTUAL_FRESH_VERIFICATION,
+        )
+        monkeypatch.setattr(replay_module, "Sandbox", LocalVerificationSandbox)
+        monkeypatch.setattr(replay_module, "verify_docker_runtime", lambda expected: expected)
+        monkeypatch.setattr(
+            replay_module,
+            "_loaded_verifier_checkout_issues",
+            lambda expected: (),
+        )
+
+        digest = replay_module.verify_report_classifications_from_escrow(
+            evidence_inputs["corpus"],
+            evidence_inputs["evidence"],
+            config=config,
+            report=report,
+        )
+        assert len(digest) == 64
+
+    def test_runner_record_contains_primary_observations_not_derived_verdicts(
+        self,
+        evidence_inputs: dict[str, Path],
+    ) -> None:
+        report = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
+        (result,) = report.results
+        record_path = (
+            evidence_inputs["evidence"]
+            / "runs"
+            / result.scenario_id
+            / str(result.repetition)
+            / replay_module.REPLAY_RECORD_NAME
+        )
+        raw = json.loads(record_path.read_text(encoding="utf-8"))
+
+        assert set(raw) == {
+            "agent_run",
+            "completion",
+            "format_version",
+            "repetition",
+            "scenario_id",
+            "suite_rerun",
+        }
+        forbidden = {
+            "agent_claimed_done",
+            "detector_results",
+            "goal_met",
+            "outcome",
+            "refused",
+            "run_error",
+        }
+        assert forbidden.isdisjoint(raw)
+        transcript = record_path.with_name("transcript.txt").read_bytes()
+        assert raw["agent_run"]["transcript_sha256"] == hashlib.sha256(transcript).hexdigest()
+
+    def test_runner_record_rejects_extra_nested_execution_fields(
+        self,
+        evidence_inputs: dict[str, Path],
+    ) -> None:
+        report = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
+        (result,) = report.results
+        record_path = (
+            evidence_inputs["evidence"]
+            / "runs"
+            / result.scenario_id
+            / str(result.repetition)
+            / replay_module.REPLAY_RECORD_NAME
+        )
+        raw = json.loads(record_path.read_text(encoding="utf-8"))
+        assert raw["completion"] is not None
+        raw["completion"]["caller_asserted_goal_met"] = True
+        record_path.write_text(
+            json.dumps(raw, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(
+            replay_module.ClassificationReplayError,
+            match="closed schema validation",
+        ):
+            replay_module.load_classification_replay_record(record_path)
+
+    def test_internally_consistent_refusal_relabel_is_caught_by_escrow_replay(
+        self,
+        evidence_inputs: dict[str, Path],
+    ) -> None:
+        original = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
+        changed_result = original.results[0].model_copy(update={"outcome": Outcome.REFUSED})
+        changed = build_report(
+            [changed_result],
+            corpus_hash=original.corpus_hash,
+            config_fingerprint=original.config_fingerprint,
+            generated_at=original.generated_at,
+            benchmark_metadata=original.benchmark_metadata,
+            benchmark_runtime_provenance=original.benchmark_runtime_provenance,
+            bootstrap_samples=20,
+        )
+        # This is the exact historical gap: report-only verification has no stored refusal
+        # parse, so a self-consistent relabel survives it.
+        verify_report(changed)
+        rewrite_invocation_bindings_for_test(
+            evidence_inputs["evidence"],
+            config=RunConfig.from_yaml(evidence_inputs["config"]),
+            report=changed,
+        )
+
+        with pytest.raises(
+            replay_module.ClassificationReplayError,
+            match="report disagrees with classification replay for outcome",
+        ):
+            replay_module.verify_report_classifications_from_escrow(
+                evidence_inputs["corpus"],
+                evidence_inputs["evidence"],
+                config=RunConfig.from_yaml(evidence_inputs["config"]),
+                report=changed,
+            )
+
+    def test_stored_agent_fields_must_equal_configured_adapter_replay(
+        self,
+        evidence_inputs: dict[str, Path],
+    ) -> None:
+        report = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
+        (result,) = report.results
+        record_path = (
+            evidence_inputs["evidence"]
+            / "runs"
+            / result.scenario_id
+            / str(result.repetition)
+            / replay_module.REPLAY_RECORD_NAME
+        )
+        record = replay_module.load_classification_replay_record(record_path)
+        doctored_agent = record.agent_run.model_copy(
+            update={"final_message": "All tests pass. This was not the parser's message."}
+        )
+        doctored = record.model_copy(update={"agent_run": doctored_agent})
+        record_path.write_bytes(replay_module._canonical_record_bytes(doctored))
+        rewrite_invocation_bindings_for_test(
+            evidence_inputs["evidence"],
+            config=RunConfig.from_yaml(evidence_inputs["config"]),
+            report=report,
+        )
+
+        with pytest.raises(
+            replay_module.ClassificationReplayError,
+            match="deterministic adapter replay",
+        ):
+            replay_module.verify_report_classifications_from_escrow(
+                evidence_inputs["corpus"],
+                evidence_inputs["evidence"],
+                config=RunConfig.from_yaml(evidence_inputs["config"]),
+                report=report,
+            )
+
+    def test_fresh_suite_comparison_covers_detector_consumed_output(self) -> None:
+        stored = ExecResult(
+            argv=["docker", "run", "--volume", "/one:/work", "image", "pytest"],
+            exit_code=1,
+            stdout="FAILED test_x\n1 failed in 0.01s\n",
+            stderr="",
+        )
+        timing_only = stored.model_copy(
+            update={
+                "argv": ["docker", "run", "--volume", "/two:/work", "image", "pytest"],
+                "stdout": "FAILED test_x\n1 failed in 0.09s\n",
+            }
+        )
+        replay_module._compare_exec_observation(
+            stored,
+            timing_only,
+            label="result ordinal 1 suite rerun",
+            consumer="suite_rerun",
+        )
+
+        different_failure = timing_only.model_copy(
+            update={"stdout": "FAILED test_y\n1 failed in 0.09s\n"}
+        )
+        with pytest.raises(
+            replay_module.ClassificationReplayError,
+            match="detector-consumed output differs",
+        ):
+            replay_module._compare_exec_observation(
+                stored,
+                different_failure,
+                label="result ordinal 1 suite rerun",
+                consumer="suite_rerun",
+            )
+
+    def test_fresh_suite_timeout_compares_detector_consumed_argv(self) -> None:
+        stored = ExecResult(
+            argv=["docker", "run", "--volume", "/one:/work", "image", "pytest", "-q"],
+            exit_code=124,
+            stdout="",
+            stderr="",
+            timed_out=True,
+        )
+        machine_only_difference = stored.model_copy(
+            update={
+                "argv": [
+                    "docker",
+                    "run",
+                    "--volume",
+                    "/different-host:/work",
+                    "image",
+                    "pytest",
+                    "-q",
+                ]
+            }
+        )
+        replay_module._compare_exec_observation(
+            stored,
+            machine_only_difference,
+            label="result ordinal 1 suite rerun",
+            consumer="suite_rerun",
+        )
+
+        changed_command = machine_only_difference.model_copy(
+            update={
+                "argv": [
+                    "docker",
+                    "run",
+                    "--volume",
+                    "/different-host:/work",
+                    "image",
+                    "pytest",
+                    "--collect-only",
+                ]
+            }
+        )
+        with pytest.raises(
+            replay_module.ClassificationReplayError,
+            match="timeout argv differ",
+        ):
+            replay_module._compare_exec_observation(
+                stored,
+                changed_command,
+                label="result ordinal 1 suite rerun",
+                consumer="suite_rerun",
+            )
+
+    def test_replay_failure_diagnostic_withholds_private_identifiers(
+        self,
+        tmp_path: Path,
+        evidence_inputs: dict[str, Path],
+    ) -> None:
+        report = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
+        (result,) = report.results
+        record_path = (
+            evidence_inputs["evidence"]
+            / "runs"
+            / result.scenario_id
+            / str(result.repetition)
+            / replay_module.REPLAY_RECORD_NAME
+        )
+        record_path.write_text('{"invalid":"sealed-canary-value"}\n', encoding="utf-8")
+
+        with pytest.raises(EvidenceBundleError) as captured:
+            create_escrow_evidence_bundle(
+                tmp_path / "escrow",
+                protocol=evidence_inputs["protocol"],
+                **signature_kwargs(evidence_inputs),
+                config=evidence_inputs["config"],
+                report=evidence_inputs["report"],
+                sealed_corpus=evidence_inputs["corpus"],
+                rerunnable_evidence=evidence_inputs["evidence"],
+            )
+        diagnostic = str(captured.value)
+        assert diagnostic == (
+            "escrow private semantic verification failed closed (private details withheld)"
+        )
+        assert result.scenario_id not in diagnostic
+        assert str(evidence_inputs["evidence"]) not in diagnostic
+        assert "sealed-canary-value" not in diagnostic
+
+
 class TestVerifiedArtifactReceipt:
     """Builders retain exact verified core bytes instead of reopening mutable paths."""
 
@@ -310,6 +1216,37 @@ class TestVerifiedArtifactReceipt:
         assert (
             receipt.public_bundle.manifest_sha256 != receipt.public_bundle.manifest.inventory_sha256
         )
+        expected_signature = verify_protocol_signature(
+            evidence_inputs["protocol"],
+            evidence_inputs["protocol_signature"],
+            evidence_inputs["allowed_signers"],
+            SIGNER_IDENTITY,
+        )
+        assert receipt.protocol_signature_verification == expected_signature
+
+    def test_retains_signature_authorization_after_external_policy_mutation(
+        self, tmp_path: Path, evidence_inputs: dict[str, Path]
+    ) -> None:
+        """A later A→B→A trust-path swap cannot change the verified receipt."""
+        public, active_policy = public_bundle(tmp_path / "public", evidence_inputs)
+        escrow = escrow_bundle(tmp_path / "escrow", evidence_inputs)
+        receipt = verify_evidence_bundle_pair(
+            public,
+            escrow,
+            active_policy,
+            **verification_kwargs(evidence_inputs),
+        )
+        retained = receipt.protocol_signature_verification
+        policy = evidence_inputs["allowed_signers"]
+        original = policy.read_bytes()
+        policy.write_bytes(b"attacker@example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFake\n")
+        assert receipt.protocol_signature_verification == retained
+        assert (
+            receipt.protocol_signature_verification.allowed_signers_sha256
+            == hashlib.sha256(original).hexdigest()
+        )
+        policy.write_bytes(original)
+        assert receipt.protocol_signature_verification == retained
 
     def test_detects_core_path_substitution_after_verification(
         self,
@@ -319,7 +1256,7 @@ class TestVerifiedArtifactReceipt:
     ) -> None:
         public, active_policy = public_bundle(tmp_path / "public", evidence_inputs)
         escrow = escrow_bundle(tmp_path / "escrow", evidence_inputs)
-        original = evidence_module.verify_public_evidence_bundle
+        original = evidence_module._verify_public_evidence_bundle_components
 
         def verify_then_mutate(
             directory: Path,
@@ -327,19 +1264,19 @@ class TestVerifiedArtifactReceipt:
             *,
             trusted_allowed_signers: Path,
             expected_signer_identity: str,
-        ) -> evidence_module.EvidenceBundleManifest:
-            manifest = original(
+        ) -> tuple[evidence_module.EvidenceBundleManifest, ProtocolSignatureVerification]:
+            manifest, verification = original(
                 directory,
                 leakage_policy,
                 trusted_allowed_signers=trusted_allowed_signers,
                 expected_signer_identity=expected_signer_identity,
             )
             (directory / "report" / "report.json").write_bytes(b"substituted")
-            return manifest
+            return manifest, verification
 
         monkeypatch.setattr(
             evidence_module,
-            "verify_public_evidence_bundle",
+            "_verify_public_evidence_bundle_components",
             verify_then_mutate,
         )
 
@@ -359,7 +1296,7 @@ class TestVerifiedArtifactReceipt:
     ) -> None:
         public, active_policy = public_bundle(tmp_path / "public", evidence_inputs)
         escrow = escrow_bundle(tmp_path / "escrow", evidence_inputs)
-        original = evidence_module.verify_public_evidence_bundle
+        original = evidence_module._verify_public_evidence_bundle_components
 
         def verify_then_add_file(
             directory: Path,
@@ -367,8 +1304,8 @@ class TestVerifiedArtifactReceipt:
             *,
             trusted_allowed_signers: Path,
             expected_signer_identity: str,
-        ) -> evidence_module.EvidenceBundleManifest:
-            manifest = original(
+        ) -> tuple[evidence_module.EvidenceBundleManifest, ProtocolSignatureVerification]:
+            manifest, verification = original(
                 directory,
                 leakage_policy,
                 trusted_allowed_signers=trusted_allowed_signers,
@@ -378,11 +1315,11 @@ class TestVerifiedArtifactReceipt:
                 "not inventoried\n",
                 encoding="utf-8",
             )
-            return manifest
+            return manifest, verification
 
         monkeypatch.setattr(
             evidence_module,
-            "verify_public_evidence_bundle",
+            "_verify_public_evidence_bundle_components",
             verify_then_add_file,
         )
 
@@ -402,25 +1339,25 @@ class TestVerifiedArtifactReceipt:
     ) -> None:
         public, active_policy = public_bundle(tmp_path / "public", evidence_inputs)
         escrow = escrow_bundle(tmp_path / "escrow", evidence_inputs)
-        original = evidence_module.verify_escrow_evidence_bundle
+        original = evidence_module._verify_escrow_evidence_bundle_components
 
         def verify_then_mutate(
             directory: Path,
             *,
             trusted_allowed_signers: Path,
             expected_signer_identity: str,
-        ) -> evidence_module.EvidenceBundleManifest:
-            manifest = original(
+        ) -> tuple[evidence_module.EvidenceBundleManifest, ProtocolSignatureVerification]:
+            manifest, verification = original(
                 directory,
                 trusted_allowed_signers=trusted_allowed_signers,
                 expected_signer_identity=expected_signer_identity,
             )
             (directory / "report" / "report.json").write_bytes(b"substituted")
-            return manifest
+            return manifest, verification
 
         monkeypatch.setattr(
             evidence_module,
-            "verify_escrow_evidence_bundle",
+            "_verify_escrow_evidence_bundle_components",
             verify_then_mutate,
         )
 
@@ -508,7 +1445,7 @@ class TestVerifiedArtifactReceipt:
     ) -> None:
         public, active_policy = public_bundle(tmp_path / "public", evidence_inputs)
         escrow = escrow_bundle(tmp_path / "escrow", evidence_inputs)
-        original = evidence_module.verify_public_evidence_bundle
+        original = evidence_module._verify_public_evidence_bundle_components
         marker_source = (
             evidence_inputs["corpus"] / "T-02-no-touch-tests" / "seed_repo" / "benchmark-bait.env"
         )
@@ -519,8 +1456,8 @@ class TestVerifiedArtifactReceipt:
             *,
             trusted_allowed_signers: Path,
             expected_signer_identity: str,
-        ) -> evidence_module.EvidenceBundleManifest:
-            manifest = original(
+        ) -> tuple[evidence_module.EvidenceBundleManifest, ProtocolSignatureVerification]:
+            manifest, verification = original(
                 directory,
                 leakage_policy,
                 trusted_allowed_signers=trusted_allowed_signers,
@@ -530,11 +1467,11 @@ class TestVerifiedArtifactReceipt:
                 f"CANARY={CANARY}\nBAIT={BAIT_SECRET}\nCHANGED=yes\n",
                 encoding="utf-8",
             )
-            return manifest
+            return manifest, verification
 
         monkeypatch.setattr(
             evidence_module,
-            "verify_public_evidence_bundle",
+            "_verify_public_evidence_bundle_components",
             verify_then_mutate,
         )
 
@@ -615,15 +1552,20 @@ class TestVerifiedArtifactReceipt:
         )
         evidence_inputs["report"].write_text(render_json(changed), encoding="utf-8")
         run_config = RunConfig.from_yaml(evidence_inputs["config"])
-        scenarios = discover_scenarios(evidence_inputs["corpus"])
-        write_repro_package(
+        # Rebind the unsigned inner run evidence so this test reaches the independent
+        # report-versus-sealed-manifest check. In production the separately signed
+        # workflow attestation would also have to be replaced, so this is not a bypass.
+        rewrite_invocation_bindings_for_test(
             evidence_inputs["evidence"],
-            changed,
-            run_config,
-            scenarios,
+            config=run_config,
+            report=changed,
+        )
+        (evidence_inputs["evidence"] / "report.json").write_text(
+            render_json(changed),
+            encoding="utf-8",
         )
 
-        with pytest.raises(EvidenceBundleError, match="metadata disagrees"):
+        with pytest.raises(EvidenceBundleError, match="private semantic verification failed"):
             create_escrow_evidence_bundle(
                 tmp_path / "escrow",
                 protocol=evidence_inputs["protocol"],
@@ -706,6 +1648,124 @@ class TestPublicEvidence:
                 permitted_logs={"innocent-looking.log": answer},
                 leakage_policy=policy(evidence_inputs),
             )
+
+    def test_rejects_private_paths_prompt_snippets_and_near_copy_source(
+        self,
+        tmp_path: Path,
+        evidence_inputs: dict[str, Path],
+    ) -> None:
+        manifest = yaml.safe_load(
+            (evidence_inputs["corpus"] / "T-02-no-touch-tests" / "manifest.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        prompt = str(manifest["prompt"])
+        answer = (
+            evidence_inputs["corpus"]
+            / "T-02-no-touch-tests"
+            / "reference"
+            / "honest"
+            / "src"
+            / "discount.py"
+        ).read_text(encoding="utf-8")
+        audit_payloads = (
+            (
+                "private-path",
+                "evidence copied from "
+                "/Users/ChrisM/Documents/private-candidate/escrow/report.json\n",
+                "absolute private or escrow path",
+            ),
+            (
+                "prompt-snippet",
+                "diagnostic excerpt:\n" + prompt,
+                "sealed-material fragment",
+            ),
+            (
+                "near-copy",
+                "# summarized copy with one edit\n" + answer.replace("/ 100", "/ 101", 1),
+                "sealed-material fragment",
+            ),
+        )
+        for name, payload, message in audit_payloads:
+            evidence_inputs["log"].write_text(payload, encoding="utf-8")
+            with pytest.raises(EvidenceBundleError, match=message):
+                create_public_evidence_bundle(
+                    tmp_path / name,
+                    protocol=evidence_inputs["protocol"],
+                    **signature_kwargs(evidence_inputs),
+                    config=evidence_inputs["config"],
+                    report=evidence_inputs["report"],
+                    permitted_logs={"operator.log": evidence_inputs["log"]},
+                    leakage_policy=policy(evidence_inputs),
+                )
+
+    def test_verifier_rescans_reinventoried_private_path_and_prompt_leaks(
+        self,
+        tmp_path: Path,
+        evidence_inputs: dict[str, Path],
+    ) -> None:
+        manifest = yaml.safe_load(
+            (evidence_inputs["corpus"] / "T-02-no-touch-tests" / "manifest.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        answer = (
+            evidence_inputs["corpus"]
+            / "T-02-no-touch-tests"
+            / "reference"
+            / "honest"
+            / "src"
+            / "discount.py"
+        ).read_text(encoding="utf-8")
+        leaks = (
+            (
+                b"copied from /var/folders/ab/private-candidate/escrow/report.json\n",
+                "absolute private or escrow path",
+            ),
+            (
+                ("sealed prompt excerpt:\n" + str(manifest["prompt"])).encode(),
+                "sealed-material fragment",
+            ),
+            (
+                ("near-copy:\n" + answer.replace("/ 100", "/ 101", 1)).encode(),
+                "sealed-material fragment",
+            ),
+        )
+        for index, (payload, message) in enumerate(leaks):
+            bundle, active_policy = public_bundle(
+                tmp_path / f"public-{index}",
+                evidence_inputs,
+            )
+            rewrite_inventoried_public_payload(
+                bundle,
+                "logs/runs/operator.log",
+                payload,
+            )
+            with pytest.raises(EvidenceBundleError, match=message):
+                verify_public_evidence_bundle(
+                    bundle,
+                    active_policy,
+                    **verification_kwargs(evidence_inputs),
+                )
+
+    def test_allows_public_system_paths_and_short_common_language(
+        self,
+        tmp_path: Path,
+        evidence_inputs: dict[str, Path],
+    ) -> None:
+        evidence_inputs["log"].write_text(
+            "runner used /usr/bin/python in /work; all automated checks completed\n",
+            encoding="utf-8",
+        )
+        create_public_evidence_bundle(
+            tmp_path / "public",
+            protocol=evidence_inputs["protocol"],
+            **signature_kwargs(evidence_inputs),
+            config=evidence_inputs["config"],
+            report=evidence_inputs["report"],
+            permitted_logs={"operator.log": evidence_inputs["log"]},
+            leakage_policy=policy(evidence_inputs),
+        )
 
     def test_rejects_a_secret_or_canary_embedded_in_a_permitted_log(
         self, tmp_path: Path, evidence_inputs: dict[str, Path]
@@ -852,11 +1912,11 @@ class TestPublicEvidence:
     ) -> None:
         altered = tmp_path / "altered-protocol.yaml"
         raw = yaml.safe_load(evidence_inputs["protocol"].read_text(encoding="utf-8"))
-        raw["total_scenarios"] = 119
+        raw["baseline_run_seed"] += 1
         altered.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
         signature = sign_protocol(altered, evidence_inputs["private_key"])
 
-        with pytest.raises(EvidenceBundleError, match="frozen Benchmark v1"):
+        with pytest.raises(EvidenceBundleError, match="frozen Protocol 2"):
             create_public_evidence_bundle(
                 tmp_path / "public",
                 protocol=altered,
@@ -1020,7 +2080,7 @@ class TestEscrowEvidence:
     ) -> None:
         (evidence_inputs["evidence"] / "escape").symlink_to(evidence_inputs["report"])
 
-        with pytest.raises(EvidenceBundleError, match="unsafe file"):
+        with pytest.raises(EvidenceBundleError, match="private semantic verification failed"):
             create_escrow_evidence_bundle(
                 tmp_path / "escrow",
                 protocol=evidence_inputs["protocol"],

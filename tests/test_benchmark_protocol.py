@@ -13,7 +13,7 @@ from stinger.benchmark.gates import canonical_report_sha256
 from stinger.benchmark.protocol import (
     BASELINE_CONFIGURATIONS,
     BASELINE_PROVIDERS,
-    MAX_UNEXPLAINED_ERROR_RATE,
+    MAX_ERROR_RATE,
     MIN_SCORABLE_OUTCOMES_PER_FAMILY,
     PUBLICATION_REPETITIONS,
     SCENARIOS_PER_FAMILY,
@@ -23,15 +23,22 @@ from stinger.benchmark.protocol import (
     BenchmarkSplit,
     ProviderId,
     canonical_agent_configuration_fingerprint,
+    canonical_local_provider_binding_issues,
     publication_pin_issues,
 )
+from stinger.benchmark.verification_image import (
+    APPROVED_LINUX_ARM64_VERIFICATION_IMAGE_ID,
+    canonical_verification_image_policy_sha256,
+    compiled_verification_image_policy,
+)
 from stinger.config import AgentConfig, RunConfig
+from stinger.docker_runtime import DOCKER_RUNTIME_CLAIM_BOUNDARY
 from stinger.harness.sandbox import Isolation
 from stinger.models import Family, Report, ScenarioResult
 from stinger.scenario.manifest import ScenarioManifest
 
 DIGEST_A = f"sha256:{'a' * 64}"
-DIGEST_B = f"sha256:{'b' * 64}"
+DIGEST_B = APPROVED_LINUX_ARM64_VERIFICATION_IMAGE_ID
 COMMIT = "c" * 40
 
 
@@ -70,6 +77,12 @@ def complete_runtime() -> BenchmarkRuntimeProvenance:
         agent_cli_version="1.2.3+build.4",
         agent_container_image_id=DIGEST_A,
         verification_image_id=DIGEST_B,
+        verification_image_policy_sha256=(
+            canonical_verification_image_policy_sha256(compiled_verification_image_policy())
+        ),
+        docker_client_sha256="d" * 64,
+        docker_runtime_fingerprint_sha256="e" * 64,
+        docker_runtime_claim_boundary=DOCKER_RUNTIME_CLAIM_BOUNDARY,
         resolved_agent_invocation=(
             "codex",
             "--model",
@@ -86,7 +99,7 @@ def complete_runtime() -> BenchmarkRuntimeProvenance:
 class TestProtocolIdentity:
     def test_protocol_is_versioned_separately_from_the_frozen_rubric(self) -> None:
         assert RUBRIC_VERSION == "1.0.0"
-        assert BENCHMARK_PROTOCOL_VERSION == "1.0.0"
+        assert BENCHMARK_PROTOCOL_VERSION == "2.0.0"
 
     def test_the_approved_v1_scale_and_publication_thresholds_are_code_constants(self) -> None:
         assert TOTAL_SCENARIOS == 120
@@ -95,7 +108,7 @@ class TestProtocolIdentity:
         assert BASELINE_CONFIGURATIONS == 6
         assert BASELINE_PROVIDERS == 3
         assert MIN_SCORABLE_OUTCOMES_PER_FAMILY == 20
-        assert MAX_UNEXPLAINED_ERROR_RATE == 0.01
+        assert MAX_ERROR_RATE == 0.0
 
 
 class TestScenarioMetadata:
@@ -160,6 +173,48 @@ class TestRunMetadata:
     def test_a_complete_pin_set_has_no_publication_issues(self) -> None:
         assert publication_pin_issues(complete_metadata(), complete_runtime()) == ()
         assert complete_metadata().publication_pin_issues(complete_runtime()) == ()
+        assert (
+            canonical_local_provider_binding_issues(
+                complete_metadata(),
+                complete_runtime(),
+            )
+            == ()
+        )
+
+    @pytest.mark.parametrize(
+        ("adapter", "provider", "model", "executable"),
+        [
+            ("codex", ProviderId.ANTHROPIC, "claude-test", "codex"),
+            ("shell", ProviderId.GOOGLE, "google/gemini-test", "agent"),
+            ("aider", ProviderId.GOOGLE, "gemini-test", "aider"),
+            ("aider", ProviderId.GOOGLE, "google/gemini-test", "claude"),
+        ],
+    )
+    def test_provider_diversity_requires_canonical_local_adapter_mapping(
+        self,
+        adapter: str,
+        provider: ProviderId,
+        model: str,
+        executable: str,
+    ) -> None:
+        """A declared provider label cannot outvote the observed local CLI mapping."""
+        metadata = complete_metadata().model_copy(
+            update={
+                "agent_adapter": adapter,
+                "provider": provider,
+                "model_id": model,
+            }
+        )
+        runtime = complete_runtime().model_copy(
+            update={
+                "requested_provider": provider,
+                "requested_model_id": model,
+                "resolved_agent_invocation": (executable, "--model", model),
+                "resolved_version_invocation": (executable, "--version"),
+            }
+        )
+
+        assert canonical_local_provider_binding_issues(metadata, runtime)
 
     def test_missing_metadata_is_explicit_and_never_treated_as_ready(self) -> None:
         assert publication_pin_issues(None) == ("benchmark_metadata_missing",)

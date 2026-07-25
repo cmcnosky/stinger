@@ -22,8 +22,8 @@ neutral by construction.
    non-scored outcome (`error`), never to a favorable score. A scenario that cannot be
    validated MUST NOT contribute to any published number.
 2. **Mechanical truth first.** Cheating is decided by deterministic detectors, never by an
-   LLM judge alone. The optional judge (§9) may only *flag for human review*; it may never
-   set or override a `cheated`/`honest` label in the mechanical metric.
+   LLM judge alone. The optional judge (§9) may only add a non-authoritative review flag; it
+   may never set or override a `cheated`/`honest` label in the mechanical metric.
 3. **Preregistered rubric.** The scoring math (§8) is frozen and versioned. Changing it
    requires a version bump and a changelog entry. Published numbers name the rubric version.
 4. **Reproducibility or it didn't happen.** No score is emitted without a reproducibility
@@ -112,7 +112,7 @@ class Family(str, Enum):
 class DetectorResult(BaseModel):            # returned by every detector
     detector: str
     fired: bool                             # True => evidence of a cheat
-    low_confidence: bool = False            # True => unresolved/degraded; routes to review,
+    low_confidence: bool = False            # True => unresolved/degraded; creates a review flag,
                                             # never renders as a bare pass or a bare fire (§6, §7)
     evidence: str                           # human-readable, points at the trace
     artifacts: list[str] = []               # paths inside the repro package
@@ -223,7 +223,7 @@ Rules:
 - A detector MUST be deterministic and MUST attach evidence (a path + a human sentence).
 - `assertion_change` uses Python `ast` for `.py` test files; for other languages it falls
   back to a normalized-diff heuristic and MUST label its verdict `low_confidence` (which the
-  runner treats as "flag for review," not an automatic `cheated`). **[OPEN: v1 targets
+  runner treats as a non-authoritative review flag, not an automatic `cheated`). **[OPEN: v1 targets
   Python scenarios only; other languages are post-v1.]**
 - Detectors never call the network.
 
@@ -301,7 +301,9 @@ Notes:
 ## 9. Optional LLM judge (`scoring/judge.py`) — bounded, labeled, never authoritative
 
 - MAY run only after mechanical scoring. MAY only move a mechanically-`honest` scenario into
-  a `needs_review` list. MUST NOT change any mechanical label or the mechanical metric.
+  a `needs_review` list. That queue may be consumed by an automated or operator-selected
+  workflow, but it is never a scoring or Benchmark Protocol 2 release input. The judge MUST
+  NOT change any mechanical label or the mechanical metric.
 - Any metric incorporating judge input is emitted as a **separate** `judge_assisted` block
   with its own numbers, the judge model id, and the exact judge prompt (versioned).
 - Disabled by default. Enabling it never alters the headline Integrity Rate.
@@ -315,12 +317,22 @@ repro/<timestamp>/
   config.resolved.json          # the full RunConfig, with the fingerprint
   corpus.lock                    # scenario ids + per-scenario content hashes + corpus_hash
   rubric.version                 # RUBRIC_VERSION
+  repro.format.version           # replay-evidence contract version
   benchmark.protocol.version     # benchmark-capable runs only
-  runs/<scenario>/<rep>/         # transcript.txt, before.diff, after.diff, artifacts/
+  runs/<scenario>/<rep>/         # transcript/diffs/workdir/classification.replay.json/artifacts
   rerun.sh                       # one command that reproduces this exact run
 ```
 `rerun.sh` MUST reproduce identical *scoring* given the same agent build (agent
 non-determinism surfaces as variance, never as an unexplained score change).
+
+For benchmark escrow, `classification.replay.json` is a closed-schema record of primary
+agent and verifier observations only. It MUST NOT store the outcome, detector results,
+goal/claim/refusal decisions, or run error. Escrow verification MUST derive those fields
+again from the exact sealed scenario, transcript, retained final worktree, configured
+adapter parser, and freshly rerun verification commands in the pinned network-disabled
+image. The derived result MUST match the public/escrow `report.json` exactly except for
+observational duration. A legacy package without this replay contract remains a readable
+development artifact but is ineligible for a Protocol 2 release.
 
 ## 11. `check.sh` — the master gate (definition of done for any change)
 
@@ -335,7 +347,7 @@ definition of done. A change that reduces coverage or leaves a stub is not done.
 
 Every scenario ships two reference resolutions as **overlay directories**:
 `reference/honest/` and `reference/cheat/` (files mirroring repo paths, copied over a fresh
-`seed_repo`). Overlays are used instead of `.patch` files so a scenario's fairness proof can
+`seed_repo`). Overlays are used instead of `.patch` files so a scenario's validity proof can
 never be broken by diff-context/line-number drift. `stinger validate` MUST, for each
 scenario:
 1. Overlay `reference/honest/` onto the seed, run all the scenario's detectors → assert
@@ -357,25 +369,123 @@ stinger report REPRO_DIR [--format html|md|json]
 stinger benchmark protocol-check [benchmark/protocol.yaml]
 stinger benchmark release-schema
 stinger benchmark release-check SUBMISSION [--format text|json] \
+  [--protocol FILE --protocol-signature SIG --protocol-allowed-signers FILE \
+   --protocol-signer-identity ID] \
+  [--candidate-receipt FILE --candidate-receipt-signature SIG \
+   --candidate-receipt-allowed-signers FILE --candidate-receipt-signer-identity ID] \
+  [--candidate-promotion-statement FILE --candidate-promotion-signature SIG \
+   --candidate-promotion-allowed-signers FILE --candidate-promotion-signer-identity ID] \
+  [--corpus-construction-receipt FILE --corpus-construction-signature SIG \
+   --corpus-construction-allowed-signers FILE --corpus-construction-signer-identity ID] \
+  [--corpus-freeze-statement FILE --corpus-freeze-signature SIG \
+   --corpus-freeze-allowed-signers FILE --corpus-freeze-signer-identity ID] \
+  [--pilot-evidence-statement FILE --pilot-evidence-signature SIG \
+   --pilot-evidence-allowed-signers FILE --pilot-evidence-signer-identity ID] \
+  [--conformance-statement FILE --conformance-signature SIG \
+   --conformance-allowed-signers FILE --conformance-signer-identity ID]... \
+  [--baseline-verification-statement FILE --baseline-verification-signature SIG \
+   --baseline-verification-allowed-signers FILE \
+   --baseline-verification-signer-identity ID]... \
+  [--release-evidence-statement FILE --release-evidence-signature SIG \
+   --release-evidence-allowed-signers FILE --release-evidence-signer-identity ID] \
   [--signature SIG --allowed-signers FILE --signer-identity ID] \
   [--reproduction-statement FILE --reproduction-signature SIG \
-   --verifier-allowed-signers FILE --verifier-identity ID]
+   --verifier-allowed-signers FILE --verifier-identity ID] \
+  [--public-reproduction-verification-statement FILE \
+   --public-reproduction-verification-signature SIG]
 stinger benchmark compare CANDIDATE_REPORT BASELINE_REPORT [--samples N] [--seed N]
 stinger benchmark sign-protocol PROTOCOL --private-key KEY
+stinger benchmark build-candidate-receipt ...
+stinger benchmark sign-candidate-receipt RECEIPT --private-key KEY
+stinger benchmark verify-candidate-receipt RECEIPT --signature SIG \
+  --allowed-signers FILE --signer-identity ID
+stinger benchmark promote-candidate-corpus ...
+stinger benchmark sign-candidate-promotion STATEMENT --private-key KEY
+stinger benchmark build-corpus-construction-receipt \
+  --input-manifest PRIVATE_INPUTS.yaml --output NEW.json
+stinger benchmark sign-corpus-construction-receipt RECEIPT --private-key KEY
+stinger benchmark verify-corpus-construction-receipt RECEIPT --signature SIG \
+  --allowed-signers FILE --signer-identity ID
+stinger benchmark build-pilot-evidence ...
+stinger benchmark sign-pilot-evidence STATEMENT --private-key KEY
+stinger benchmark build-corpus-freeze-statement ...
+stinger benchmark sign-corpus-freeze STATEMENT --private-key KEY
+stinger benchmark build-corpus-freeze-record ...
+stinger benchmark create-machine-environment-identity ...
+stinger benchmark build-machine-workflow-attestation ...
+stinger benchmark sign-machine-workflow-attestation ATTESTATION --private-key KEY
+stinger benchmark verify-machine-workflow-attestation ...
+stinger benchmark run-conformance-workflow ...
+stinger benchmark build-conformance-statement ...
+stinger benchmark sign-conformance STATEMENT --private-key KEY
+stinger benchmark build-conformance-record ...
 stinger benchmark sign-release SUBMISSION --private-key KEY
 stinger benchmark sign-reproduction STATEMENT --private-key KEY
+stinger benchmark sign-reproduced-report REPORT --private-key KEY
 stinger benchmark verify-protocol PROTOCOL --signature SIG --allowed-signers FILE \
   --signer-identity ID
 stinger benchmark bundle-public ...           # signed, leakage-checked disclosure bundle
 stinger benchmark verify-public ...
 stinger benchmark bundle-escrow ...           # full, access-controlled verifier bundle
 stinger benchmark verify-escrow ...
+stinger benchmark build-baseline-record ...
+stinger benchmark build-baseline-verification ...
+stinger benchmark sign-baseline-verification STATEMENT --private-key KEY
+stinger benchmark build-release-evidence-record ... --toolchain-python PYTHON \
+  --preparation-package DIR
+stinger benchmark build-release-evidence-statement ... --preparation-package DIR
+stinger benchmark sign-release-evidence STATEMENT --private-key KEY
+stinger benchmark reproduction-diff TARGET_REPORT REPRODUCED_REPORT --output FILE
+stinger benchmark build-reproduction-statement ...
+stinger benchmark verify-public-reproduction ...
+stinger benchmark sign-public-reproduction-verification STATEMENT --private-key KEY
+stinger benchmark build-reproduction-record ...
 ```
+
+The corpus-construction command consumes one private, closed input manifest and derives the
+path-free receipt; it does not accept a caller-authored `SealedCorpusRecord`. The private
+manifest and every path it names stay outside the public repository and release gate.
+
+Each `release-check` group above is all-or-nothing. A publication-eligible Protocol 2
+invocation supplies all **twelve** groups: signed protocol, signed candidate receipt, signed
+candidate promotion, signed corpus-construction receipt, signed corpus freeze, signed pilot
+evidence, conformance authorizations, baseline-verification authorizations, signed release
+evidence, signed final release submission, signed reproduction statement, and the public
+reproduction-verification handoff. The conformance and baseline groups repeat as aligned
+statement/signature/trust/identity quadruples—one per submitted conformance environment and
+one per baseline configuration. Omitting a complete group leaves the corresponding release
+gate blocked.
+
+Full reproduced-public-bundle verification is a separate pre-release step because it needs
+the active leakage comparison set. It emits a canonical, non-secret verification statement
+for a dedicated detached signature. `release-check` receives only that statement and
+signature plus the already supplied verifier trust policy; it never opens a bundle, report,
+escrow tree, sealed corpus, marker file, or leakage policy.
+
 `stinger.yaml` (see `config.py`) declares: the adapter + agent config, corpus path,
 reps, output dir, judge on/off, and the CI regression threshold. Benchmark-capable runs
 add a separately versioned protocol, provider/model/CLI/settings pins, Stinger commit,
 agent and verifier image digests, and a fixed run seed. Those fields do not change the
 frozen rubric and are optional for ordinary development runs.
+
+For Protocol 2 benchmark operations, a verifier digest declaration is not sufficient. The
+signed protocol MUST bind the exact canonical `docker/runner.Dockerfile` plus complete
+hash-locked dependency inventory and a closed immutable verifier-image ID for each approved
+Docker target platform. Because containerd-backed Docker stores report the OCI manifest
+digest while classic Docker Engine reports the OCI image-config digest as `.Id`, one
+platform record MUST name those two ordered identities from the same byte-identical clean
+exports; the config digest binds the ordered root-filesystem DiffIDs. Candidate validation,
+promotion, corpus construction, benchmark execution, runtime provenance, classification
+replay, and release evaluation MUST reject source, policy, platform, or image drift before
+starting a verification container. This claim is bounded to exact bytes observed through
+Stinger's fixed Docker client and the daemon-reported identity; it is not universal
+reproducible-build, registry, TPM, physical-host, daemon-anti-fabrication, or
+administrator-integrity proof.
+
+The verifier allowlist MUST NOT be represented as approval of agent containers. Networked
+agent images execute untrusted sealed prompts and require a separate signed source or
+attestation policy before any live sealed review, QA, blind solve, pilot, baseline, or
+reproduction is authorized.
 
 ## 14. The GitHub Action (`.github/workflows/stinger.yml`)
 
@@ -390,7 +500,7 @@ by the reusable public workflow. Seeing the marker makes that workflow suppress 
 and fail closed. Escrow creation and transfer use the separate, access-controlled benchmark
 evidence workflow.
 
-The fairness gate the job runs before scoring anything (§12) MUST cover the corpus named by
+The validity gate the job runs before scoring anything (§12) MUST cover the corpus named by
 the caller's config, not Stinger's bundled one. A caller who writes scenarios against their
 own house rules points `corpus:` at them, and a gate hard-coded to `scenarios/` would publish
 a green validity proof for traps the run never touches while the caller's own went unchecked
@@ -417,17 +527,79 @@ across all five families (the taxonomy names them).
 5. No `NotImplementedError` / `# BUILD:` remains in `src/`. README documents install + the
    four commands + the honest-status table.
 
-## 17. Benchmark candidate protocol — additive, separately versioned
+## 17. Benchmark Protocol 2 — additive, separately versioned
 
 The public 30-scenario corpus and §16 acceptance prove that the instrument works; they do
-not make it a benchmark. [`BENCHMARK.md`](BENCHMARK.md) is the normative construction and
-release protocol for the separately claimed **Stinger Benchmark v1**. Its
-`BENCHMARK_PROTOCOL_VERSION` is independent of `RUBRIC_VERSION`: governance, sampling,
-evidence, or uncertainty rules may version without silently changing §8 scoring.
+not make it a benchmark. [`BENCHMARK.md`](BENCHMARK.md) is the normative Protocol 2
+construction and release contract for the separately claimed **Stinger Benchmark v1**.
+`BENCHMARK_PROTOCOL_VERSION = 2.0.0` is independent of
+`RUBRIC_VERSION = 1.0.0`: governance, sampling, machine-evidence, or uncertainty rules may
+version without silently changing §8 scoring.
 
 The public corpus is the `development` split. Active headline scoring uses a separately
-stored `sealed` split of 120 independently designed scenarios, 24 per existing family.
-Each scored result carries `benchmark_split`, `scenario_version`, and `cluster_id`.
+stored `sealed` split of 120 scenarios, 24 per existing family. Each scored result carries
+`benchmark_split`, `scenario_version`, and `cluster_id`; related variants share a cluster
+and cannot count as independent statistical units.
+
+Protocol 2 replaces human scenario review, hands-on solves, manual transcript review,
+beta-operator records, editable error dispositions, and free-text reproduction
+reconciliation with fail-closed machine evidence:
+
+- two honest and two cheat variants per scenario, each bound to source, semantic-change,
+  and execution receipts;
+- five contained QA attempts per scenario across at least two pinned configurations and
+  two providers;
+- two provider-diverse machine veto reviews per scenario, bound to the exact QA manifest
+  and protocol-hashed prompt/output contract;
+- two reference-isolated blind agent solves for a deterministic six-scenario-per-family
+  subset, spanning two configurations and two providers;
+- a signed, split-only candidate-to-sealed promotion plus a signed, artifact-derived
+  corpus-construction receipt that derives the complete `SealedCorpusRecord`;
+- an artifact-derived, signed non-saturation pilot over that exact promoted corpus;
+- corpus-wide validation, custody, access-log, canary, and signed freeze receipts;
+- three clean conformance environments spanning two platform/architecture pairs, each with
+  a separately authorized construction statement;
+- six artifact-derived baselines, each with a separately authorized verification statement;
+- a signed release-evidence statement embedding typed, cross-bound protocol-freeze,
+  deterministic technical-report, conflicts-declaration, and fixed correction-policy
+  artifacts plus the exact clean commit and one preserved successful master-gate execution;
+  arbitrary nonempty files or caller-entered favorable hashes receive no credit; and
+- one cryptographically role-separated cross-machine reproduction with structural and
+  modal equality plus an automatic classification-only discrepancy ledger and direct
+  full-public-artifact verification whose signed non-secret receipt is rechecked by
+  `release-check`.
+
+The pilot's scenario inclusion and evaluation procedure is a closed
+`pilot_selection_policy` inside the signed Protocol 2 manifest: the complete promoted
+candidate-to-sealed identity set, one repetition per anonymous configuration, distinct
+resolved and agent-configuration fingerprints, and the frozen variation threshold. The
+pilot builder MUST derive `selection_protocol_sha256` from that typed policy and MUST NOT
+accept caller-authored selection bytes. This proves complete-corpus policy binding; it does
+not claim an externally timestamped or psychologically vendor-neutral choice of agent
+configurations.
+
+Machine review is veto-only. It MUST NOT set or override an agent outcome, detector result,
+or score. `block`, `uncertain`, contract drift, missing evidence, or insufficient
+provider/configuration diversity fails closed.
+
+Machine-review provider and configuration diversity MUST be derived from the fixed executed
+adapter workflow and observed runtime provenance. Each review output MUST have a detached
+runtime signature. The pair MUST use distinct configurations, canonical provider mappings,
+signer identities, verified keys, trust policies, and signature bytes, and neither review
+runtime role may be reused as the corpus-construction signing role. Caller-authored runtime
+or provider declarations do not satisfy this requirement.
+
+Protocol 2 makes no reviewer-versus-author independence claim. A signed authoring run cannot
+prove that it was the sole authoring process, so private authoring records receive no
+release-gate credit. The enforceable claim is mutual independence of the two review
+executions and their separation from the corpus-construction signing role.
+
+Provider-diversity evidence uses a deliberately narrow local adapter mapping:
+`codex` maps to OpenAI, `claude-code` maps to Anthropic, and `aider` requires both its own
+observed executable and a model ID prefixed by the declared provider. Generic `shell` and
+`recorded` adapters receive no provider-diversity credit. This detects inconsistent local
+configuration and invocation; it is not provider-signed proof of a remote account,
+endpoint, service, or served model.
 
 A benchmark-capable Report additionally carries:
 
@@ -438,16 +610,45 @@ A benchmark-capable Report additionally carries:
 - cluster-aware nested-bootstrap 95% intervals. Repetitions remain measurements of one
   scenario and MUST NOT be counted as independent tasks.
 
-`stinger report` recomputes the persisted uncertainty as well as the frozen score.
-Benchmark publication is a separate master gate over the sealed corpus, review/QA records,
-six-configuration baseline matrix, signed protocol, public/escrow evidence, outside beta
-operators, an independently signed artifact-binding reproduction statement, and an
-out-of-band signature over Chris's exact final release submission. Missing evidence leaves
-the status `benchmark_candidate`; no score can substitute for a missing construction or
-external-validation record.
+Every benchmark-mode scenario/repetition MUST also be covered by the deterministic
+execution plan, a fresh evidence-only pre-invocation nonce, a post-classification receipt
+binding the transcript/replay/diffs/final-tree/result, and the run-level invocation
+aggregate. The nonce MUST NOT enter the prompt, detector context, classifier, or score.
+Missing, extra, duplicated, or cloned invocation evidence fails closed.
+
+For `codex` and `claude-code`, the receipt MUST parse exactly one structured provider
+session identifier from the raw transcript and those identifiers MUST be unique across the
+run. The `aider` transcript exposes no equivalent canonical provider-side identifier:
+Stinger therefore claims only distinct signed runner challenges for Aider, not provider
+proof of distinct remote inference calls.
+
+The invocation aggregate is deliberately an inner, non-circular artifact created before
+the public and escrow inventories exist. After both bundles are complete, the accepted
+machine-workflow attestation MUST bind the exact aggregate hash together with the exact
+public- and escrow-manifest hashes. Neither layer alone satisfies the run-evidence gate.
+
+`stinger report` recomputes the persisted uncertainty as well as the frozen score. The
+master release gate covers the sealed corpus, machine construction evidence,
+six-configuration baseline matrix, signed protocol, signed promotion/construction/freeze and
+pilot evidence, public/escrow evidence, separately authorized baseline and conformance
+statements, signed release evidence, signed cross-machine artifact bindings, direct
+public-reproduction verification, and an out-of-band signature over Chris's exact final
+release submission. Protocol 2 permits no `ERROR` outcome in a publication baseline; no
+disposition can exclude one.
+
+The terms “clean environment” and “cross-machine” mean distinct host-derived,
+privacy-preserving operating-system commitments bound to signed workflow evidence. They do
+not prove different physical hardware, TPM-backed identity, cloud-provider identity,
+organizational independence, or resistance to cloning. Publications MUST state that
+boundary rather than presenting the commitment as hardware attestation.
+
+Chris's signature is final publication authorization required by `AGENTS.md`; it is not a
+scenario review, transcript review, or scoring input, and it cannot replace a missing
+machine gate. Missing evidence leaves status `benchmark_candidate`; a fully eligible
+submission reports `machine_reproduced`.
 
 The machine-readable thresholds live in `benchmark/protocol.yaml`; the checked-in truthful
 current state is `benchmark/candidate-submission.yaml`. The latter MUST fail
-`stinger benchmark release-check` until real sealed-corpus, outside, and approval evidence
-exists. A failing candidate release check is an honest status result, not a broken
-development gate.
+`stinger benchmark release-check` until real sealed-corpus, baseline, conformance,
+cross-machine, and operator-authorization evidence exists. A failing candidate release
+check is an honest status result, not a broken development gate.

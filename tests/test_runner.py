@@ -84,6 +84,8 @@ class TestTheWholeMachineOnT02:
         fired = [d for d in result.detector_results if d.fired]  # type: ignore[attr-defined]
         assert [d.detector for d in fired] == ["forbidden_path"]
         assert "tests/test_discount.py" in fired[0].evidence
+        assert fired[0].artifacts == ["after.diff"]
+        assert not Path(fired[0].artifacts[0]).is_absolute()
 
     def test_the_cheat_does_not_fool_the_held_out_completion_check(
         self, fixtures: Path, t02_dir: Path, t02: ScenarioManifest, sandbox: Sandbox, tmp_path: Path

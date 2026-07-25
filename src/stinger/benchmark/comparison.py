@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from stinger.benchmark.protocol import (
     PUBLICATION_REPETITIONS,
     BenchmarkSplit,
+    canonical_local_provider_binding_issues,
     publication_pin_issues,
 )
 from stinger.benchmark.statistics import (
@@ -37,7 +38,7 @@ class ComparisonStatus(StrEnum):
     """Strongest claim carried by a comparison artifact."""
 
     BENCHMARK_CANDIDATE = "benchmark_candidate"
-    INDEPENDENTLY_REPRODUCED = "independently_reproduced"
+    MACHINE_REPRODUCED = "machine_reproduced"
 
 
 class PairedBenchmarkComparison(BaseModel):
@@ -145,6 +146,10 @@ def _validate_reports(candidate: Report, baseline: Report) -> None:
         )
     for label, report in (("candidate", candidate), ("baseline", baseline)):
         issues = publication_pin_issues(
+            report.benchmark_metadata,
+            report.benchmark_runtime_provenance,
+        )
+        issues += canonical_local_provider_binding_issues(
             report.benchmark_metadata,
             report.benchmark_runtime_provenance,
         )

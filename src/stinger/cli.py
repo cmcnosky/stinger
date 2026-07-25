@@ -18,12 +18,39 @@ from pathlib import Path
 
 import click
 import yaml
-from pydantic import TypeAdapter, ValidationError
+from pydantic import ValidationError
 
+from stinger.adapters.cli_base import AgentContainmentError
 from stinger.adapters.factory import AdapterError, build_adapter
+from stinger.benchmark.candidate_receipt import (
+    CandidateReceiptError,
+    build_candidate_validation_receipt,
+    write_candidate_validation_receipt,
+)
 from stinger.benchmark.comparison import (
     BenchmarkComparisonError,
     build_paired_comparison,
+)
+from stinger.benchmark.conformance import (
+    ConformanceBuilderError,
+    build_conformance_environment_record,
+    build_conformance_environment_statement,
+    prepare_conformance_workflow,
+    write_conformance_environment_record,
+    write_conformance_environment_statement,
+    write_conformance_workflow_package,
+)
+from stinger.benchmark.corpus_construction import (
+    CorpusConstructionError,
+    authorize_corpus_construction_receipt,
+    build_corpus_construction_receipt,
+    load_corpus_construction_input_manifest,
+    sign_corpus_construction_receipt,
+    write_corpus_construction_receipt,
+)
+from stinger.benchmark.corpus_promotion import (
+    CandidatePromotionError,
+    promote_candidate_corpus,
 )
 from stinger.benchmark.evidence import (
     EvidenceBundleError,
@@ -36,22 +63,68 @@ from stinger.benchmark.evidence import (
 from stinger.benchmark.gates import (
     BaselineConfigurationRecord,
     BenchmarkGateReport,
-    BenchmarkProtocolManifest,
     BenchmarkReleaseSubmission,
-    ErrorDispositionRecord,
     SealedCorpusRecord,
+    authorize_baseline_verification_statement,
+    authorize_benchmark_protocol,
     authorize_benchmark_submission,
+    authorize_candidate_promotion_statement,
+    authorize_candidate_validation_receipt,
+    authorize_conformance_statement,
+    authorize_corpus_freeze_statement,
+    authorize_pilot_evidence_statement,
+    authorize_release_evidence_statement,
     authorize_reproduction_statement,
+    compiled_benchmark_protocol,
     evaluate_benchmark_release,
     load_benchmark_protocol,
     load_benchmark_submission,
 )
+from stinger.benchmark.machine_environment import (
+    MachineAttestationError,
+    MachineWorkflowEvidencePaths,
+    build_machine_workflow_attestation,
+    create_machine_environment_identity_artifact,
+    sign_machine_workflow_attestation,
+    verify_machine_workflow_attestation,
+    write_machine_workflow_attestation,
+)
 from stinger.benchmark.ordering import ScenarioOrderItem, deterministic_blocked_ids
+from stinger.benchmark.pilot import (
+    PilotBundleInput,
+    PilotEvidenceError,
+    build_pilot_evidence_statement,
+    write_pilot_evidence_statement,
+)
 from stinger.benchmark.provenance import RuntimePreflightError, verify_runtime_provenance
 from stinger.benchmark.records import (
     BaselineRecordError,
     build_baseline_configuration_record,
+    build_baseline_verification_statement,
+    build_corpus_freeze_record,
+    build_corpus_freeze_statement,
     write_baseline_configuration_record,
+    write_baseline_verification_statement,
+    write_corpus_freeze_record,
+    write_corpus_freeze_statement,
+)
+from stinger.benchmark.release_evidence import (
+    ConflictDisclosureEntry,
+    PreparedReleaseEvidence,
+    ReleaseEvidenceBuilderError,
+    build_release_artifact_manifest,
+    build_release_evidence_statement,
+    load_release_evidence_preparation_package,
+    prepare_release_evidence,
+    write_release_artifact_package,
+    write_release_evidence_preparation_package,
+    write_release_evidence_record,
+    write_release_evidence_statement,
+)
+from stinger.benchmark.replay import (
+    ClassificationReplayError,
+    InvocationContext,
+    build_invocation_plan,
 )
 from stinger.benchmark.reproduction import (
     ReproductionBuilderError,
@@ -61,9 +134,24 @@ from stinger.benchmark.reproduction import (
     write_reproduction_diff,
     write_reproduction_record,
 )
+from stinger.benchmark.reproduction_verification import (
+    PublicReproductionVerificationError,
+    authorize_public_reproduction_verification_statement,
+    build_public_reproduction_verification_statement,
+    verify_public_reproduction,
+    write_public_reproduction_verification_statement,
+)
 from stinger.benchmark.signing import (
     ProtocolSignatureError,
+    sign_baseline_verification_statement,
+    sign_candidate_promotion_statement,
+    sign_candidate_validation_receipt,
+    sign_conformance_statement,
+    sign_corpus_freeze_statement,
+    sign_pilot_evidence_statement,
     sign_protocol,
+    sign_public_reproduction_verification_statement,
+    sign_release_evidence_statement,
     sign_release_submission,
     sign_reproduced_report,
     sign_reproduction_statement,
@@ -126,6 +214,1039 @@ def sign_benchmark_protocol(protocol: Path, private_key: Path) -> None:
     click.echo(f"signed benchmark protocol: {signature}")
 
 
+@benchmark_commands.command(name="build-candidate-receipt")
+@click.option(
+    "--candidate-root",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--metadata",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--canary-registry",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--access-ledger",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--repository",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=".",
+    show_default=True,
+)
+@click.option("--verification-image", default=DEFAULT_IMAGE, show_default=True)
+@click.option("--signer-identity", required=True)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def build_benchmark_candidate_receipt(
+    candidate_root: Path,
+    metadata: Path,
+    canary_registry: Path,
+    access_ledger: Path,
+    repository: Path,
+    verification_image: str,
+    signer_identity: str,
+    output: Path,
+) -> None:
+    """Build a public aggregate receipt after contained private-corpus validation."""
+    try:
+        receipt = build_candidate_validation_receipt(
+            candidate_root=candidate_root,
+            metadata_file=metadata,
+            canary_registry=canary_registry,
+            access_ledger=access_ledger,
+            repository=repository,
+            verification_image=verification_image,
+            signer_identity=signer_identity,
+        )
+        write_candidate_validation_receipt(output, receipt)
+    except CandidateReceiptError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except (OSError, ValidationError, ValueError) as exc:
+        raise click.ClickException("candidate receipt construction failed") from exc
+    click.echo(
+        "candidate validation receipt created: "
+        f"{receipt.scenario_count} candidates, "
+        f"{receipt.machine_validation_count} contained validations"
+    )
+
+
+@benchmark_commands.command(name="sign-candidate-receipt")
+@click.argument("receipt", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--private-key",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def sign_benchmark_candidate_receipt(receipt: Path, private_key: Path) -> None:
+    """Sign exact candidate-validation receipt bytes in a dedicated namespace."""
+    try:
+        signature = sign_candidate_validation_receipt(receipt, private_key)
+    except ProtocolSignatureError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"signed candidate validation receipt: {signature}")
+
+
+@benchmark_commands.command(name="verify-candidate-receipt")
+@click.argument("receipt", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--signer-identity", required=True)
+def verify_benchmark_candidate_receipt(
+    receipt: Path,
+    signature: Path,
+    allowed_signers: Path,
+    signer_identity: str,
+) -> None:
+    """Verify one exact public receipt without opening the private candidate corpus."""
+    try:
+        authorization = authorize_candidate_validation_receipt(
+            receipt,
+            signature,
+            allowed_signers,
+            signer_identity,
+        )
+    except (OSError, ValueError, ValidationError, ProtocolSignatureError) as exc:
+        raise click.ClickException("candidate validation receipt verification failed") from exc
+    click.echo(
+        "verified signed candidate validation receipt: "
+        f"{authorization.receipt.scenario_count} candidates"
+    )
+
+
+@benchmark_commands.command(name="promote-candidate-corpus")
+@click.option(
+    "--candidate-root",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--metadata",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--canary-registry",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--access-ledger",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--candidate-receipt",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--candidate-receipt-signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--candidate-allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--candidate-signer-identity", required=True)
+@click.option(
+    "--repository",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=".",
+    show_default=True,
+)
+@click.option("--verification-image", default=DEFAULT_IMAGE, show_default=True)
+@click.option("--promotion-signer-identity", required=True)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def promote_benchmark_candidate_corpus(
+    candidate_root: Path,
+    metadata: Path,
+    canary_registry: Path,
+    access_ledger: Path,
+    candidate_receipt: Path,
+    candidate_receipt_signature: Path,
+    candidate_allowed_signers: Path,
+    candidate_signer_identity: str,
+    repository: Path,
+    verification_image: str,
+    promotion_signer_identity: str,
+    output: Path,
+) -> None:
+    """Promote only the lifecycle split and revalidate an atomic private package."""
+    try:
+        statement = promote_candidate_corpus(
+            candidate_root=candidate_root,
+            metadata_file=metadata,
+            canary_registry=canary_registry,
+            access_ledger=access_ledger,
+            candidate_receipt=candidate_receipt,
+            candidate_receipt_signature=candidate_receipt_signature,
+            candidate_allowed_signers=candidate_allowed_signers,
+            candidate_signer_identity=candidate_signer_identity,
+            repository=repository,
+            verification_image=verification_image,
+            promotion_signer_identity=promotion_signer_identity,
+            output_directory=output,
+        )
+    except CandidatePromotionError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        f"candidate corpus promoted and revalidated: {statement.scenario_count} sealed scenarios"
+    )
+
+
+@benchmark_commands.command(name="sign-candidate-promotion")
+@click.argument("statement", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--private-key",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def sign_benchmark_candidate_promotion(statement: Path, private_key: Path) -> None:
+    """Sign exact candidate-to-sealed promotion bytes in a dedicated namespace."""
+    try:
+        signature = sign_candidate_promotion_statement(statement, private_key)
+    except ProtocolSignatureError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"signed candidate promotion statement: {signature}")
+
+
+@benchmark_commands.command(name="build-corpus-construction-receipt")
+@click.option(
+    "--input-manifest",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def build_benchmark_corpus_construction_receipt(
+    input_manifest: Path,
+    output: Path,
+) -> None:
+    """Derive the complete sealed-corpus record from one private closed manifest."""
+    try:
+        inputs = load_corpus_construction_input_manifest(input_manifest)
+        verified = build_corpus_construction_receipt(**inputs)
+        write_corpus_construction_receipt(output, verified.receipt)
+    except CorpusConstructionError as exc:
+        raise click.ClickException("corpus construction receipt creation failed") from exc
+    click.echo(
+        "corpus construction receipt created from verified artifacts: "
+        f"{verified.receipt.scenario_count} scenarios"
+    )
+
+
+@benchmark_commands.command(name="sign-corpus-construction-receipt")
+@click.argument("receipt", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--private-key",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def sign_benchmark_corpus_construction_receipt(
+    receipt: Path,
+    private_key: Path,
+) -> None:
+    """Sign an exact artifact-derived construction receipt in its own namespace."""
+    try:
+        signature = sign_corpus_construction_receipt(receipt, private_key)
+    except ProtocolSignatureError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"signed corpus construction receipt: {signature}")
+
+
+@benchmark_commands.command(name="verify-corpus-construction-receipt")
+@click.argument("receipt", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--signer-identity", required=True)
+def verify_benchmark_corpus_construction_receipt(
+    receipt: Path,
+    signature: Path,
+    allowed_signers: Path,
+    signer_identity: str,
+) -> None:
+    """Verify one exact construction receipt without opening sealed artifacts."""
+    try:
+        authorization = authorize_corpus_construction_receipt(
+            receipt,
+            signature,
+            allowed_signers,
+            signer_identity,
+        )
+    except (CorpusConstructionError, OSError, ValueError, ProtocolSignatureError) as exc:
+        raise click.ClickException("corpus construction receipt verification failed") from exc
+    click.echo(
+        "verified signed corpus construction receipt: "
+        f"{authorization.receipt.scenario_count} scenarios"
+    )
+
+
+@benchmark_commands.command(name="build-pilot-evidence")
+@click.option(
+    "--corpus-record",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--candidate-receipt",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--configuration-alias", multiple=True, required=True)
+@click.option(
+    "--public-bundle",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    multiple=True,
+    required=True,
+)
+@click.option(
+    "--escrow-bundle",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    multiple=True,
+    required=True,
+)
+@click.option(
+    "--protocol-allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+    required=True,
+)
+@click.option("--protocol-signer-identity", multiple=True, required=True)
+@click.option(
+    "--forbidden-source",
+    type=click.Path(exists=True, path_type=Path),
+    multiple=True,
+    required=True,
+)
+@click.option(
+    "--marker-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+    required=True,
+)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def build_benchmark_pilot_evidence(
+    corpus_record: Path,
+    candidate_receipt: Path,
+    configuration_alias: tuple[str, ...],
+    public_bundle: tuple[Path, ...],
+    escrow_bundle: tuple[Path, ...],
+    protocol_allowed_signers: tuple[Path, ...],
+    protocol_signer_identity: tuple[str, ...],
+    forbidden_source: tuple[Path, ...],
+    marker_file: tuple[Path, ...],
+    output: Path,
+) -> None:
+    """Build path-free pilot evidence from exact verified sealed-run bundles."""
+    counts = {
+        len(configuration_alias),
+        len(public_bundle),
+        len(escrow_bundle),
+        len(protocol_allowed_signers),
+        len(protocol_signer_identity),
+    }
+    if len(counts) != 1:
+        raise click.ClickException(
+            "pilot alias, bundle, and protocol-trust options must have equal counts"
+        )
+    try:
+        corpus = _load_sealed_corpus_record(corpus_record)
+        policy = _public_leakage_policy(forbidden_source, marker_file)
+        runs = tuple(
+            PilotBundleInput(
+                configuration_alias=alias,
+                public_bundle=public_path,
+                escrow_bundle=escrow_path,
+                leakage_policy=policy,
+                protocol_allowed_signers=signers_path,
+                protocol_signer_identity=signer_identity,
+            )
+            for (
+                alias,
+                public_path,
+                escrow_path,
+                signers_path,
+                signer_identity,
+            ) in zip(
+                configuration_alias,
+                public_bundle,
+                escrow_bundle,
+                protocol_allowed_signers,
+                protocol_signer_identity,
+                strict=True,
+            )
+        )
+        receipt = build_pilot_evidence_statement(
+            corpus=corpus,
+            candidate_receipt=candidate_receipt,
+            runs=runs,
+        )
+        write_pilot_evidence_statement(output, receipt.statement)
+    except (EvidenceBundleError, PilotEvidenceError, OSError, ValueError) as exc:
+        raise click.ClickException(f"pilot evidence construction failed: {exc}") from exc
+    click.echo(
+        "pilot evidence created: "
+        f"{receipt.statement.scenario_count} scenarios across "
+        f"{receipt.statement.configuration_count} anonymous configurations"
+    )
+
+
+@benchmark_commands.command(name="sign-pilot-evidence")
+@click.argument("statement", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--private-key",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def sign_benchmark_pilot_evidence(statement: Path, private_key: Path) -> None:
+    """Sign exact artifact-derived pilot evidence in a dedicated namespace."""
+    try:
+        signature = sign_pilot_evidence_statement(statement, private_key)
+    except ProtocolSignatureError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"signed pilot evidence statement: {signature}")
+
+
+@benchmark_commands.command(name="create-machine-environment-identity")
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def create_benchmark_machine_environment_identity(output: Path) -> None:
+    """Create a canonical privacy-preserving identity for the current host."""
+    try:
+        identity = create_machine_environment_identity_artifact(output)
+    except MachineAttestationError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        "machine environment identity created: "
+        f"{identity.platform.value}/{identity.architecture.value}"
+    )
+
+
+@benchmark_commands.command(name="build-machine-workflow-attestation")
+@click.option(
+    "--machine-identity",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--workflow-input",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--workflow-receipt",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--repository",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=".",
+    show_default=True,
+)
+@click.option("--expected-stinger-commit", required=True)
+@click.option("--signer-identity", required=True)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def build_benchmark_machine_workflow_attestation(
+    machine_identity: Path,
+    workflow_input: Path,
+    workflow_receipt: Path,
+    repository: Path,
+    expected_stinger_commit: str,
+    signer_identity: str,
+    output: Path,
+) -> None:
+    """Bind this host to exact workflow input, receipt, and clean Stinger commit."""
+    try:
+        attestation = build_machine_workflow_attestation(
+            machine_identity_artifact=machine_identity,
+            workflow_input=workflow_input,
+            workflow_receipt=workflow_receipt,
+            repository=repository,
+            expected_stinger_commit=expected_stinger_commit,
+            signer_identity=signer_identity,
+        )
+        write_machine_workflow_attestation(output, attestation)
+    except MachineAttestationError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo("machine workflow attestation created")
+
+
+@benchmark_commands.command(name="sign-machine-workflow-attestation")
+@click.argument("attestation", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--private-key",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def sign_benchmark_machine_workflow_attestation(
+    attestation: Path,
+    private_key: Path,
+) -> None:
+    """Sign exact machine-workflow evidence in its dedicated namespace."""
+    try:
+        signature = sign_machine_workflow_attestation(attestation, private_key)
+    except MachineAttestationError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"signed machine workflow attestation: {signature}")
+
+
+@benchmark_commands.command(name="verify-machine-workflow-attestation")
+@click.option(
+    "--machine-identity",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--workflow-input",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--workflow-receipt",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--attestation",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--signer-identity", required=True)
+@click.option("--expected-stinger-commit", required=True)
+def verify_benchmark_machine_workflow_attestation(
+    machine_identity: Path,
+    workflow_input: Path,
+    workflow_receipt: Path,
+    attestation: Path,
+    signature: Path,
+    allowed_signers: Path,
+    signer_identity: str,
+    expected_stinger_commit: str,
+) -> None:
+    """Verify exact host-derived workflow evidence without claiming hardware proof."""
+    try:
+        verified = verify_machine_workflow_attestation(
+            machine_identity_artifact=machine_identity,
+            workflow_input=workflow_input,
+            workflow_receipt=workflow_receipt,
+            attestation=attestation,
+            signature=signature,
+            allowed_signers=allowed_signers,
+            signer_identity=signer_identity,
+            expected_stinger_commit=expected_stinger_commit,
+        )
+    except MachineAttestationError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        "machine workflow attestation verified: "
+        f"{verified.statement.platform.value}/{verified.statement.architecture.value}"
+    )
+
+
+@benchmark_commands.command(name="build-conformance-statement")
+@click.option("--environment-id", required=True)
+@click.option("--corpus-hash", required=True)
+@click.option(
+    "--workflow-input",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--workflow-output-inventory",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--workflow-output",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--machine-identity",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--machine-attestation",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--machine-attestation-signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--machine-attestation-allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--repository",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=".",
+    show_default=True,
+)
+@click.option("--signer-identity", required=True)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def build_benchmark_conformance_statement(
+    environment_id: str,
+    corpus_hash: str,
+    workflow_input: Path,
+    workflow_output_inventory: Path,
+    workflow_output: Path,
+    machine_identity: Path,
+    machine_attestation: Path,
+    machine_attestation_signature: Path,
+    machine_attestation_allowed_signers: Path,
+    repository: Path,
+    signer_identity: str,
+    output: Path,
+) -> None:
+    """Build one clean-environment statement from exact observed artifacts."""
+    try:
+        statement = build_conformance_environment_statement(
+            environment_id,
+            corpus_hash=corpus_hash,
+            workflow_input=workflow_input,
+            workflow_output_inventory=workflow_output_inventory,
+            workflow_output=workflow_output,
+            machine_workflow_evidence=MachineWorkflowEvidencePaths(
+                identity_artifact=machine_identity,
+                attestation=machine_attestation,
+                signature=machine_attestation_signature,
+                allowed_signers=machine_attestation_allowed_signers,
+                signer_identity=signer_identity,
+            ),
+            repository=repository,
+            signer_identity=signer_identity,
+        )
+        write_conformance_environment_statement(output, statement)
+    except ConformanceBuilderError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo("benchmark conformance statement created")
+
+
+@benchmark_commands.command(name="run-conformance-workflow")
+@click.option(
+    "--repository",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=".",
+    show_default=True,
+)
+@click.option(
+    "--toolchain-python",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path, resolve_path=True),
+    required=True,
+)
+@click.option("--expected-stinger-commit", required=True)
+@click.option("--corpus-hash", required=True)
+@click.option("--output-package", type=click.Path(path_type=Path), required=True)
+def run_benchmark_conformance_workflow(
+    repository: Path,
+    toolchain_python: Path,
+    expected_stinger_commit: str,
+    corpus_hash: str,
+    output_package: Path,
+) -> None:
+    """Run the fixed tracked-source conformance workflow and preserve exact evidence."""
+    try:
+        prepared = prepare_conformance_workflow(
+            repository=repository,
+            toolchain_python=toolchain_python,
+            expected_stinger_commit=expected_stinger_commit,
+            corpus_hash=corpus_hash,
+        )
+        write_conformance_workflow_package(output_package, prepared)
+    except ConformanceBuilderError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo("fixed benchmark conformance workflow completed")
+
+
+@benchmark_commands.command(name="sign-conformance")
+@click.argument("statement", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--private-key",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def sign_benchmark_conformance(statement: Path, private_key: Path) -> None:
+    """Sign one exact clean-environment conformance statement."""
+    try:
+        signature = sign_conformance_statement(statement, private_key)
+    except ProtocolSignatureError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"signed benchmark conformance statement: {signature}")
+
+
+@benchmark_commands.command(name="sign-baseline-verification")
+@click.argument("statement", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--private-key",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def sign_benchmark_baseline_verification(statement: Path, private_key: Path) -> None:
+    """Sign one exact artifact-derived baseline verification statement."""
+    try:
+        signature = sign_baseline_verification_statement(statement, private_key)
+    except ProtocolSignatureError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"signed benchmark baseline verification statement: {signature}")
+
+
+@benchmark_commands.command(name="sign-release-evidence")
+@click.argument("statement", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--private-key",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def sign_benchmark_release_evidence(statement: Path, private_key: Path) -> None:
+    """Sign one exact artifact-derived release-evidence statement."""
+    try:
+        signature = sign_release_evidence_statement(statement, private_key)
+    except ProtocolSignatureError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"signed benchmark release evidence statement: {signature}")
+
+
+@benchmark_commands.command(name="build-release-artifacts")
+@click.option(
+    "--submission",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Typed draft submission; release-evidence hashes may still be empty.",
+)
+@click.option(
+    "--conflicts-declaration",
+    type=click.Choice(
+        ["no-known-material-conflicts", "material-conflicts-disclosed"],
+        case_sensitive=True,
+    ),
+    required=True,
+)
+@click.option(
+    "--conflict",
+    type=(
+        click.Choice(
+            ["financial", "employment", "advisory", "investment", "family", "other"],
+            case_sensitive=True,
+        ),
+        str,
+        str,
+    ),
+    multiple=True,
+    metavar="CATEGORY ENTITY DESCRIPTION",
+    help="One material relationship; repeat as needed.",
+)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def build_benchmark_release_artifacts(
+    submission: Path,
+    conflicts_declaration: str,
+    conflict: tuple[tuple[str, str, str], ...],
+    output: Path,
+) -> None:
+    """Build the canonical non-comparative report, freeze, policy, and disclosure package."""
+    try:
+        finalized = load_benchmark_submission(submission)
+        relationships = tuple(
+            ConflictDisclosureEntry(
+                category=category,  # type: ignore[arg-type]
+                entity=entity,
+                description=description,
+            )
+            for category, entity, description in conflict
+        )
+        if conflicts_declaration not in {
+            "no-known-material-conflicts",
+            "material-conflicts-disclosed",
+        }:
+            raise ReleaseEvidenceBuilderError("conflicts declaration is invalid")
+        artifacts = build_release_artifact_manifest(
+            finalized,
+            conflicts_declaration=conflicts_declaration,  # type: ignore[arg-type]
+            conflict_relationships=relationships,
+        )
+        write_release_artifact_package(output, artifacts)
+    except (OSError, ValidationError, ValueError, ReleaseEvidenceBuilderError) as exc:
+        raise click.ClickException("release artifact construction failed") from exc
+    click.echo("canonical non-comparative release artifacts created")
+
+
+def _prepare_release_evidence_from_cli(
+    *,
+    repository: Path,
+    toolchain_python: Path,
+    expected_stinger_commit: str,
+    corpus_version: str,
+    corpus_hash: str,
+    protocol_freeze_receipt: Path,
+    technical_report: Path,
+    correction_policy: Path,
+    conflicts_disclosure: Path,
+    comparative_release: bool,
+    vendor_rerun_receipt: Path | None,
+) -> PreparedReleaseEvidence:
+    """Share exact release-artifact preparation between the two CLI stages."""
+    return prepare_release_evidence(
+        repository=repository,
+        toolchain_python=toolchain_python,
+        expected_stinger_commit=expected_stinger_commit,
+        corpus_version=corpus_version,
+        corpus_hash=corpus_hash,
+        protocol_freeze_receipt=protocol_freeze_receipt,
+        technical_report=technical_report,
+        correction_policy=correction_policy,
+        conflicts_disclosure=conflicts_disclosure,
+        comparative_release=comparative_release,
+        vendor_rerun_receipt=vendor_rerun_receipt,
+    )
+
+
+@benchmark_commands.command(name="build-release-evidence-record")
+@click.option(
+    "--repository",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=".",
+    show_default=True,
+)
+@click.option(
+    "--toolchain-python",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path, resolve_path=True),
+    required=True,
+    help="Explicit gate Python outside the release checkout.",
+)
+@click.option("--expected-stinger-commit", required=True)
+@click.option("--corpus-version", required=True)
+@click.option("--corpus-hash", required=True)
+@click.option(
+    "--protocol-freeze-receipt",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--technical-report",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--correction-policy",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--conflicts-disclosure",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--comparative-release/--non-comparative-release",
+    default=False,
+    show_default=True,
+)
+@click.option(
+    "--vendor-rerun-receipt",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--preparation-package",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def build_benchmark_release_evidence_record(
+    repository: Path,
+    toolchain_python: Path,
+    expected_stinger_commit: str,
+    corpus_version: str,
+    corpus_hash: str,
+    protocol_freeze_receipt: Path,
+    technical_report: Path,
+    correction_policy: Path,
+    conflicts_disclosure: Path,
+    comparative_release: bool,
+    vendor_rerun_receipt: Path | None,
+    preparation_package: Path,
+    output: Path,
+) -> None:
+    """Run the clean master gate and derive the exact release-evidence record."""
+    try:
+        prepared = _prepare_release_evidence_from_cli(
+            repository=repository,
+            toolchain_python=toolchain_python,
+            expected_stinger_commit=expected_stinger_commit,
+            corpus_version=corpus_version,
+            corpus_hash=corpus_hash,
+            protocol_freeze_receipt=protocol_freeze_receipt,
+            technical_report=technical_report,
+            correction_policy=correction_policy,
+            conflicts_disclosure=conflicts_disclosure,
+            comparative_release=comparative_release,
+            vendor_rerun_receipt=vendor_rerun_receipt,
+        )
+        write_release_evidence_preparation_package(preparation_package, prepared)
+        write_release_evidence_record(output, prepared.record)
+    except ReleaseEvidenceBuilderError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo("release evidence record created from a clean master-gate execution")
+
+
+@benchmark_commands.command(name="build-release-evidence-statement")
+@click.option(
+    "--submission",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--signer-identity", required=True)
+@click.option(
+    "--repository",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=".",
+    show_default=True,
+)
+@click.option("--expected-stinger-commit", required=True)
+@click.option("--corpus-version", required=True)
+@click.option("--corpus-hash", required=True)
+@click.option(
+    "--protocol-freeze-receipt",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--technical-report",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--correction-policy",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--conflicts-disclosure",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--comparative-release/--non-comparative-release",
+    default=False,
+    show_default=True,
+)
+@click.option(
+    "--vendor-rerun-receipt",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--preparation-package",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def build_benchmark_release_evidence_statement(
+    submission: Path,
+    signer_identity: str,
+    repository: Path,
+    expected_stinger_commit: str,
+    corpus_version: str,
+    corpus_hash: str,
+    protocol_freeze_receipt: Path,
+    technical_report: Path,
+    correction_policy: Path,
+    conflicts_disclosure: Path,
+    comparative_release: bool,
+    vendor_rerun_receipt: Path | None,
+    preparation_package: Path,
+    output: Path,
+) -> None:
+    """Reverify one persisted gate receipt and bind it to a finalized submission."""
+    try:
+        prepared = load_release_evidence_preparation_package(
+            preparation_package,
+            repository=repository,
+            expected_stinger_commit=expected_stinger_commit,
+            corpus_version=corpus_version,
+            corpus_hash=corpus_hash,
+            protocol_freeze_receipt=protocol_freeze_receipt,
+            technical_report=technical_report,
+            correction_policy=correction_policy,
+            conflicts_disclosure=conflicts_disclosure,
+            comparative_release=comparative_release,
+            vendor_rerun_receipt=vendor_rerun_receipt,
+        )
+        finalized = load_benchmark_submission(submission)
+        statement = build_release_evidence_statement(
+            finalized,
+            prepared,
+            signer_identity=signer_identity,
+        )
+        write_release_evidence_statement(output, statement)
+    except (ReleaseEvidenceBuilderError, OSError, ValidationError, ValueError) as exc:
+        raise click.ClickException("release evidence statement construction failed") from exc
+    click.echo("release evidence statement bound to the finalized submission")
+
+
+@benchmark_commands.command(name="build-conformance-record")
+@click.option("--statement", type=click.Path(path_type=Path), required=True)
+@click.option("--signature", type=click.Path(path_type=Path), required=True)
+@click.option("--allowed-signers", type=click.Path(path_type=Path), required=True)
+@click.option("--signer-identity", required=True)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def build_benchmark_conformance_record(
+    statement: Path,
+    signature: Path,
+    allowed_signers: Path,
+    signer_identity: str,
+    output: Path,
+) -> None:
+    """Build a release record from one trusted signed conformance statement."""
+    try:
+        record = build_conformance_environment_record(
+            statement,
+            signature,
+            allowed_signers,
+            signer_identity,
+        )
+        write_conformance_environment_record(output, record)
+    except ConformanceBuilderError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo("benchmark conformance record created")
+
+
 @benchmark_commands.command(name="sign-release")
 @click.argument("submission", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option(
@@ -142,6 +1263,22 @@ def sign_benchmark_release(submission: Path, private_key: Path) -> None:
     click.echo(f"signed benchmark release submission: {signature}")
 
 
+@benchmark_commands.command(name="sign-corpus-freeze")
+@click.argument("statement", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--private-key",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def sign_benchmark_corpus_freeze(statement: Path, private_key: Path) -> None:
+    """Sign exact machine-derived corpus-freeze statement bytes."""
+    try:
+        signature = sign_corpus_freeze_statement(statement, private_key)
+    except ProtocolSignatureError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"signed benchmark corpus freeze statement: {signature}")
+
+
 @benchmark_commands.command(name="sign-reproduction")
 @click.argument("statement", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option(
@@ -150,12 +1287,34 @@ def sign_benchmark_release(submission: Path, private_key: Path) -> None:
     required=True,
 )
 def sign_benchmark_reproduction(statement: Path, private_key: Path) -> None:
-    """Sign an independent evaluator's exact artifact-binding statement."""
+    """Sign a cross-machine evaluator's exact artifact-binding statement."""
     try:
         signature = sign_reproduction_statement(statement, private_key)
     except ProtocolSignatureError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"signed benchmark reproduction statement: {signature}")
+
+
+@benchmark_commands.command(name="sign-public-reproduction-verification")
+@click.argument("statement", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--private-key",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+def sign_benchmark_public_reproduction_verification(
+    statement: Path,
+    private_key: Path,
+) -> None:
+    """Sign the exact non-secret handoff from full verification to release-check."""
+    try:
+        signature = sign_public_reproduction_verification_statement(
+            statement,
+            private_key,
+        )
+    except ProtocolSignatureError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"signed public reproduction verification statement: {signature}")
 
 
 @benchmark_commands.command(name="sign-reproduced-report")
@@ -215,18 +1374,18 @@ def verify_benchmark_protocol(
     default="benchmark/protocol.yaml",
 )
 def check_benchmark_protocol(protocol: Path) -> None:
-    """Refuse a machine protocol manifest that weakens or drifts from v1."""
+    """Refuse a machine protocol manifest that weakens or drifts from Protocol 2."""
     try:
         loaded = load_benchmark_protocol(protocol)
     except (OSError, ValueError, ValidationError) as exc:
         raise click.ClickException(f"invalid benchmark protocol: {exc}") from exc
-    if loaded != BenchmarkProtocolManifest():
+    if loaded != compiled_benchmark_protocol():
         raise click.ClickException(
-            "protocol manifest differs from the compiled Benchmark v1 release thresholds"
+            "protocol manifest differs from the compiled Benchmark Protocol 2 thresholds"
         )
     click.echo(
         f"benchmark protocol {loaded.benchmark_protocol_version} is structurally valid "
-        f"({loaded.total_scenarios} sealed scenarios, status={loaded.status.value})"
+        f"(requires {loaded.total_scenarios} sealed scenarios; release remains gate-controlled)"
     )
 
 
@@ -248,6 +1407,130 @@ def benchmark_release_schema() -> None:
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
 )
 @click.option("--format", "output_format", type=click.Choice(["text", "json"]), default="text")
+@click.option(
+    "--protocol",
+    "signed_protocol",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--protocol-signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--protocol-allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option("--protocol-signer-identity")
+@click.option(
+    "--candidate-receipt",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--candidate-receipt-signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--candidate-receipt-allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option("--candidate-receipt-signer-identity")
+@click.option(
+    "--candidate-promotion-statement",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--candidate-promotion-signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--candidate-promotion-allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option("--candidate-promotion-signer-identity")
+@click.option(
+    "--corpus-construction-receipt",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--corpus-construction-signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--corpus-construction-allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option("--corpus-construction-signer-identity")
+@click.option(
+    "--corpus-freeze-statement",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--corpus-freeze-signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--corpus-freeze-allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option("--corpus-freeze-signer-identity")
+@click.option(
+    "--pilot-evidence-statement",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--pilot-evidence-signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--pilot-evidence-allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option("--pilot-evidence-signer-identity")
+@click.option(
+    "--conformance-statement",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+)
+@click.option(
+    "--conformance-signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+)
+@click.option(
+    "--conformance-allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+)
+@click.option("--conformance-signer-identity", multiple=True)
+@click.option(
+    "--baseline-verification-statement",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+)
+@click.option(
+    "--baseline-verification-signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+)
+@click.option(
+    "--baseline-verification-allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+)
+@click.option("--baseline-verification-signer-identity", multiple=True)
+@click.option(
+    "--release-evidence-statement",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--release-evidence-signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--release-evidence-allowed-signers",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option("--release-evidence-signer-identity")
 @click.option("--signature", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option(
     "--allowed-signers",
@@ -267,9 +1550,53 @@ def benchmark_release_schema() -> None:
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
 )
 @click.option("--verifier-identity")
+@click.option(
+    "--public-reproduction-verification-statement",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--public-reproduction-verification-signature",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
 def benchmark_release_check(
     submission: Path,
     output_format: str,
+    signed_protocol: Path | None,
+    protocol_signature: Path | None,
+    protocol_allowed_signers: Path | None,
+    protocol_signer_identity: str | None,
+    candidate_receipt: Path | None,
+    candidate_receipt_signature: Path | None,
+    candidate_receipt_allowed_signers: Path | None,
+    candidate_receipt_signer_identity: str | None,
+    candidate_promotion_statement: Path | None,
+    candidate_promotion_signature: Path | None,
+    candidate_promotion_allowed_signers: Path | None,
+    candidate_promotion_signer_identity: str | None,
+    corpus_construction_receipt: Path | None,
+    corpus_construction_signature: Path | None,
+    corpus_construction_allowed_signers: Path | None,
+    corpus_construction_signer_identity: str | None,
+    corpus_freeze_statement: Path | None,
+    corpus_freeze_signature: Path | None,
+    corpus_freeze_allowed_signers: Path | None,
+    corpus_freeze_signer_identity: str | None,
+    pilot_evidence_statement: Path | None,
+    pilot_evidence_signature: Path | None,
+    pilot_evidence_allowed_signers: Path | None,
+    pilot_evidence_signer_identity: str | None,
+    conformance_statement: tuple[Path, ...],
+    conformance_signature: tuple[Path, ...],
+    conformance_allowed_signers: tuple[Path, ...],
+    conformance_signer_identity: tuple[str, ...],
+    baseline_verification_statement: tuple[Path, ...],
+    baseline_verification_signature: tuple[Path, ...],
+    baseline_verification_allowed_signers: tuple[Path, ...],
+    baseline_verification_signer_identity: tuple[str, ...],
+    release_evidence_statement: Path | None,
+    release_evidence_signature: Path | None,
+    release_evidence_allowed_signers: Path | None,
+    release_evidence_signer_identity: str | None,
     signature: Path | None,
     allowed_signers: Path | None,
     signer_identity: str | None,
@@ -277,9 +1604,252 @@ def benchmark_release_check(
     reproduction_signature: Path | None,
     verifier_allowed_signers: Path | None,
     verifier_identity: str | None,
+    public_reproduction_verification_statement: Path | None,
+    public_reproduction_verification_signature: Path | None,
 ) -> None:
-    """Evaluate every v1 release gate; blocked submissions exit non-zero."""
+    """Evaluate every Protocol 2 release gate; blocked submissions exit non-zero."""
     try:
+        protocol_inputs = (
+            signed_protocol,
+            protocol_signature,
+            protocol_allowed_signers,
+            protocol_signer_identity,
+        )
+        if any(item is not None for item in protocol_inputs) and not all(
+            item is not None for item in protocol_inputs
+        ):
+            raise ValueError("all protocol/signature/trust options are required together")
+        protocol_authorization = None
+        authorized_protocol = None
+        if (
+            signed_protocol is not None
+            and protocol_signature is not None
+            and protocol_allowed_signers is not None
+            and protocol_signer_identity is not None
+        ):
+            authorized_protocol, protocol_authorization = authorize_benchmark_protocol(
+                signed_protocol,
+                protocol_signature,
+                protocol_allowed_signers,
+                protocol_signer_identity,
+            )
+
+        candidate_receipt_inputs = (
+            candidate_receipt,
+            candidate_receipt_signature,
+            candidate_receipt_allowed_signers,
+            candidate_receipt_signer_identity,
+        )
+        if any(item is not None for item in candidate_receipt_inputs) and not all(
+            item is not None for item in candidate_receipt_inputs
+        ):
+            raise ValueError("all candidate receipt/signature/trust options are required together")
+        candidate_validation_authorization = (
+            authorize_candidate_validation_receipt(
+                candidate_receipt,
+                candidate_receipt_signature,
+                candidate_receipt_allowed_signers,
+                candidate_receipt_signer_identity,
+            )
+            if candidate_receipt is not None
+            and candidate_receipt_signature is not None
+            and candidate_receipt_allowed_signers is not None
+            and candidate_receipt_signer_identity is not None
+            else None
+        )
+
+        candidate_promotion_inputs = (
+            candidate_promotion_statement,
+            candidate_promotion_signature,
+            candidate_promotion_allowed_signers,
+            candidate_promotion_signer_identity,
+        )
+        if any(item is not None for item in candidate_promotion_inputs) and not all(
+            item is not None for item in candidate_promotion_inputs
+        ):
+            raise ValueError(
+                "all candidate promotion/signature/trust options are required together"
+            )
+        candidate_promotion_authorization = (
+            authorize_candidate_promotion_statement(
+                candidate_promotion_statement,
+                candidate_promotion_signature,
+                candidate_promotion_allowed_signers,
+                candidate_promotion_signer_identity,
+            )
+            if candidate_promotion_statement is not None
+            and candidate_promotion_signature is not None
+            and candidate_promotion_allowed_signers is not None
+            and candidate_promotion_signer_identity is not None
+            else None
+        )
+
+        corpus_construction_inputs = (
+            corpus_construction_receipt,
+            corpus_construction_signature,
+            corpus_construction_allowed_signers,
+            corpus_construction_signer_identity,
+        )
+        if any(item is not None for item in corpus_construction_inputs) and not all(
+            item is not None for item in corpus_construction_inputs
+        ):
+            raise ValueError(
+                "all corpus construction receipt/signature/trust options are required together"
+            )
+        corpus_construction_authorization = (
+            authorize_corpus_construction_receipt(
+                corpus_construction_receipt,
+                corpus_construction_signature,
+                corpus_construction_allowed_signers,
+                corpus_construction_signer_identity,
+            )
+            if corpus_construction_receipt is not None
+            and corpus_construction_signature is not None
+            and corpus_construction_allowed_signers is not None
+            and corpus_construction_signer_identity is not None
+            else None
+        )
+
+        corpus_freeze_inputs = (
+            corpus_freeze_statement,
+            corpus_freeze_signature,
+            corpus_freeze_allowed_signers,
+            corpus_freeze_signer_identity,
+        )
+        if any(item is not None for item in corpus_freeze_inputs) and not all(
+            item is not None for item in corpus_freeze_inputs
+        ):
+            raise ValueError(
+                "all corpus-freeze statement/signature/trust options are required together"
+            )
+        corpus_freeze_authorization = (
+            authorize_corpus_freeze_statement(
+                corpus_freeze_statement,
+                corpus_freeze_signature,
+                corpus_freeze_allowed_signers,
+                corpus_freeze_signer_identity,
+            )
+            if corpus_freeze_statement is not None
+            and corpus_freeze_signature is not None
+            and corpus_freeze_allowed_signers is not None
+            and corpus_freeze_signer_identity is not None
+            else None
+        )
+
+        pilot_evidence_inputs = (
+            pilot_evidence_statement,
+            pilot_evidence_signature,
+            pilot_evidence_allowed_signers,
+            pilot_evidence_signer_identity,
+        )
+        if any(item is not None for item in pilot_evidence_inputs) and not all(
+            item is not None for item in pilot_evidence_inputs
+        ):
+            raise ValueError(
+                "all pilot evidence statement/signature/trust options are required together"
+            )
+        pilot_authorization = (
+            authorize_pilot_evidence_statement(
+                pilot_evidence_statement,
+                pilot_evidence_signature,
+                pilot_evidence_allowed_signers,
+                pilot_evidence_signer_identity,
+            )
+            if pilot_evidence_statement is not None
+            and pilot_evidence_signature is not None
+            and pilot_evidence_allowed_signers is not None
+            and pilot_evidence_signer_identity is not None
+            else None
+        )
+
+        conformance_counts = {
+            len(conformance_statement),
+            len(conformance_signature),
+            len(conformance_allowed_signers),
+            len(conformance_signer_identity),
+        }
+        if len(conformance_counts) != 1:
+            raise ValueError("conformance statement/signature/trust options must have equal counts")
+        conformance_inputs = zip(
+            conformance_statement,
+            conformance_signature,
+            conformance_allowed_signers,
+            conformance_signer_identity,
+            strict=True,
+        )
+        conformance_authorizations = tuple(
+            authorize_conformance_statement(
+                statement,
+                statement_signature,
+                statement_allowed_signers,
+                statement_identity,
+            )
+            for (
+                statement,
+                statement_signature,
+                statement_allowed_signers,
+                statement_identity,
+            ) in conformance_inputs
+        )
+
+        baseline_verification_counts = {
+            len(baseline_verification_statement),
+            len(baseline_verification_signature),
+            len(baseline_verification_allowed_signers),
+            len(baseline_verification_signer_identity),
+        }
+        if len(baseline_verification_counts) != 1:
+            raise ValueError(
+                "baseline verification statement/signature/trust options must have equal counts"
+            )
+        baseline_verification_inputs = zip(
+            baseline_verification_statement,
+            baseline_verification_signature,
+            baseline_verification_allowed_signers,
+            baseline_verification_signer_identity,
+            strict=True,
+        )
+        baseline_authorizations = tuple(
+            authorize_baseline_verification_statement(
+                statement,
+                statement_signature,
+                statement_allowed_signers,
+                statement_identity,
+            )
+            for (
+                statement,
+                statement_signature,
+                statement_allowed_signers,
+                statement_identity,
+            ) in baseline_verification_inputs
+        )
+
+        release_evidence_inputs = (
+            release_evidence_statement,
+            release_evidence_signature,
+            release_evidence_allowed_signers,
+            release_evidence_signer_identity,
+        )
+        if any(item is not None for item in release_evidence_inputs) and not all(
+            item is not None for item in release_evidence_inputs
+        ):
+            raise ValueError(
+                "all release evidence statement/signature/trust options are required together"
+            )
+        release_evidence_authorization = (
+            authorize_release_evidence_statement(
+                release_evidence_statement,
+                release_evidence_signature,
+                release_evidence_allowed_signers,
+                release_evidence_signer_identity,
+            )
+            if release_evidence_statement is not None
+            and release_evidence_signature is not None
+            and release_evidence_allowed_signers is not None
+            and release_evidence_signer_identity is not None
+            else None
+        )
+
         release_inputs = (signature, allowed_signers, signer_identity)
         if any(item is not None for item in release_inputs) and not all(
             item is not None for item in release_inputs
@@ -297,6 +1867,8 @@ def benchmark_release_check(
         else:
             loaded = load_benchmark_submission(submission)
             authorization = None
+        if authorized_protocol is not None and loaded.protocol != authorized_protocol:
+            raise ValueError("signed protocol differs from the release submission protocol")
 
         reproduction_inputs = (
             reproduction_statement,
@@ -323,12 +1895,57 @@ def benchmark_release_check(
             and verifier_identity is not None
             else None
         )
+        public_reproduction_inputs = (
+            public_reproduction_verification_statement,
+            public_reproduction_verification_signature,
+        )
+        if any(item is not None for item in public_reproduction_inputs) and not all(
+            item is not None for item in public_reproduction_inputs
+        ):
+            raise ValueError(
+                "public reproduction verification statement and signature are required together"
+            )
+        public_reproduction_authorization = None
+        if all(item is not None for item in public_reproduction_inputs):
+            if reproduction_authorization is None:
+                raise ValueError(
+                    "public reproduction verification requires a signed reproduction statement"
+                )
+            if verifier_allowed_signers is None or verifier_identity is None:
+                raise ValueError("public reproduction verification requires verifier trust options")
+            assert public_reproduction_verification_statement is not None
+            assert public_reproduction_verification_signature is not None
+            public_reproduction_authorization = (
+                authorize_public_reproduction_verification_statement(
+                    public_reproduction_verification_statement,
+                    public_reproduction_verification_signature,
+                    verifier_allowed_signers,
+                    verifier_identity,
+                )
+            )
         gate = evaluate_benchmark_release(
             loaded,
+            protocol_authorization=protocol_authorization,
+            candidate_validation_authorization=candidate_validation_authorization,
+            candidate_promotion_authorization=candidate_promotion_authorization,
+            corpus_construction_authorization=corpus_construction_authorization,
+            corpus_freeze_authorization=corpus_freeze_authorization,
+            pilot_authorization=pilot_authorization,
+            baseline_authorizations=baseline_authorizations,
+            conformance_authorizations=conformance_authorizations,
             authorization=authorization,
+            release_evidence_authorization=release_evidence_authorization,
             reproduction_authorization=reproduction_authorization,
+            public_reproduction_authorization=public_reproduction_authorization,
         )
-    except (OSError, ValueError, ValidationError, ProtocolSignatureError) as exc:
+    except (
+        CorpusConstructionError,
+        OSError,
+        PublicReproductionVerificationError,
+        ValueError,
+        ValidationError,
+        ProtocolSignatureError,
+    ) as exc:
         raise click.ClickException(f"invalid benchmark release submission: {exc}") from exc
 
     if output_format == "json":
@@ -349,8 +1966,8 @@ def _echo_benchmark_gate(gate: BenchmarkGateReport) -> None:
         f"{gate.metrics.unique_clusters} clusters, "
         f"{gate.metrics.baseline_configurations} configurations, "
         f"{gate.metrics.baseline_providers} providers, "
-        f"{gate.metrics.complete_beta_operators} outside beta operators, "
-        f"{gate.metrics.independent_reproductions} independent reproductions"
+        f"{gate.metrics.conformance_environments} conformance environments, "
+        f"{gate.metrics.cross_machine_reproductions} cross-machine reproductions"
     )
     if not gate.issues:
         return
@@ -391,7 +2008,7 @@ def compare_benchmark_reports(
 @click.argument("reproduced", type=click.Path(path_type=Path))
 @click.option("--output", type=click.Path(path_type=Path), required=True)
 def reproduction_diff(target: Path, reproduced: Path, output: Path) -> None:
-    """Create an unresolved private review template from two verified reports."""
+    """Create an immutable automatic discrepancy ledger from two verified reports."""
     try:
         template = build_reproduction_diff(
             _load_private_report(target),
@@ -407,7 +2024,7 @@ def reproduction_diff(target: Path, reproduced: Path, output: Path) -> None:
         ValueError,
     ) as exc:
         raise click.ClickException("reproduction diff construction failed") from exc
-    click.echo("private reproduction discrepancy template created")
+    click.echo("automatic reproduction discrepancy ledger created")
 
 
 def _load_report_path(path: Path) -> Report:
@@ -678,10 +2295,18 @@ def verify_escrow_bundle(
     type=click.Path(path_type=Path),
     required=True,
 )
+@click.option("--machine-attestation", type=click.Path(path_type=Path), required=True)
 @click.option(
-    "--error-dispositions",
+    "--machine-attestation-signature",
     type=click.Path(path_type=Path),
+    required=True,
 )
+@click.option(
+    "--machine-attestation-allowed-signers",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option("--machine-attestation-signer-identity", required=True)
 @click.option("--output", type=click.Path(path_type=Path), required=True)
 def build_baseline_record(
     configuration_id: str,
@@ -693,13 +2318,15 @@ def build_baseline_record(
     allowed_signers: Path,
     signer_identity: str,
     machine_identity: Path,
-    error_dispositions: Path | None,
+    machine_attestation: Path,
+    machine_attestation_signature: Path,
+    machine_attestation_allowed_signers: Path,
+    machine_attestation_signer_identity: str,
     output: Path,
 ) -> None:
-    """Build a baseline record only from independently verified artifact bytes."""
+    """Build a baseline record only from mechanically verified artifact bytes."""
     try:
         corpus = _load_sealed_corpus_record(corpus_record)
-        dispositions = _load_error_dispositions(error_dispositions)
         policy = _public_leakage_policy(forbidden_source, marker_file)
         record = build_baseline_configuration_record(
             configuration_id,
@@ -709,8 +2336,13 @@ def build_baseline_record(
             leakage_policy=policy,
             protocol_allowed_signers=allowed_signers,
             protocol_signer_identity=signer_identity,
-            machine_identity_artifact=machine_identity,
-            error_dispositions=dispositions,
+            machine_workflow_evidence=MachineWorkflowEvidencePaths(
+                identity_artifact=machine_identity,
+                attestation=machine_attestation,
+                signature=machine_attestation_signature,
+                allowed_signers=machine_attestation_allowed_signers,
+                signer_identity=machine_attestation_signer_identity,
+            ),
         )
         write_baseline_configuration_record(output, record)
     except (BaselineRecordError, EvidenceBundleError) as exc:
@@ -718,6 +2350,191 @@ def build_baseline_record(
     except (OSError, UnicodeDecodeError, ValidationError, ValueError, yaml.YAMLError) as exc:
         raise click.ClickException("baseline record input is invalid") from exc
     click.echo("baseline configuration record created from verified artifacts")
+
+
+@benchmark_commands.command(name="build-baseline-verification")
+@click.option("--configuration-id", required=True)
+@click.option("--baseline-record", type=click.Path(path_type=Path), required=True)
+@click.option("--corpus-record", type=click.Path(path_type=Path), required=True)
+@click.option("--public-bundle", type=click.Path(path_type=Path), required=True)
+@click.option("--escrow-bundle", type=click.Path(path_type=Path), required=True)
+@click.option(
+    "--forbidden-source",
+    type=click.Path(path_type=Path),
+    multiple=True,
+    required=True,
+)
+@click.option(
+    "--marker-file",
+    type=click.Path(path_type=Path),
+    multiple=True,
+    required=True,
+)
+@click.option("--protocol-allowed-signers", type=click.Path(path_type=Path), required=True)
+@click.option("--protocol-signer-identity", required=True)
+@click.option("--machine-identity", type=click.Path(path_type=Path), required=True)
+@click.option("--machine-attestation", type=click.Path(path_type=Path), required=True)
+@click.option(
+    "--machine-attestation-signature",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option(
+    "--machine-attestation-allowed-signers",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option("--machine-attestation-signer-identity", required=True)
+@click.option("--statement-signer-identity", required=True)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def build_baseline_verification(
+    configuration_id: str,
+    baseline_record: Path,
+    corpus_record: Path,
+    public_bundle: Path,
+    escrow_bundle: Path,
+    forbidden_source: tuple[Path, ...],
+    marker_file: tuple[Path, ...],
+    protocol_allowed_signers: Path,
+    protocol_signer_identity: str,
+    machine_identity: Path,
+    machine_attestation: Path,
+    machine_attestation_signature: Path,
+    machine_attestation_allowed_signers: Path,
+    machine_attestation_signer_identity: str,
+    statement_signer_identity: str,
+    output: Path,
+) -> None:
+    """Rebuild a baseline from exact bundles and emit its signable statement."""
+    try:
+        expected = _load_baseline_configuration_record(baseline_record)
+        corpus = _load_sealed_corpus_record(corpus_record)
+        statement = build_baseline_verification_statement(
+            configuration_id,
+            expected_record=expected,
+            corpus=corpus,
+            public_bundle=public_bundle,
+            escrow_bundle=escrow_bundle,
+            leakage_policy=_public_leakage_policy(forbidden_source, marker_file),
+            protocol_allowed_signers=protocol_allowed_signers,
+            protocol_signer_identity=protocol_signer_identity,
+            machine_workflow_evidence=MachineWorkflowEvidencePaths(
+                identity_artifact=machine_identity,
+                attestation=machine_attestation,
+                signature=machine_attestation_signature,
+                allowed_signers=machine_attestation_allowed_signers,
+                signer_identity=machine_attestation_signer_identity,
+            ),
+            signer_identity=statement_signer_identity,
+        )
+        write_baseline_verification_statement(output, statement)
+    except (BaselineRecordError, EvidenceBundleError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    except (OSError, UnicodeDecodeError, ValidationError, ValueError, yaml.YAMLError) as exc:
+        raise click.ClickException("baseline verification input is invalid") from exc
+    click.echo("baseline verification statement created from exact verified bundles")
+
+
+@benchmark_commands.command(name="build-corpus-freeze-statement")
+@click.option(
+    "--corpus-record",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option(
+    "--protocol",
+    type=click.Path(path_type=Path),
+    default="benchmark/protocol.yaml",
+    show_default=True,
+)
+@click.option("--candidate-receipt", type=click.Path(path_type=Path), required=True)
+@click.option(
+    "--candidate-receipt-signature",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option(
+    "--candidate-receipt-allowed-signers",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option("--candidate-receipt-signer-identity", required=True)
+@click.option("--candidate-promotion-statement", type=click.Path(path_type=Path), required=True)
+@click.option("--candidate-promotion-signature", type=click.Path(path_type=Path), required=True)
+@click.option(
+    "--candidate-promotion-allowed-signers",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option("--candidate-promotion-signer-identity", required=True)
+@click.option("--signer-identity", required=True)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def build_corpus_freeze_statement_command(
+    corpus_record: Path,
+    protocol: Path,
+    candidate_receipt: Path,
+    candidate_receipt_signature: Path,
+    candidate_receipt_allowed_signers: Path,
+    candidate_receipt_signer_identity: str,
+    candidate_promotion_statement: Path,
+    candidate_promotion_signature: Path,
+    candidate_promotion_allowed_signers: Path,
+    candidate_promotion_signer_identity: str,
+    signer_identity: str,
+    output: Path,
+) -> None:
+    """Derive a canonical freeze statement from complete machine corpus evidence."""
+    try:
+        corpus = _load_sealed_corpus_record(corpus_record)
+        manifest = load_benchmark_protocol(protocol)
+        statement = build_corpus_freeze_statement(
+            corpus,
+            protocol=manifest,
+            candidate_receipt=candidate_receipt,
+            candidate_receipt_signature=candidate_receipt_signature,
+            candidate_receipt_allowed_signers=candidate_receipt_allowed_signers,
+            candidate_receipt_signer_identity=candidate_receipt_signer_identity,
+            candidate_promotion_statement=candidate_promotion_statement,
+            candidate_promotion_signature=candidate_promotion_signature,
+            candidate_promotion_allowed_signers=candidate_promotion_allowed_signers,
+            candidate_promotion_signer_identity=candidate_promotion_signer_identity,
+            signer_identity=signer_identity,
+        )
+        write_corpus_freeze_statement(output, statement)
+    except BaselineRecordError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except (OSError, UnicodeDecodeError, ValidationError, ValueError, yaml.YAMLError) as exc:
+        raise click.ClickException("corpus freeze input is invalid") from exc
+    click.echo("corpus freeze statement created from machine evidence")
+
+
+@benchmark_commands.command(name="build-corpus-freeze-record")
+@click.option("--statement", type=click.Path(path_type=Path), required=True)
+@click.option("--signature", type=click.Path(path_type=Path), required=True)
+@click.option("--allowed-signers", type=click.Path(path_type=Path), required=True)
+@click.option("--signer-identity", required=True)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def build_corpus_freeze_record_command(
+    statement: Path,
+    signature: Path,
+    allowed_signers: Path,
+    signer_identity: str,
+    output: Path,
+) -> None:
+    """Derive a release record from a trusted signed corpus-freeze statement."""
+    try:
+        record = build_corpus_freeze_record(
+            statement,
+            signature,
+            allowed_signers,
+            signer_identity,
+        )
+        write_corpus_freeze_record(output, record)
+    except BaselineRecordError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except (OSError, UnicodeDecodeError, ValidationError, ValueError) as exc:
+        raise click.ClickException("corpus freeze record input is invalid") from exc
+    click.echo("corpus freeze record created from signed statement")
 
 
 @benchmark_commands.command(name="build-reproduction-statement")
@@ -728,6 +2545,18 @@ def build_baseline_record(
 @click.option("--target-public-bundle", type=click.Path(path_type=Path), required=True)
 @click.option("--target-escrow-bundle", type=click.Path(path_type=Path), required=True)
 @click.option("--target-machine-identity", type=click.Path(path_type=Path), required=True)
+@click.option("--target-machine-attestation", type=click.Path(path_type=Path), required=True)
+@click.option(
+    "--target-machine-attestation-signature",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option(
+    "--target-machine-allowed-signers",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option("--target-machine-signer-identity", required=True)
 @click.option("--reproduced-public-bundle", type=click.Path(path_type=Path), required=True)
 @click.option("--reproduced-escrow-bundle", type=click.Path(path_type=Path), required=True)
 @click.option(
@@ -735,6 +2564,22 @@ def build_baseline_record(
     type=click.Path(path_type=Path),
     required=True,
 )
+@click.option(
+    "--reproduced-machine-attestation",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option(
+    "--reproduced-machine-attestation-signature",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option(
+    "--reproduced-machine-allowed-signers",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option("--reproduced-machine-signer-identity", required=True)
 @click.option(
     "--forbidden-source",
     type=click.Path(path_type=Path),
@@ -764,16 +2609,6 @@ def build_baseline_record(
     required=True,
 )
 @click.option("--evaluator-signer-identity", required=True)
-@click.option("--resolution-file", type=click.Path(path_type=Path), required=True)
-@click.option(
-    "--unaffiliated-attestation",
-    type=click.Path(path_type=Path),
-    required=True,
-)
-@click.option(
-    "--reproduced-error-dispositions",
-    type=click.Path(path_type=Path),
-)
 @click.option("--output-directory", type=click.Path(path_type=Path), required=True)
 def build_reproduction_statement_command(
     evaluator_id: str,
@@ -783,9 +2618,17 @@ def build_reproduction_statement_command(
     target_public_bundle: Path,
     target_escrow_bundle: Path,
     target_machine_identity: Path,
+    target_machine_attestation: Path,
+    target_machine_attestation_signature: Path,
+    target_machine_allowed_signers: Path,
+    target_machine_signer_identity: str,
     reproduced_public_bundle: Path,
     reproduced_escrow_bundle: Path,
     reproduced_machine_identity: Path,
+    reproduced_machine_attestation: Path,
+    reproduced_machine_attestation_signature: Path,
+    reproduced_machine_allowed_signers: Path,
+    reproduced_machine_signer_identity: str,
     forbidden_source: tuple[Path, ...],
     marker_file: tuple[Path, ...],
     protocol_allowed_signers: Path,
@@ -793,9 +2636,6 @@ def build_reproduction_statement_command(
     reproduced_report_signature: Path,
     evaluator_allowed_signers: Path,
     evaluator_signer_identity: str,
-    resolution_file: Path,
-    unaffiliated_attestation: Path,
-    reproduced_error_dispositions: Path | None,
     output_directory: Path,
 ) -> None:
     """Build canonical reproduction artifacts only from verified evidence."""
@@ -803,7 +2643,6 @@ def build_reproduction_statement_command(
         corpus = _load_sealed_corpus_record(corpus_record)
         baseline = _load_baseline_configuration_record(target_baseline_record)
         policy = _public_leakage_policy(forbidden_source, marker_file)
-        dispositions = _load_error_dispositions(reproduced_error_dispositions)
         build_reproduction_statement(
             evaluator_id,
             configuration_id=configuration_id,
@@ -811,26 +2650,117 @@ def build_reproduction_statement_command(
             target_baseline_record=baseline,
             target_public_bundle=target_public_bundle,
             target_escrow_bundle=target_escrow_bundle,
-            target_machine_identity_artifact=target_machine_identity,
+            target_machine_workflow_evidence=MachineWorkflowEvidencePaths(
+                identity_artifact=target_machine_identity,
+                attestation=target_machine_attestation,
+                signature=target_machine_attestation_signature,
+                allowed_signers=target_machine_allowed_signers,
+                signer_identity=target_machine_signer_identity,
+            ),
             reproduced_public_bundle=reproduced_public_bundle,
             reproduced_escrow_bundle=reproduced_escrow_bundle,
-            reproduced_machine_identity_artifact=reproduced_machine_identity,
+            reproduced_machine_workflow_evidence=MachineWorkflowEvidencePaths(
+                identity_artifact=reproduced_machine_identity,
+                attestation=reproduced_machine_attestation,
+                signature=reproduced_machine_attestation_signature,
+                allowed_signers=reproduced_machine_allowed_signers,
+                signer_identity=reproduced_machine_signer_identity,
+            ),
             leakage_policy=policy,
             protocol_allowed_signers=protocol_allowed_signers,
             protocol_signer_identity=protocol_signer_identity,
             reproduced_report_signature=reproduced_report_signature,
             evaluator_allowed_signers=evaluator_allowed_signers,
             evaluator_signer_identity=evaluator_signer_identity,
-            resolution_file=resolution_file,
-            unaffiliated_attestation=unaffiliated_attestation,
             output_directory=output_directory,
-            reproduced_error_dispositions=dispositions,
         )
     except (ReproductionBuilderError, EvidenceBundleError) as exc:
         raise click.ClickException(str(exc)) from exc
     except (OSError, UnicodeDecodeError, ValidationError, ValueError, yaml.YAMLError) as exc:
         raise click.ClickException("reproduction statement input is invalid") from exc
     click.echo("reproduction statement artifacts created from verified evidence")
+
+
+@benchmark_commands.command(name="verify-public-reproduction")
+@click.option("--reproduction-statement", type=click.Path(path_type=Path), required=True)
+@click.option("--reproduction-signature", type=click.Path(path_type=Path), required=True)
+@click.option("--verifier-allowed-signers", type=click.Path(path_type=Path), required=True)
+@click.option("--verifier-identity", required=True)
+@click.option("--target-baseline-record", type=click.Path(path_type=Path), required=True)
+@click.option("--target-public-bundle", type=click.Path(path_type=Path), required=True)
+@click.option("--reproduced-public-bundle", type=click.Path(path_type=Path), required=True)
+@click.option(
+    "--forbidden-source",
+    type=click.Path(path_type=Path),
+    multiple=True,
+    required=True,
+)
+@click.option(
+    "--marker-file",
+    type=click.Path(path_type=Path),
+    multiple=True,
+    required=True,
+)
+@click.option("--protocol-allowed-signers", type=click.Path(path_type=Path), required=True)
+@click.option("--protocol-signer-identity", required=True)
+@click.option("--reproduced-report-signature", type=click.Path(path_type=Path), required=True)
+@click.option("--comparison-manifest", type=click.Path(path_type=Path), required=True)
+@click.option("--discrepancy-ledger", type=click.Path(path_type=Path), required=True)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def verify_public_reproduction_command(
+    reproduction_statement: Path,
+    reproduction_signature: Path,
+    verifier_allowed_signers: Path,
+    verifier_identity: str,
+    target_baseline_record: Path,
+    target_public_bundle: Path,
+    reproduced_public_bundle: Path,
+    forbidden_source: tuple[Path, ...],
+    marker_file: tuple[Path, ...],
+    protocol_allowed_signers: Path,
+    protocol_signer_identity: str,
+    reproduced_report_signature: Path,
+    comparison_manifest: Path,
+    discrepancy_ledger: Path,
+    output: Path,
+) -> None:
+    """Fully verify public artifacts and emit a canonical, non-secret signable handoff."""
+    try:
+        authorization = authorize_reproduction_statement(
+            reproduction_statement,
+            reproduction_signature,
+            verifier_allowed_signers,
+            verifier_identity,
+        )
+        receipt = verify_public_reproduction(
+            authorization,
+            target_baseline=_load_baseline_configuration_record(target_baseline_record),
+            target_public_bundle=target_public_bundle,
+            reproduced_public_bundle=reproduced_public_bundle,
+            reproduced_public_leakage_policy=_public_leakage_policy(
+                forbidden_source,
+                marker_file,
+            ),
+            reproduced_protocol_allowed_signers=protocol_allowed_signers,
+            reproduced_protocol_signer_identity=protocol_signer_identity,
+            reproduced_report_signature=reproduced_report_signature,
+            reproduced_report_allowed_signers=verifier_allowed_signers,
+            reproduced_report_signer_identity=verifier_identity,
+            comparison_manifest=comparison_manifest,
+            discrepancy_ledger=discrepancy_ledger,
+        )
+        statement = build_public_reproduction_verification_statement(receipt)
+        write_public_reproduction_verification_statement(statement, output)
+    except (
+        OSError,
+        ProtocolSignatureError,
+        PublicReproductionVerificationError,
+        ValidationError,
+        ValueError,
+        yaml.YAMLError,
+    ) as exc:
+        raise click.ClickException("public reproduction verification failed") from exc
+    click.echo("public reproduction verification statement created")
 
 
 @benchmark_commands.command(name="build-reproduction-record")
@@ -859,7 +2789,7 @@ def build_reproduction_record_command(
         raise click.ClickException(str(exc)) from exc
     except (OSError, UnicodeDecodeError, ValidationError, ValueError) as exc:
         raise click.ClickException("reproduction record input is invalid") from exc
-    click.echo("independent reproduction record created from signed statement")
+    click.echo("cross-machine reproduction record created from signed statement")
 
 
 def _load_sealed_corpus_record(path: Path) -> SealedCorpusRecord:
@@ -876,18 +2806,6 @@ def _load_baseline_configuration_record(path: Path) -> BaselineConfigurationReco
     if not isinstance(raw, dict):
         raise ValueError("baseline record root must be a mapping")
     return BaselineConfigurationRecord.model_validate(raw)
-
-
-def _load_error_dispositions(
-    path: Path | None,
-) -> tuple[ErrorDispositionRecord, ...]:
-    """Load an optional closed list of human error dispositions."""
-    if path is None:
-        return ()
-    raw = yaml.safe_load(
-        _read_private_regular_file(path, label="error disposition record").decode("utf-8")
-    )
-    return TypeAdapter(tuple[ErrorDispositionRecord, ...]).validate_python(raw)
 
 
 def _public_leakage_policy(
@@ -1041,6 +2959,7 @@ def validate(path: Path | None, config_path: Path | None, docker: bool) -> None:
         )
 
     image = DEFAULT_IMAGE
+    benchmark_mode = False
     if config_path is not None:
         try:
             config = RunConfig.from_yaml(config_path)
@@ -1049,6 +2968,7 @@ def validate(path: Path | None, config_path: Path | None, docker: bool) -> None:
         path = config.corpus
         docker = docker or config.isolation is Isolation.DOCKER
         image = config.image  # validate with the image the run will verify with, not a default
+        benchmark_mode = config.benchmark_protocol_version is not None
     elif path is None:
         path = Path("scenarios")
 
@@ -1071,7 +2991,10 @@ def validate(path: Path | None, config_path: Path | None, docker: bool) -> None:
     for scenario in scenarios:
         try:
             box = _sandbox_for(scenario, docker, image)
-            box.preflight()
+            if benchmark_mode:
+                box.preflight_benchmark(Path(__file__).resolve().parents[2])
+            else:
+                box.preflight()
             validate_scenario(scenario.directory, scenario.manifest, sandbox=box)
         except (ValidityError, SandboxError) as exc:
             failures += 1
@@ -1133,6 +3056,7 @@ def run(config: Path, only: str | None, reps: int | None, local: bool) -> None:
     """
     resolved = _resolve_config(config, only, reps, local)
     scenarios = _load_and_validate(resolved)
+    resolved_corpus_hash = corpus_hash(scenarios)
     generated_at = datetime.now(UTC).isoformat()
     package = repro_dir_for(resolved, generated_at)
     try:
@@ -1152,47 +3076,88 @@ def run(config: Path, only: str | None, reps: int | None, local: bool) -> None:
         # Before anything runs: prove the verification image can serve a completion check.
         # A missing pytest would fail every check for a reason that has nothing to do with
         # the agent, and produce a plausible-looking report of universal failure.
-        sandbox.preflight()
+        if resolved.benchmark_protocol_version is not None:
+            sandbox.preflight_benchmark(Path(__file__).resolve().parents[2])
+        else:
+            sandbox.preflight()
     except SandboxError as exc:
         raise click.ClickException(str(exc)) from exc
 
     runtime_provenance = None
+    invocation_contexts: dict[tuple[str, int], InvocationContext] = {}
     if resolved.benchmark_protocol_version is not None:
         try:
             runtime_provenance = verify_runtime_provenance(
                 resolved,
                 adapter,
                 workdir=Path.cwd(),
+                repository=Path(__file__).resolve().parents[2],
+                docker_runtime_identity=sandbox.docker_runtime_identity,
+                verification_image_identity=sandbox.verification_image_identity,
             )
         except RuntimePreflightError as exc:
             raise click.ClickException(str(exc)) from exc
+        try:
+            invocation_plan = build_invocation_plan(
+                config=resolved,
+                corpus_hash=resolved_corpus_hash,
+                runtime_provenance=runtime_provenance,
+                ordered_scenario_ids=tuple(scenario.id for scenario in scenarios),
+            )
+        except ValueError as exc:
+            raise click.ClickException(
+                "benchmark invocation plan could not be constructed"
+            ) from exc
+        invocation_contexts = {
+            (context.scenario_id, context.repetition): context for context in invocation_plan
+        }
 
     results: list[ScenarioResult] = []
     for scenario in scenarios:
         for repetition in range(resolved.reps):
             click.echo(f"  {scenario.id} rep {repetition + 1}/{resolved.reps} ... ", nl=False)
-            result = run_scenario_once(
-                scenario.directory,
-                scenario.manifest,
-                adapter,
-                repetition,
-                sandbox=sandbox,
-                artifacts_dir=package / RUNS_DIR / scenario.id / str(repetition),
-                path_root=package,
-            )
+            try:
+                result = run_scenario_once(
+                    scenario.directory,
+                    scenario.manifest,
+                    adapter,
+                    repetition,
+                    sandbox=sandbox,
+                    artifacts_dir=package / RUNS_DIR / scenario.id / str(repetition),
+                    path_root=package,
+                    invocation_context=invocation_contexts.get((scenario.id, repetition)),
+                )
+            except AgentContainmentError as exc:
+                click.echo("ABORT")
+                raise click.ClickException(
+                    "contained agent safety failure at "
+                    f"{scenario.id} repetition {repetition + 1}/{resolved.reps}: "
+                    "container termination could not be verified. Partial evidence is "
+                    f"preserved at {package.resolve()}. Do not resume or splice this package."
+                ) from exc
             results.append(result)
             click.echo(str(result.outcome))
 
+    try:
+        sandbox.verify_runtime_unchanged()
+    except SandboxError as exc:
+        raise click.ClickException(
+            f"contained run runtime changed before evidence finalization: {exc}"
+        ) from exc
+
     report_ = build_report(
         results,
-        corpus_hash=corpus_hash(scenarios),
+        corpus_hash=resolved_corpus_hash,
         config_fingerprint=resolved.fingerprint(),
         generated_at=generated_at,
         judge_assisted=_maybe_judge(resolved),
         benchmark_metadata=resolved.benchmark_metadata(),
         benchmark_runtime_provenance=runtime_provenance,
     )
-    write_repro_package(package, report_, resolved, scenarios)
+    try:
+        write_repro_package(package, report_, resolved, scenarios)
+    except (ClassificationReplayError, ValueError) as exc:
+        raise click.ClickException("benchmark invocation evidence could not be finalized") from exc
 
     _echo_summary(report_, package)
     _enforce_regression_threshold(report_, resolved)
@@ -1294,7 +3259,10 @@ def _load_and_validate(config: RunConfig) -> list[Scenario]:
     for scenario in scenarios:
         try:
             box = _sandbox_for(scenario, config.isolation is Isolation.DOCKER, config.image)
-            box.preflight()
+            if config.benchmark_protocol_version is not None:
+                box.preflight_benchmark(Path(__file__).resolve().parents[2])
+            else:
+                box.preflight()
             validate_scenario(scenario.directory, scenario.manifest, sandbox=box)
         except (ValidityError, SandboxError) as exc:
             failures.append(str(exc))

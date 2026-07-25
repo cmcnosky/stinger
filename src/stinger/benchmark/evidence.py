@@ -28,7 +28,9 @@ import json
 import os
 import re
 import stat
-from collections.abc import Mapping, Sequence
+import tempfile
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
@@ -36,11 +38,21 @@ from pathlib import Path, PurePosixPath
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from stinger.benchmark.gates import BenchmarkProtocolManifest
+from stinger.benchmark.gates import (
+    BenchmarkProtocolManifest,
+    compiled_benchmark_protocol,
+)
 from stinger.benchmark.protocol import BenchmarkSplit
+from stinger.benchmark.replay import (
+    INVOCATION_AGGREGATE_NAME,
+    REPRO_EVIDENCE_FORMAT_FILE,
+    ClassificationReplayError,
+    verify_report_classifications_from_escrow,
+)
 from stinger.benchmark.signing import (
     PROTOCOL_SIGNATURE_NAMESPACE,
     ProtocolSignatureError,
+    ProtocolSignatureVerification,
     verify_protocol_signature,
 )
 from stinger.config import RunConfig
@@ -70,9 +82,10 @@ __all__ = [
     "verify_evidence_bundle_pair",
     "verify_escrow_evidence_bundle",
     "verify_public_evidence_bundle",
+    "verify_public_evidence_bundle_receipt",
 ]
 
-BUNDLE_FORMAT_VERSION = "2"
+BUNDLE_FORMAT_VERSION = "4"
 BUNDLE_MANIFEST = "bundle.manifest.json"
 BUNDLE_MANIFEST_HASH = "bundle.manifest.sha256"
 ESCROW_NOTICE_FILE = "ESCROW_NOTICE.txt"
@@ -124,6 +137,32 @@ _SECRET_OPTION_VALUE = re.compile(
     re.IGNORECASE,
 )
 _PUBLIC_PATH_REDACTION = Path("<redacted-host-path>")
+_SENSITIVE_RAW_CHUNK_BYTES = 64
+_SENSITIVE_RAW_CHUNK_STRIDE = 16
+_SENSITIVE_TEXT_NGRAM_WORDS = 8
+_SENSITIVE_TEXT_NGRAM_MIN_BYTES = 48
+_MAX_SENSITIVE_CHUNKS_PER_FILE = 8192
+_TEXT_TOKEN_PATTERN = re.compile(r"[^\W_]+(?:[._:/-][^\W_]+)*|_", re.UNICODE)
+_PRIVATE_ABSOLUTE_PATH_PATTERNS = (
+    re.compile(
+        rb"(?<![A-Za-z0-9_.-])/(?:Users|home)/[^\s\"'<>]+",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rb"(?<![A-Za-z0-9_.-])/(?:private/)?(?:var/folders|tmp)/[^\s\"'<>]+",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rb"(?<![A-Za-z0-9_.-])/(?:[^\s\"'<>]+/)*"
+        rb"[^/\s\"'<>]*(?:escrow|sealed[-_]?corpus|private[-_]?candidate)"
+        rb"[^\s\"'<>]*",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rb"(?<![A-Za-z0-9_.-])[A-Za-z]:[\\/]+Users[\\/]+[^\s\"'<>]+",
+        re.IGNORECASE,
+    ),
+)
 
 
 class EvidenceBundleError(Exception):
@@ -235,6 +274,7 @@ class VerifiedArtifactReceipt:
     protocol: BenchmarkProtocolManifest
     config: RunConfig
     report: Report
+    protocol_signature_verification: ProtocolSignatureVerification
 
 
 @dataclass(frozen=True)
@@ -242,7 +282,9 @@ class _LeakageSnapshot:
     """Hashed policy material safe to compare with public payloads."""
 
     forbidden_file_hashes: frozenset[str]
+    forbidden_chunk_hashes: frozenset[str]
     forbidden_markers: tuple[bytes, ...]
+    forbidden_path_fragments: tuple[bytes, ...]
     fingerprint: str
 
 
@@ -381,7 +423,7 @@ def create_escrow_evidence_bundle(
         config,
         report,
     )
-    _verify_escrow_semantics(
+    _verify_private_escrow_semantics(
         sealed_corpus,
         rerunnable_evidence,
         protocol=protocol_model,
@@ -457,6 +499,23 @@ def verify_public_evidence_bundle(
         EvidenceBundleError: On any ambiguity, missing/extra path, hash disagreement,
             policy mismatch, sensitive path, exact forbidden-file match, or marker leak.
     """
+    manifest, _ = _verify_public_evidence_bundle_components(
+        directory,
+        leakage_policy,
+        trusted_allowed_signers=trusted_allowed_signers,
+        expected_signer_identity=expected_signer_identity,
+    )
+    return manifest
+
+
+def _verify_public_evidence_bundle_components(
+    directory: Path,
+    leakage_policy: PublicLeakagePolicy,
+    *,
+    trusted_allowed_signers: Path,
+    expected_signer_identity: str,
+) -> tuple[EvidenceBundleManifest, ProtocolSignatureVerification]:
+    """Verify one public bundle and retain its original signature authorization."""
     snapshot = _snapshot_policy(leakage_policy)
     manifest = _load_and_verify_manifest(directory, expected_kind=BundleKind.PUBLIC)
     if manifest.leakage_policy_sha256 != snapshot.fingerprint:
@@ -466,7 +525,7 @@ def verify_public_evidence_bundle(
     if manifest.access_control_notice is not None:
         raise EvidenceBundleError("public bundle unexpectedly declares an escrow notice")
     _verify_role_shape(manifest, public=True)
-    _verify_bundled_protocol_signature(
+    signature_verification = _verify_bundled_protocol_signature(
         directory,
         manifest,
         trusted_allowed_signers=trusted_allowed_signers,
@@ -474,7 +533,39 @@ def verify_public_evidence_bundle(
     )
     _verify_bundled_core_semantics(directory, manifest)
     _scan_public_bundle(directory, manifest, snapshot)
-    return manifest
+    return manifest, signature_verification
+
+
+def verify_public_evidence_bundle_receipt(
+    directory: Path,
+    leakage_policy: PublicLeakagePolicy,
+    *,
+    trusted_allowed_signers: Path,
+    expected_signer_identity: str,
+) -> EvidenceBundleReceipt:
+    """Verify a complete public bundle and retain exact core bytes for downstream gates.
+
+    This is the public-only counterpart to :func:`verify_evidence_bundle_pair`. It reruns
+    inventory, protocol trust, core semantics, and leakage checks, snapshots the exact
+    verified manifest/config/report bytes, then rechecks the inventory so later builders
+    never accept a manifest-shaped JSON file as a substitute for the actual bundle.
+    """
+    manifest, signature_verification = _verify_public_evidence_bundle_components(
+        directory,
+        leakage_policy,
+        trusted_allowed_signers=trusted_allowed_signers,
+        expected_signer_identity=expected_signer_identity,
+    )
+    receipt = _snapshot_verified_bundle(
+        directory,
+        manifest,
+        protocol_signature_verification=signature_verification,
+    )
+    _verify_actual_inventory(directory, manifest)
+    final_manifest = _read_regular_file(directory / BUNDLE_MANIFEST, "bundle manifest")
+    if final_manifest != receipt.manifest_bytes:
+        raise EvidenceBundleError("public bundle changed during receipt construction")
+    return receipt
 
 
 def verify_escrow_evidence_bundle(
@@ -497,30 +588,54 @@ def verify_escrow_evidence_bundle(
         EvidenceBundleError: On any missing/extra path, hash disagreement, malformed
             manifest, missing full-corpus/evidence role, or untruthful security notice.
     """
+    manifest, _ = _verify_escrow_evidence_bundle_components(
+        directory,
+        trusted_allowed_signers=trusted_allowed_signers,
+        expected_signer_identity=expected_signer_identity,
+    )
+    return manifest
+
+
+def _verify_escrow_evidence_bundle_components(
+    directory: Path,
+    *,
+    trusted_allowed_signers: Path,
+    expected_signer_identity: str,
+) -> tuple[EvidenceBundleManifest, ProtocolSignatureVerification]:
+    """Verify one escrow bundle and retain its original signature authorization."""
     manifest = _load_and_verify_manifest(directory, expected_kind=BundleKind.ESCROW)
     if manifest.leakage_policy_sha256 is not None:
         raise EvidenceBundleError("escrow bundle unexpectedly declares a public leakage policy")
     if manifest.access_control_notice != ESCROW_NOTICE:
         raise EvidenceBundleError("escrow bundle does not carry the required access-control notice")
     _verify_role_shape(manifest, public=False)
-    _verify_bundled_protocol_signature(
+    signature_verification = _verify_bundled_protocol_signature(
         directory,
         manifest,
         trusted_allowed_signers=trusted_allowed_signers,
         expected_signer_identity=expected_signer_identity,
     )
     protocol, config, report = _verify_bundled_core_semantics(directory, manifest)
-    _verify_escrow_semantics(
-        directory / "sealed-corpus",
-        directory / "rerunnable-evidence",
-        protocol=protocol,
-        config=config,
-        report=report,
-    )
+    # Inventory verification above proves the bytes at one point in time. Replay reads a
+    # large tree repeatedly (sealed source, final workdirs, transcripts, typed observations),
+    # so reopening the caller-controlled paths directly would reintroduce a check/use race.
+    # Copy every role-bound byte through a no-follow descriptor into a verifier-owned
+    # snapshot, checking its manifest hash again, and perform all semantic work there.
+    with _snapshot_escrow_payloads(directory, manifest) as (
+        sealed_corpus,
+        rerunnable_evidence,
+    ):
+        _verify_private_escrow_semantics(
+            sealed_corpus,
+            rerunnable_evidence,
+            protocol=protocol,
+            config=config,
+            report=report,
+        )
     notice = directory / ESCROW_NOTICE_FILE
     if _read_regular_file(notice, "escrow notice") != ESCROW_NOTICE.encode("utf-8"):
         raise EvidenceBundleError("escrow notice file disagrees with the required warning")
-    return manifest
+    return manifest, signature_verification
 
 
 def verify_evidence_bundle_pair(
@@ -552,20 +667,28 @@ def verify_evidence_bundle_pair(
     Raises:
         EvidenceBundleError: If either bundle fails or the pair disagrees.
     """
-    public_manifest = verify_public_evidence_bundle(
+    public_manifest, public_signature_verification = _verify_public_evidence_bundle_components(
         public_bundle,
         leakage_policy,
         trusted_allowed_signers=trusted_allowed_signers,
         expected_signer_identity=expected_signer_identity,
     )
-    public_receipt = _snapshot_verified_bundle(public_bundle, public_manifest)
+    public_receipt = _snapshot_verified_bundle(
+        public_bundle,
+        public_manifest,
+        protocol_signature_verification=public_signature_verification,
+    )
     _verify_actual_inventory(public_bundle, public_manifest)
-    escrow_manifest = verify_escrow_evidence_bundle(
+    escrow_manifest, escrow_signature_verification = _verify_escrow_evidence_bundle_components(
         escrow_bundle,
         trusted_allowed_signers=trusted_allowed_signers,
         expected_signer_identity=expected_signer_identity,
     )
-    escrow_receipt = _snapshot_verified_bundle(escrow_bundle, escrow_manifest)
+    escrow_receipt = _snapshot_verified_bundle(
+        escrow_bundle,
+        escrow_manifest,
+        protocol_signature_verification=escrow_signature_verification,
+    )
     _verify_actual_inventory(escrow_bundle, escrow_manifest)
     _verify_leakage_policy_covers_escrow(
         escrow_bundle,
@@ -582,6 +705,8 @@ def verify_evidence_bundle_pair(
         raise EvidenceBundleError("public and escrow protocol signatures disagree")
     if public_receipt.allowed_signers_bytes != escrow_receipt.allowed_signers_bytes:
         raise EvidenceBundleError("public and escrow protocol trust policies disagree")
+    if public_signature_verification != escrow_signature_verification:
+        raise EvidenceBundleError("public and escrow protocol signature authorizations disagree")
     if (
         public_receipt.manifest.protocol_signer_identity
         != escrow_receipt.manifest.protocol_signer_identity
@@ -604,6 +729,7 @@ def verify_evidence_bundle_pair(
         protocol=public_receipt.protocol,
         config=escrow_receipt.config,
         report=public_receipt.report,
+        protocol_signature_verification=public_signature_verification,
     )
 
 
@@ -646,6 +772,8 @@ def _verify_leakage_policy_covers_escrow(
 def _snapshot_verified_bundle(
     directory: Path,
     manifest: EvidenceBundleManifest,
+    *,
+    protocol_signature_verification: ProtocolSignatureVerification,
 ) -> EvidenceBundleReceipt:
     """Snapshot exact core bytes and prove they still match the verified manifest."""
     manifest_bytes = _read_regular_file(directory / BUNDLE_MANIFEST, "bundle manifest")
@@ -676,6 +804,16 @@ def _snapshot_verified_bundle(
         config_bytes,
         report_bytes,
     )
+    if (
+        protocol_signature_verification.identity != manifest.protocol_signer_identity
+        or protocol_signature_verification.namespace != manifest.protocol_signature_namespace
+        or protocol_signature_verification.protocol_sha256 != _sha256(protocol_bytes)
+        or protocol_signature_verification.signature_sha256 != _sha256(signature_bytes)
+        or protocol_signature_verification.allowed_signers_sha256 != _sha256(allowed_signers_bytes)
+    ):
+        raise EvidenceBundleError(
+            "retained protocol signature authorization disagrees with exact bundle bytes"
+        )
     return EvidenceBundleReceipt(
         bundle_kind=manifest.bundle_kind,
         manifest=manifest,
@@ -776,10 +914,10 @@ def _validate_core_semantics_bytes(
         protocol_model = BenchmarkProtocolManifest.model_validate(raw_protocol)
     except (UnicodeDecodeError, ValueError, ValidationError, yaml.YAMLError) as exc:
         raise EvidenceBundleError(f"benchmark protocol is not valid: {exc}") from exc
-    expected_protocol = BenchmarkProtocolManifest()
+    expected_protocol = compiled_benchmark_protocol()
     if protocol_model != expected_protocol:
         raise EvidenceBundleError(
-            "signed benchmark protocol does not match the frozen Benchmark v1 contract"
+            "signed benchmark protocol does not match the frozen Protocol 2 contract"
         )
 
     config_model = _load_resolved_config_bytes(config_content)
@@ -967,6 +1105,8 @@ def _verify_escrow_semantics(
         "config.resolved.json",
         "corpus.lock",
         "rubric.version",
+        REPRO_EVIDENCE_FORMAT_FILE,
+        INVOCATION_AGGREGATE_NAME,
         "benchmark.protocol.version",
         "rerun.sh",
         SEALED_REPRO_MARKER,
@@ -1022,6 +1162,94 @@ def _verify_escrow_semantics(
                 rerunnable_evidence / artifact_path.as_posix(),
                 f"rerunnable evidence report artifact {artifact!r}",
             )
+    try:
+        verify_report_classifications_from_escrow(
+            sealed_corpus,
+            rerunnable_evidence,
+            config=config,
+            report=report,
+        )
+    except ClassificationReplayError:
+        raise EvidenceBundleError(
+            "rerunnable evidence classification replay failed closed (private details withheld)"
+        ) from None
+
+
+def _verify_private_escrow_semantics(
+    sealed_corpus: Path,
+    rerunnable_evidence: Path,
+    *,
+    protocol: BenchmarkProtocolManifest,
+    config: RunConfig,
+    report: Report,
+) -> None:
+    """Run private semantic checks without exposing sealed identifiers or paths."""
+    try:
+        _verify_escrow_semantics(
+            sealed_corpus,
+            rerunnable_evidence,
+            protocol=protocol,
+            config=config,
+            report=report,
+        )
+    except (EvidenceBundleError, ClassificationReplayError, ScenarioLoadError, OSError):
+        raise EvidenceBundleError(
+            "escrow private semantic verification failed closed (private details withheld)"
+        ) from None
+
+
+@contextmanager
+def _snapshot_escrow_payloads(
+    directory: Path,
+    manifest: EvidenceBundleManifest,
+) -> Iterator[tuple[Path, Path]]:
+    """Yield immutable verifier-owned snapshots of both private evidence roles.
+
+    ``_verify_actual_inventory`` rejects symlinks and verifies every hash, but a caller able
+    to mutate the bundle could replace a regular file after that pass and before semantic
+    replay reopened it.  This helper closes that window: every byte is read through
+    ``O_NOFOLLOW``, checked against the already parsed manifest again, and copied into a new
+    private temporary tree.  Replay touches only that tree.
+    """
+    private_roles = {
+        EvidenceRole.SEALED_CORPUS,
+        EvidenceRole.RERUNNABLE_EVIDENCE,
+    }
+    with tempfile.TemporaryDirectory(prefix="stinger-escrow-snapshot-") as temporary_name:
+        snapshot = Path(temporary_name)
+        for relative, role in sorted(manifest.directories.items()):
+            if role not in private_roles:
+                continue
+            target = snapshot / relative
+            target.mkdir(parents=True, exist_ok=False)
+            target.chmod(0o700)
+        for relative, entry in sorted(manifest.files.items()):
+            if entry.role not in private_roles:
+                continue
+            try:
+                content = _read_regular_file(
+                    directory / relative,
+                    "escrow private payload",
+                )
+            except EvidenceBundleError:
+                raise EvidenceBundleError(
+                    "escrow private payload could not be snapshotted (private details withheld)"
+                ) from None
+            if len(content) != entry.size or _sha256(content) != entry.sha256:
+                raise EvidenceBundleError(
+                    "escrow private payload changed before semantic replay "
+                    "(private details withheld)"
+                )
+            target = snapshot / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            target.chmod(0o700 if entry.executable else 0o600)
+
+        sealed = snapshot / "sealed-corpus"
+        rerunnable = snapshot / "rerunnable-evidence"
+        _require_directory(sealed, "snapshotted sealed corpus")
+        _require_directory(rerunnable, "snapshotted rerunnable evidence")
+        yield sealed, rerunnable
 
 
 def _public_log_sources(
@@ -1075,13 +1303,19 @@ def _snapshot_policy(policy: PublicLeakagePolicy) -> _LeakageSnapshot:
         )
 
     file_hashes: set[str] = set()
+    chunk_hashes: set[str] = set()
+    path_fragments: set[bytes] = set()
     sensitive_content: list[bytes] = []
     for source in policy.forbidden_sources:
         if source.is_symlink():
             raise EvidenceBundleError(f"forbidden source must not be a symlink: {source}")
+        resolved_source = str(source.resolve()).encode("utf-8")
+        if resolved_source:
+            path_fragments.add(resolved_source)
         if source.is_file():
             content = _read_regular_file(source, "forbidden source")
             file_hashes.add(_sha256(content))
+            chunk_hashes.update(_sensitive_chunk_hashes(content))
             sensitive_content.append(content)
             continue
         _require_directory(source, "forbidden source")
@@ -1090,6 +1324,7 @@ def _snapshot_policy(policy: PublicLeakagePolicy) -> _LeakageSnapshot:
             if not is_directory:
                 content = _read_regular_file(entry, "forbidden source file")
                 file_hashes.add(_sha256(content))
+                chunk_hashes.update(_sensitive_chunk_hashes(content))
                 sensitive_content.append(content)
     if not file_hashes:
         raise EvidenceBundleError("public leakage policy sealed sources contain no files")
@@ -1113,10 +1348,17 @@ def _snapshot_policy(policy: PublicLeakagePolicy) -> _LeakageSnapshot:
         )
     payload = {
         "forbidden_file_sha256": sorted(file_hashes),
+        "forbidden_chunk_sha256": sorted(chunk_hashes),
         "forbidden_marker_sha256": sorted(_sha256(marker) for marker in ordered_markers),
     }
     fingerprint = _sha256(_canonical_json(payload))
-    return _LeakageSnapshot(frozenset(file_hashes), ordered_markers, fingerprint)
+    return _LeakageSnapshot(
+        frozenset(file_hashes),
+        frozenset(chunk_hashes),
+        ordered_markers,
+        tuple(sorted(path_fragments)),
+        fingerprint,
+    )
 
 
 def _scan_public_sources(
@@ -1159,20 +1401,75 @@ def _check_public_path(path: PurePosixPath) -> None:
 
 
 def _check_public_content(relative: str, content: bytes, snapshot: _LeakageSnapshot) -> None:
-    """Reject exact sealed files, active markers, and unmistakable private keys."""
+    """Reject sealed near-copies, private paths, active markers, and private keys."""
     if _sha256(content) in snapshot.forbidden_file_hashes:
         raise EvidenceBundleError(
             f"public payload {relative!r} is byte-identical to active sealed material"
+        )
+    overlap = _sensitive_chunk_hashes(content) & snapshot.forbidden_chunk_hashes
+    if overlap:
+        raise EvidenceBundleError(
+            f"public payload {relative!r} contains a meaningful sealed-material fragment"
         )
     for index, marker in enumerate(snapshot.forbidden_markers, start=1):
         if marker in content:
             raise EvidenceBundleError(
                 f"public payload {relative!r} contains forbidden canary/secret marker #{index}"
             )
+    if any(fragment in content for fragment in snapshot.forbidden_path_fragments) or any(
+        pattern.search(content) is not None for pattern in _PRIVATE_ABSOLUTE_PATH_PATTERNS
+    ):
+        raise EvidenceBundleError(
+            f"public payload {relative!r} contains an absolute private or escrow path"
+        )
     if any(marker in content for marker in _INTRINSIC_SECRET_MARKERS):
         raise EvidenceBundleError(
             f"public payload {relative!r} contains recognizable private-key material"
         )
+
+
+def _sensitive_chunk_hashes(content: bytes) -> set[str]:
+    """Return bounded domain-separated hashes of meaningful raw and textual fragments."""
+    hashes: set[str] = set()
+    if len(content) >= _SENSITIVE_RAW_CHUNK_BYTES:
+        positions = list(
+            range(
+                0,
+                len(content) - _SENSITIVE_RAW_CHUNK_BYTES + 1,
+                _SENSITIVE_RAW_CHUNK_STRIDE,
+            )
+        )
+        last = len(content) - _SENSITIVE_RAW_CHUNK_BYTES
+        if not positions or positions[-1] != last:
+            positions.append(last)
+        for position in _bounded_positions(positions):
+            chunk = content[position : position + _SENSITIVE_RAW_CHUNK_BYTES]
+            hashes.add(_sha256(b"stinger-raw-chunk-v1\x00" + chunk))
+
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return hashes
+    tokens = _TEXT_TOKEN_PATTERN.findall(text.casefold())
+    if len(tokens) < _SENSITIVE_TEXT_NGRAM_WORDS:
+        return hashes
+    positions = list(range(0, len(tokens) - _SENSITIVE_TEXT_NGRAM_WORDS + 1))
+    for position in _bounded_positions(positions):
+        ngram = " ".join(tokens[position : position + _SENSITIVE_TEXT_NGRAM_WORDS]).encode("utf-8")
+        if len(ngram) >= _SENSITIVE_TEXT_NGRAM_MIN_BYTES:
+            hashes.add(_sha256(b"stinger-text-ngram-v1\x00" + ngram))
+    return hashes
+
+
+def _bounded_positions(positions: list[int]) -> tuple[int, ...]:
+    """Select deterministic evenly distributed positions under the per-file bound."""
+    if len(positions) <= _MAX_SENSITIVE_CHUNKS_PER_FILE:
+        return tuple(positions)
+    last = len(positions) - 1
+    return tuple(
+        positions[index * last // (_MAX_SENSITIVE_CHUNKS_PER_FILE - 1)]
+        for index in range(_MAX_SENSITIVE_CHUNKS_PER_FILE)
+    )
 
 
 def _require_directory(path: Path, label: str) -> None:
@@ -1488,7 +1785,7 @@ def _verify_bundled_protocol_signature(
     *,
     trusted_allowed_signers: Path,
     expected_signer_identity: str,
-) -> None:
+) -> ProtocolSignatureVerification:
     """Cryptographically bind the bundled protocol to the declared trusted identity."""
     protocol = _single_role_path(manifest, EvidenceRole.PROTOCOL)
     signature = _single_role_path(manifest, EvidenceRole.PROTOCOL_SIGNATURE)
@@ -1523,6 +1820,7 @@ def _verify_bundled_protocol_signature(
         raise EvidenceBundleError(
             "bundled signer policy disagrees with independently trusted signer policy"
         )
+    return verification
 
 
 def _single_role_path(manifest: EvidenceBundleManifest, role: EvidenceRole) -> str:

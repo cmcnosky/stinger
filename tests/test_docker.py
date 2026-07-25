@@ -12,8 +12,10 @@ perfect. Only running it showed the problem.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -26,6 +28,8 @@ from stinger.harness.sandbox import (
     apply_overlay,
 )
 from stinger.scenario.manifest import ScenarioManifest, validate_scenario
+
+REPOSITORY = Path(__file__).resolve().parents[1]
 
 
 def _docker_ready() -> bool:
@@ -44,14 +48,70 @@ pytestmark = pytest.mark.skipif(
     not _docker_ready(),
     reason=(
         f"needs a running Docker daemon and the {DEFAULT_IMAGE} image "
-        f"(docker build -t {DEFAULT_IMAGE} -f docker/runner.Dockerfile .)"
+        "(build it with README.md's deterministic platform-specific recipe)"
     ),
 )
 
 
 @pytest.fixture
 def box() -> Sandbox:
-    return Sandbox(isolation=Isolation.DOCKER)
+    sandbox = Sandbox(isolation=Isolation.DOCKER)
+    sandbox.preflight()
+    return sandbox
+
+
+@pytest.fixture(scope="module")
+def image_without_pytest() -> Iterator[str]:
+    """Create a network-disabled, local-only negative fixture from the approved image.
+
+    The test must not assume that a mutable public base-image tag already exists in the
+    daemon's image store. Container-backed Buildx intentionally keeps its build cache
+    separate from that store, so the old assumption made CI depend on unrelated cache state.
+    """
+    suffix = str(os.getpid())
+    container_name = f"stinger-test-no-pytest-{suffix}"
+    image_name = f"stinger-test-no-pytest:{suffix}"
+    try:
+        subprocess.run(
+            [
+                "docker",
+                "run",
+                "--name",
+                container_name,
+                "--network",
+                "none",
+                DEFAULT_IMAGE,
+                "python",
+                "-m",
+                "pip",
+                "uninstall",
+                "--yes",
+                "pytest",
+            ],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        subprocess.run(
+            ["docker", "commit", container_name, image_name],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        yield image_name
+    finally:
+        subprocess.run(
+            ["docker", "rm", "--force", container_name],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        subprocess.run(
+            ["docker", "image", "rm", "--force", image_name],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
 
 
 class TestPreflight:
@@ -60,9 +120,16 @@ class TestPreflight:
     def test_the_shipped_image_passes(self, box: Sandbox) -> None:
         box.preflight()  # must not raise
 
-    def test_an_image_without_pytest_is_refused_with_a_remedy(self) -> None:
+    def test_the_shipped_image_passes_protocol_2_identity_policy(self, box: Sandbox) -> None:
+        """The live daemon's manifest/config identity representation is explicitly approved."""
+        box.preflight_benchmark(REPOSITORY)  # must not raise
+
+    def test_an_image_without_pytest_is_refused_with_a_remedy(
+        self,
+        image_without_pytest: str,
+    ) -> None:
         """THE bug this whole module exists for: it would have zeroed every score silently."""
-        bare = Sandbox(isolation=Isolation.DOCKER, image="python:3.12-slim")
+        bare = Sandbox(isolation=Isolation.DOCKER, image=image_without_pytest)
 
         with pytest.raises(SandboxError) as caught:
             bare.preflight()
@@ -125,4 +192,6 @@ class TestVerificationInsideAContainer:
 class TestTheValidityContractUnderDocker:
     def test_t02_validates_in_real_containers(self, t02_dir: Path, t02: ScenarioManifest) -> None:
         """The same contract that runs under --local, run for real (SPEC §12)."""
-        validate_scenario(t02_dir, t02, sandbox=Sandbox(isolation=Isolation.DOCKER))
+        sandbox = Sandbox(isolation=Isolation.DOCKER)
+        sandbox.preflight()
+        validate_scenario(t02_dir, t02, sandbox=sandbox)

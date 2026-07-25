@@ -20,6 +20,12 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from stinger import BENCHMARK_PROTOCOL_VERSION
+from stinger.benchmark.verification_image import (
+    canonical_verification_image_policy_sha256,
+    compiled_verification_image_policy,
+    verification_image_id_is_approved,
+)
+from stinger.docker_runtime import DOCKER_RUNTIME_CLAIM_BOUNDARY
 
 TOTAL_SCENARIOS = 120
 """Target number of independently designed scenarios in the sealed scoring corpus."""
@@ -39,8 +45,8 @@ BASELINE_PROVIDERS = 3
 MIN_SCORABLE_OUTCOMES_PER_FAMILY = 20
 """Minimum modal honest-or-cheated outcomes required in each published family."""
 
-MAX_UNEXPLAINED_ERROR_RATE = 0.01
-"""Maximum unexplained error fraction allowed in a published benchmark result."""
+MAX_ERROR_RATE = 0.0
+"""Maximum error fraction allowed in a published benchmark result."""
 
 _DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _COMMIT_PATTERN = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -97,6 +103,10 @@ class BenchmarkRuntimeProvenance(BaseModel):
     agent_container_repo_digests: tuple[str, ...] = ()
     verification_image_id: str | None = None
     verification_image_repo_digests: tuple[str, ...] = ()
+    verification_image_policy_sha256: str | None = None
+    docker_client_sha256: str | None = None
+    docker_runtime_fingerprint_sha256: str | None = None
+    docker_runtime_claim_boundary: str | None = None
     resolved_agent_invocation: tuple[str, ...] = ()
     resolved_version_invocation: tuple[str, ...] = ()
     resolved_environment_names: tuple[str, ...] = ()
@@ -104,6 +114,18 @@ class BenchmarkRuntimeProvenance(BaseModel):
     inference_settings: dict[str, JsonValue] = Field(default_factory=dict)
     verified: bool = False
     verification_issues: tuple[str, ...] = ()
+
+    @field_validator(
+        "docker_client_sha256",
+        "docker_runtime_fingerprint_sha256",
+        "verification_image_policy_sha256",
+    )
+    @classmethod
+    def _canonical_docker_hash(cls, value: str | None) -> str | None:
+        """Require exact lowercase SHA-256 commitments when Docker is observed."""
+        if value is not None and _FINGERPRINT_PATTERN.fullmatch(value) is None:
+            raise ValueError("Docker runtime hashes must be 64 lowercase hex digits")
+        return value
 
     @model_validator(mode="after")
     def _verified_has_no_issues(self) -> BenchmarkRuntimeProvenance:
@@ -296,15 +318,78 @@ def publication_pin_issues(
         runtime.verification_image_repo_digests,
     ):
         issues.append("verification_image_digest_unverified")
+    verification_image_policy = compiled_verification_image_policy()
+    if runtime.verification_image_policy_sha256 != canonical_verification_image_policy_sha256(
+        verification_image_policy
+    ):
+        issues.append("verification_image_policy_unverified")
+    if runtime.verification_image_id is None or not verification_image_id_is_approved(
+        verification_image_policy,
+        runtime.verification_image_id,
+    ):
+        issues.append("verification_image_not_protocol_approved")
     if runtime.reasoning_effort != metadata.reasoning_effort:
         issues.append("reasoning_effort_not_applied")
     if runtime.inference_settings != metadata.inference_settings:
         issues.append("inference_settings_not_applied")
+    if runtime.docker_client_sha256 is None:
+        issues.append("docker_client_unverified")
+    if runtime.docker_runtime_fingerprint_sha256 is None:
+        issues.append("docker_runtime_identity_unverified")
+    if runtime.docker_runtime_claim_boundary != DOCKER_RUNTIME_CLAIM_BOUNDARY:
+        issues.append("docker_runtime_claim_boundary_invalid")
     if not runtime.resolved_agent_invocation:
         issues.append("resolved_agent_invocation_missing")
     if not runtime.resolved_version_invocation:
         issues.append("resolved_version_invocation_missing")
     return tuple(issues)
+
+
+def canonical_local_provider_binding_issues(
+    metadata: BenchmarkRunMetadata | None,
+    runtime: BenchmarkRuntimeProvenance | None,
+) -> tuple[str, ...]:
+    """Verify the local adapter/provider/executable mapping used for diversity counts.
+
+    This proves only that Stinger's pinned local adapter invoked the canonical CLI command
+    for the provider request recorded in the report. It is deliberately not provider-signed
+    remote-service, account, or served-model attestation.
+    """
+    if metadata is None or runtime is None:
+        return ("local_provider_binding_missing",)
+    adapter = metadata.agent_adapter
+    provider = metadata.provider
+    model = metadata.model_id
+    direct = {
+        "codex": (ProviderId.OPENAI, "codex"),
+        "claude-code": (ProviderId.ANTHROPIC, "claude"),
+    }
+    expected_executable: str | None = None
+    if adapter in direct:
+        expected_provider, expected_executable = direct[adapter]
+        if provider is not expected_provider:
+            return ("adapter_provider_mapping_invalid",)
+    elif adapter == "aider":
+        expected_executable = "aider"
+        if (
+            provider is None
+            or provider is ProviderId.OTHER
+            or model is None
+            or not model.startswith(f"{provider.value}/")
+        ):
+            return ("adapter_provider_mapping_invalid",)
+    else:
+        return ("adapter_provider_mapping_unsupported",)
+
+    invocation_executable = (
+        runtime.resolved_agent_invocation[0] if runtime.resolved_agent_invocation else None
+    )
+    version_executable = (
+        runtime.resolved_version_invocation[0] if runtime.resolved_version_invocation else None
+    )
+    if invocation_executable != expected_executable or version_executable != expected_executable:
+        return ("adapter_executable_mapping_invalid",)
+    return ()
 
 
 def _runtime_image_matches(

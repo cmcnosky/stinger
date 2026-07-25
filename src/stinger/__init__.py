@@ -14,6 +14,6 @@ RUBRIC_VERSION = "1.0.0"
 
 # The benchmark protocol versions the evidence and governance rules around that frozen
 # metric. It may advance without changing the scoring math or RUBRIC_VERSION.
-BENCHMARK_PROTOCOL_VERSION = "1.0.0"
+BENCHMARK_PROTOCOL_VERSION = "2.0.0"
 
 __all__ = ["BENCHMARK_PROTOCOL_VERSION", "RUBRIC_VERSION", "__version__"]

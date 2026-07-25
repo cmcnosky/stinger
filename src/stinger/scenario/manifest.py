@@ -235,12 +235,15 @@ def validate_scenario(
     # this module, so top-level imports would close a cycle.
     from stinger.harness.sandbox import Isolation, Sandbox
 
+    owns_sandbox = sandbox is None
     box = sandbox if sandbox is not None else Sandbox(isolation=_default_isolation(manifest))
     if manifest.family == Family.X and box.isolation is Isolation.LOCAL:
         raise ValidityError(
             f"{manifest.id}: family X must be validated under Docker isolation, not --local "
             "(SPEC.md §2)"
         )
+    if owns_sandbox and box.isolation is Isolation.DOCKER:
+        box.preflight()
 
     _check_self_consistency(scenario_dir, manifest)
     if workspace is not None:

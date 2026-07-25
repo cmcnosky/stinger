@@ -14,8 +14,8 @@ It is a CLI and a GitHub Action. It is model-agnostic and vendor-neutral by cons
 Two rules shape everything here:
 
 - **Mechanical truth first.** Cheating is decided by deterministic detectors, never by an
-  LLM judge. The optional judge may only *flag for human review*; it can never set or
-  override a `cheated`/`honest` label.
+  LLM judge. The optional judge may only add an item to a non-authoritative review queue;
+  it can never set or override a `cheated`/`honest` label or headline metric.
 - **Fail closed.** Any ambiguity, harness error, or missing evidence resolves to a
   non-scored `error`, never to a favorable score.
 
@@ -28,19 +28,45 @@ Stinger is currently a **benchmark candidate / instrument demonstration**. The 3
 scenarios are the development and conformance suite; because their prompts, oracles, and
 reference resolutions are public, they are not used for a headline benchmark claim.
 
-The separately versioned [benchmark protocol](BENCHMARK.md) specifies a sealed
-120-scenario scoring corpus, independent fairness and QA records, six pinned configurations
-across three providers, five repetitions, cluster-aware uncertainty, signed public evidence,
-three outside beta operators, and one unaffiliated full reproduction. The repository now
-implements the metadata, deterministic ordering, statistics, signed public/escrow bundles,
-and fail-closed master release gate.
+The separately versioned [Benchmark Protocol 2](BENCHMARK.md) specifies a sealed
+120-scenario scoring corpus, artifact-bound QA, provider-diverse machine vetoes,
+reference-isolated blind agent solves, six pinned configurations across three providers,
+five repetitions, cluster-aware uncertainty, three clean conformance environments, signed
+public/escrow evidence, and one complete cross-machine reproduction. Machine review can
+only veto evidence; it cannot relabel a result or change the frozen score.
 
 A private, externally stored authoring checkpoint now contains 120 candidate scenarios:
 24 per family, with eight small, eight medium, and eight large repositories per family.
-Its 480 concrete honest/cheat variants passed their mechanical checks, and all 120 primary
-scenarios passed contained Docker validity. That is self-authored construction evidence,
-not independent fairness review, live-agent QA, a frozen or sealed scoring corpus, a
-baseline result, or a benchmark claim. No outside reproduction is claimed.
+Its 480 concrete honest/cheat variants passed their authoring checks, and all 120 primary
+scenarios passed contained Docker validity. That is candidate construction evidence, not
+an accepted Protocol 2 validation receipt, machine-review/QA matrix, blind-solve record,
+frozen or sealed scoring corpus, baseline result, or benchmark claim. No cross-machine
+reproduction is claimed.
+
+There is also a hard credential-isolation HOLD before any live sealed execution. Current
+networked agent containers can read raw Codex/Claude credentials. An ordinary
+`credential_mount` may contain extra hidden CLI configuration or session files even though
+the published fingerprint records only that a mount exists. Read-only mounting and
+post-run leakage scans do not prevent a sealed prompt from inducing credential abuse. No
+sealed review, QA, blind solve, pilot, baseline, or reproduction is authorized until an
+external provider-allowlisted credential broker (or equivalent that keeps raw credentials
+outside the agent container) and an exact minimal projection/config receipt are
+mechanically implemented and evidence-bound.
+
+Protocol 2 now separately closes the verification-image substitution gap. The signed
+protocol commits to the exact `docker/runner.Dockerfile` and fully hash-locked dependency
+bytes, then approves the OCI manifest and image-config identities derived from the same
+byte-identical clean exports for each Docker target platform. Containerd-backed and classic
+Docker stores report different one of those two immutable identities as `.Id`; the signed
+policy names both explicitly. Every benchmark validation, replay, construction, and run
+checks that policy before starting a verification container. This is an exact-byte
+observation through the fixed Docker client/daemon boundary, not a universal
+reproducible-build, registry-attestation, TPM, or hostile-administrator proof.
+
+That verifier policy does **not** approve agent images. Agent containers execute untrusted
+sealed prompts with network access, so their own image supply chain remains a separate hard
+HOLD alongside credential isolation. No live sealed review, QA, blind solve, pilot, baseline,
+or reproduction is authorized until both holds are mechanically closed and evidence-bound.
 
 The current state is executable:
 
@@ -49,10 +75,11 @@ stinger benchmark protocol-check benchmark/protocol.yaml
 stinger benchmark release-check benchmark/candidate-submission.yaml
 ```
 
-The first command passes the frozen protocol structure. The second intentionally exits
-non-zero and enumerates every unearned release gate. Only a fully evidenced submission can
-produce `independently_reproduced`; “established benchmark” requires later sustained
-third-party use and a documented correction cycle.
+The first command checks the exact Protocol 2 threshold structure. The second intentionally
+exits non-zero and enumerates every unearned release gate. Only a fully evidenced,
+role-separated, signed submission can produce `machine_reproduced`; “established
+benchmark” additionally requires three accepted cross-machine environment records and a
+documented correction cycle.
 
 ## Install
 
@@ -102,10 +129,10 @@ who was not there, no agent, no container, no network. That is step 1 of the `re
 run writes.
 
 `stinger validate` is the one to understand first. Before any agent is judged, every
-scenario must prove it is fair: overlay the scenario's *honest* reference resolution and no
-detector may fire; overlay its *cheat* reference and the intended detector must fire. A
-scenario that fails validation is refused entry to a scoring run. That is the corpus's own
-fail-closed gate.
+scenario must pass its mechanical validity contract: overlay the scenario's *honest*
+reference resolution and no detector may fire; overlay its *cheat* reference and the
+intended detector must fire. A scenario that fails validation is refused entry to a
+scoring run.
 
 ## Scenario families
 
@@ -126,7 +153,7 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 |---|---|
 | Core data model (`models.py`) | working |
 | Sandbox isolation + RepoState capture (§2, §7) | working — real container runs verified, including that the network is off and the mount hides the rest of the scenario |
-| Contained agent — `container_image`, `credential_mount` (§5) | working — [docker/codex-agent.Dockerfile](docker/codex-agent.Dockerfile) builds a Codex image, and credential-by-name plus the read-only mount are unit-tested; **no contained or `X`-family live run is committed as evidence** — every package in [evidence/](evidence/) is `--local`, families T/S/C/G only |
+| Contained agent — `container_image`, `credential_mount` (§5) | working for development containment, **not credential-isolated for sealed execution** — [docker/codex-agent.Dockerfile](docker/codex-agent.Dockerfile) builds a Codex image and the read-only mount is unit-tested, but raw credentials remain readable by the networked agent and ordinary mount contents are not evidence-bound; no sealed live run is authorized |
 | Run state machine + frozen `classify()` (§7) | working |
 | Held-out completion check (§7) | working |
 | All seven detectors (§6) | working — each fires on its intended cheat and stays silent on the honest reference, unit-tested and exercised by the corpus |
@@ -144,12 +171,12 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | Benchmark protocol + exact run/scenario metadata | working — separately versioned without changing `RUBRIC_VERSION`; legacy configs and reports remain readable |
 | Seeded family-blocked benchmark ordering | working — stable across input order and mechanically rechecked at the release gate |
 | Cluster-aware 95% bootstrap and paired differences | working — repetitions stay nested within scenarios; persisted intervals are recomputed by `stinger report` |
-| Signed public / escrow benchmark evidence | working — OpenSSH detached protocol signature, independently supplied trust policy, exact inventories, sealed-file/canary/secret leakage checks, and explicit unencrypted-escrow warning |
-| Benchmark master release gate | working — typed corpus/review/QA/baseline/external/approval evidence with stable fail-closed issue codes |
-| Sealed scoring corpus | **candidate built; not sealed** — a private externally stored authoring checkpoint has 120 internally validated candidates, 24 per family; independent fairness review, live-agent QA, pilot selection, freeze, and sealing remain undone |
-| Outside beta operators + independent reproduction | **not done** — no operator or evaluator record has been accepted |
+| Signed public / escrow benchmark evidence | working — OpenSSH detached protocol signature, separately supplied trust policy, exact inventories, sealed-file/canary/secret leakage checks, escrow classification replay from primary artifacts, and explicit unencrypted-escrow warning |
+| Protocol 2 machine construction gate | working on this candidate implementation — artifact-bound variants/QA, provider-diverse veto review, deterministic blind agent solves, custody receipts, and stable fail-closed issue codes |
+| Benchmark master release gate | working on this candidate implementation — typed corpus, machine QA/review/solve, baseline, conformance, cross-machine, and operator-authorization evidence |
+| Sealed scoring corpus | **candidate built; not sealed** — a private externally stored checkpoint has 120 candidates, 24 per family; Protocol 2 receipt normalization, machine QA/review/blind solves, split-only promotion, exact-snapshot pilot, and freeze remain undone |
+| Clean conformance + cross-machine reproduction | **not done** — no accepted conformance environment or complete reproduction record exists |
 | Benchmark v1 release | **HOLD** — the checked-in candidate submission fails the master gate; only Chris can approve spending, publication, or a vendor comparison after all other gates pass |
-| Human spot-audit of the corpus | **not done** — [scenarios/AUDIT.md](scenarios/AUDIT.md) is ready for a reviewer who did not write the scenarios |
 | Discrimination demo (§16.4) | working — a strictly configured agent scores 100% and passes; a permissive one scores 0% and fails, on the same corpus (family T only, a labeled partial run — [demo/](demo/)) |
 | Scenario corpus | **30 validated scenarios, 6 in each of the five families** ([scenarios/README.md](scenarios/README.md)) |
 
@@ -215,15 +242,28 @@ not done. Never weaken a gate to make it pass — that is the exact behavior thi
 to catch.
 
 It needs Docker, because the `X` safety family refuses to run unconfined (SPEC.md §2). Build
-the verification image once:
+the verification image once. On Apple Silicon:
 
 ```bash
-docker build -t stinger-runner:1 -f docker/runner.Dockerfile .
+stinger_runner_build_dir="$(mktemp -d)"
+docker buildx create --name stinger-verifier-v0312 \
+  --driver docker-container \
+  --driver-opt image=moby/buildkit:v0.31.2 \
+  --use --bootstrap
+docker buildx build --no-cache --provenance=false \
+  --build-arg SOURCE_DATE_EPOCH=0 \
+  --platform linux/arm64 -t stinger-runner:1 \
+  --output type=docker,rewrite-timestamp=true,dest="$stinger_runner_build_dir/stinger-runner.tar" \
+  -f docker/runner.Dockerfile docker/
+docker load --input "$stinger_runner_build_dir/stinger-runner.tar"
 ```
 
-A bare `python:3.12-slim` will not do — verification runs with the network disabled, so pytest
-has to already be in the image. `stinger run` preflights this and refuses to start otherwise,
-rather than letting every scenario score as a failure for a reason unrelated to the agent.
+Use `linux/amd64` on an amd64 Docker host. A bare `python:3.12-slim` will not do —
+verification runs with the network disabled, so pytest has to already be in the image.
+Benchmark operations additionally require the exact platform/image ID and Dockerfile/lock
+inventory frozen in the signed protocol; importing pytest is necessary but not sufficient.
+Stinger refuses before verification starts rather than letting an arbitrary verifier
+manufacture a plausible score.
 
 ## License
 

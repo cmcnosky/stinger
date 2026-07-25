@@ -20,12 +20,16 @@ import re
 import shutil
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from stinger.adapters.base import AgentAdapter, AgentRun, Budget
 from stinger.detectors.base import DetectorContext, Verification, get_detector
 from stinger.harness.sandbox import Sandbox, SandboxError, capture, diff_states
 from stinger.models import DetectorResult, ExecResult, Outcome, ScenarioResult
 from stinger.scenario.manifest import COMPLETION_CHECK_DIR, ScenarioManifest
+
+if TYPE_CHECKING:
+    from stinger.benchmark.replay import InvocationContext
 
 __all__ = [
     "agent_refused",
@@ -47,8 +51,9 @@ def classify(
     """FROZEN decision order (SPEC.md §7). Do not reorder.
 
     Fail closed: unresolved detectors and adapter errors go to ERROR, never to a pass.
-    A low_confidence detector hit is NOT an automatic CHEATED — it routes to review, which
-    at scoring time is treated as ERROR (non-scoring) unless a human confirms.
+    A low_confidence detector hit is NOT an automatic CHEATED. It remains ERROR
+    (non-scoring); advisory tooling may surface it for optional operator inspection, but
+    inspection never mutates this classifier's result.
     """
     if run.error is not None and run.error.strip():
         return Outcome.ERROR
@@ -82,6 +87,7 @@ def run_scenario_once(
     sandbox: Sandbox,
     artifacts_dir: Path,
     path_root: Path | None = None,
+    invocation_context: InvocationContext | None = None,
 ) -> ScenarioResult:
     """Execute the SPEC.md §7 pipeline for one repetition and return a ScenarioResult.
 
@@ -101,6 +107,8 @@ def run_scenario_once(
             The CLI passes the package root, so a published report names
             `runs/<scenario>/<rep>/transcript.txt` rather than an absolute path that would
             bake one machine's directory layout into a document meant to travel.
+        invocation_context: Deterministic benchmark execution-plan identity. When present,
+            the runner emits a primary invocation receipt after classification.
 
     Returns:
         The repetition's result, including the paths of every artifact written. A harness
@@ -128,6 +136,15 @@ def run_scenario_once(
         )
 
         # 3. Run the agent. The only step that touches the agent under test.
+        if invocation_context is not None:
+            # This random event is evidence only: it is persisted before the process starts
+            # and never enters the prompt, detector context, classifier, or score.
+            from stinger.benchmark.replay import write_invocation_challenge
+
+            write_invocation_challenge(
+                artifacts_dir,
+                context=invocation_context,
+            )
         budget = Budget(max_seconds=manifest.budget_seconds, max_tokens=manifest.budget_tokens)
         run = adapter.run(workdir, manifest.prompt, budget)
 
@@ -143,6 +160,21 @@ def run_scenario_once(
         rerun = suite_rerun(manifest, workdir, sandbox, artifacts_dir)
         _write_exec_log(artifacts_dir / "completion.txt", completion)
         _write_exec_log(artifacts_dir / "suite_rerun.txt", rerun)
+        # Persist primary observations before deriving any verdict. Benchmark escrow
+        # verification reconstructs claim parsing, goal_met, every detector, refusal, and
+        # the frozen classifier from this record plus the retained final workdir. Keeping
+        # those derived fields out of the record is what makes it evidence rather than a
+        # second self-attesting report.
+        from stinger.benchmark.replay import write_classification_replay_record
+
+        write_classification_replay_record(
+            artifacts_dir,
+            scenario_id=manifest.id,
+            repetition=repetition,
+            run=run,
+            completion=completion,
+            suite_rerun=rerun,
+        )
 
         # 5. Run the scenario's detectors over everything observed.
         ctx = DetectorContext(
@@ -174,7 +206,7 @@ def run_scenario_once(
         )
 
     # 10. Artifacts are already persisted; the result names them.
-    return ScenarioResult(
+    result = ScenarioResult(
         scenario_id=manifest.id,
         family=manifest.family,
         outcome=outcome,
@@ -190,6 +222,30 @@ def run_scenario_once(
         scenario_version=manifest.scenario_version,
         cluster_id=manifest.cluster_id,
     )
+    if invocation_context is not None:
+        from stinger.benchmark.replay import (
+            ClassificationReplayError,
+            write_invocation_receipt,
+        )
+
+        try:
+            write_invocation_receipt(
+                artifacts_dir,
+                context=invocation_context,
+                transcript=run.transcript,
+                final_worktree=after,
+                result=result,
+            )
+        except (ClassificationReplayError, OSError, ValueError) as exc:
+            return _error_result(
+                manifest,
+                repetition,
+                evidence=f"invocation receipt construction failed closed: {exc}",
+                transcript_path=_relative(transcript_path, path_root),
+                diff_path=_relative(diff_path, path_root),
+                duration_s=time.monotonic() - started,
+            )
+    return result
 
 
 def completion_check(
