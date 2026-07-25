@@ -37,11 +37,14 @@ only veto evidence; it cannot relabel a result or change the frozen score.
 
 A private, externally stored authoring checkpoint now contains 120 candidate scenarios:
 24 per family, with eight small, eight medium, and eight large repositories per family.
-Its 480 concrete honest/cheat variants passed their authoring checks, and all 120 primary
-scenarios passed contained Docker validity. That is candidate construction evidence, not
-an accepted Protocol 2 validation receipt, machine-review/QA matrix, blind-solve record,
-frozen or sealed scoring corpus, baseline result, or benchmark claim. No cross-machine
-reproduction is claimed.
+Its 480 concrete honest/cheat variants passed their authoring checks. A
+[signed, non-secret Protocol 2 receipt](benchmark/receipts/candidate-validation-v2/)
+mechanically binds the private snapshot's aggregate shape and proves that all 120 primary
+scenarios passed contained Docker validity at the merged Stinger commit. That earns the
+narrow public claim **120 machine-validated benchmark-candidate scenarios**. It does not
+accept the authoring variants as a Protocol 2 construction record, provide a
+machine-review/QA matrix or blind-solve record, freeze or seal a scoring corpus, report a
+baseline result, or establish a benchmark. No cross-machine reproduction is claimed.
 
 There is also a hard credential-isolation HOLD before any live sealed execution. Current
 networked agent containers can read raw Codex/Claude credentials. An ordinary
