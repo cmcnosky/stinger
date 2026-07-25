@@ -131,7 +131,13 @@ verifier trust policy. Release and reproduction must resolve to different signer
 different verified signing-key fingerprints, and different signer policies; signature
 namespaces alone are only domain separation and do not prove independence. The statement
 binds both reports, both agent-configuration fingerprints, corpus and bundle hashes,
-distinct machine fingerprints, and a resolved discrepancy ledger.
+distinct machine fingerprints, and a resolved discrepancy ledger. Before building that
+statement, the evaluator signs the exact reproduced `report.json` bytes under the separate
+`stinger-benchmark-reproduced-report` namespace. The artifact-derived builder re-verifies
+both public/escrow pairs, reconstructs the target baseline record, verifies that report
+signature, enforces structural identity, and computes the paired comparison and
+classification-only discrepancy ledger. The public release gate verifies the evaluator's
+signed statement and its bound hashes; it never opens the active corpus or escrow material.
 
 ## Publication eligibility
 

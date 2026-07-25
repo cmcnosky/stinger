@@ -17,13 +17,16 @@ from stinger.benchmark.gates import (
 from stinger.benchmark.signing import (
     PROTOCOL_SIGNATURE_NAMESPACE,
     RELEASE_SIGNATURE_NAMESPACE,
+    REPRODUCED_REPORT_SIGNATURE_NAMESPACE,
     REPRODUCTION_SIGNATURE_NAMESPACE,
     ProtocolSignatureError,
     sign_protocol,
     sign_release_submission,
+    sign_reproduced_report,
     sign_reproduction_statement,
     verify_protocol_signature,
     verify_release_submission_signature,
+    verify_reproduced_report_signature,
     verify_reproduction_statement_signature,
 )
 from stinger.cli import main
@@ -299,6 +302,274 @@ def test_signature_namespaces_are_distinct_while_the_signing_key_remains_visible
             signing_material["allowed_signers"],
             IDENTITY,
         )
+
+
+class TestReproducedReportSigning:
+    """Evaluator report signatures bind exact bytes, identity, trust, and namespace."""
+
+    def test_signs_and_verifies_exact_reproduced_report_bytes(
+        self,
+        signing_material: dict[str, Path],
+        tmp_path: Path,
+    ) -> None:
+        report = tmp_path / "report.json"
+        report.write_bytes(b'{"results":[],"rubric_version":"1.0.0"}\n')
+
+        signature = sign_reproduced_report(report, signing_material["private_key"])
+        verification = verify_reproduced_report_signature(
+            report,
+            signature,
+            signing_material["allowed_signers"],
+            IDENTITY,
+        )
+
+        assert verification.identity == IDENTITY
+        assert verification.namespace == REPRODUCED_REPORT_SIGNATURE_NAMESPACE
+        assert len(verification.artifact_sha256) == 64
+        assert len(verification.signature_sha256) == 64
+        assert len(verification.allowed_signers_sha256) == 64
+        assert verification.signing_key_fingerprint.startswith("SHA256:")
+        assert REPRODUCED_REPORT_SIGNATURE_NAMESPACE not in {
+            PROTOCOL_SIGNATURE_NAMESPACE,
+            RELEASE_SIGNATURE_NAMESPACE,
+            REPRODUCTION_SIGNATURE_NAMESPACE,
+        }
+
+    def test_report_signature_cannot_substitute_for_statement_or_other_namespaces(
+        self,
+        signing_material: dict[str, Path],
+        tmp_path: Path,
+    ) -> None:
+        report = tmp_path / "report.json"
+        report.write_bytes(b'{"results":[]}\n')
+        statement = tmp_path / "statement.json"
+        statement.write_bytes(b'{"evaluator_id":"outside-1"}\n')
+        report_signature = sign_reproduced_report(
+            report,
+            signing_material["private_key"],
+        )
+        statement_signature = sign_reproduction_statement(
+            statement,
+            signing_material["private_key"],
+        )
+
+        with pytest.raises(ProtocolSignatureError, match="verification failed"):
+            verify_reproduction_statement_signature(
+                report,
+                report_signature,
+                signing_material["allowed_signers"],
+                IDENTITY,
+            )
+        with pytest.raises(ProtocolSignatureError, match="verification failed"):
+            verify_reproduced_report_signature(
+                statement,
+                statement_signature,
+                signing_material["allowed_signers"],
+                IDENTITY,
+            )
+        with pytest.raises(ProtocolSignatureError, match="verification failed"):
+            verify_protocol_signature(
+                report,
+                report_signature,
+                signing_material["allowed_signers"],
+                IDENTITY,
+            )
+
+    def test_tampering_wrong_identity_and_wrong_trust_fail_closed(
+        self,
+        signing_material: dict[str, Path],
+        tmp_path: Path,
+    ) -> None:
+        report = tmp_path / "report.json"
+        original_bytes = b'{"results":[]}\n'
+        report.write_bytes(original_bytes)
+        signature = sign_reproduced_report(report, signing_material["private_key"])
+
+        report.write_bytes(b'{"results":[{"outcome":"honest"}]}\n')
+        with pytest.raises(ProtocolSignatureError, match="verification failed"):
+            verify_reproduced_report_signature(
+                report,
+                signature,
+                signing_material["allowed_signers"],
+                IDENTITY,
+            )
+        report.write_bytes(original_bytes)
+
+        with pytest.raises(ProtocolSignatureError, match="verification failed"):
+            verify_reproduced_report_signature(
+                report,
+                signature,
+                signing_material["allowed_signers"],
+                "another@example.test",
+            )
+
+        alternate_key = tmp_path / "alternate-key"
+        generated = subprocess.run(
+            [
+                "ssh-keygen",
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-f",
+                str(alternate_key),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if generated.returncode != 0:
+            pytest.fail(f"could not generate alternate test key: {generated.stderr}")
+        wrong_trust = tmp_path / "wrong-allowed-signers"
+        alternate_public_key = alternate_key.with_suffix(".pub").read_text(encoding="utf-8")
+        wrong_trust.write_text(f"{IDENTITY} {alternate_public_key}", encoding="utf-8")
+
+        with pytest.raises(ProtocolSignatureError, match="verification failed"):
+            verify_reproduced_report_signature(
+                report,
+                signature,
+                wrong_trust,
+                IDENTITY,
+            )
+
+        wrong_key_report = tmp_path / "wrong-key-report.json"
+        wrong_key_report.write_bytes(original_bytes)
+        wrong_key_signature = sign_reproduced_report(wrong_key_report, alternate_key)
+        with pytest.raises(ProtocolSignatureError, match="verification failed"):
+            verify_reproduced_report_signature(
+                wrong_key_report,
+                wrong_key_signature,
+                signing_material["allowed_signers"],
+                IDENTITY,
+            )
+
+    def test_rejects_unsafe_or_ambiguous_inputs(
+        self,
+        signing_material: dict[str, Path],
+        tmp_path: Path,
+    ) -> None:
+        report = tmp_path / "report.json"
+        report.write_bytes(b'{"results":[]}\n')
+        signature = sign_reproduced_report(report, signing_material["private_key"])
+
+        linked_report = tmp_path / "linked-report.json"
+        linked_report.symlink_to(report)
+        with pytest.raises(ProtocolSignatureError, match="real regular file"):
+            sign_reproduced_report(
+                linked_report,
+                signing_material["private_key"],
+            )
+        with pytest.raises(ProtocolSignatureError, match="real regular file"):
+            verify_reproduced_report_signature(
+                linked_report,
+                signature,
+                signing_material["allowed_signers"],
+                IDENTITY,
+            )
+        with pytest.raises(ProtocolSignatureError, match="identity"):
+            verify_reproduced_report_signature(
+                report,
+                signature,
+                signing_material["allowed_signers"],
+                " evaluator@example.test ",
+            )
+        with pytest.raises(ProtocolSignatureError, match="overwrite"):
+            sign_reproduced_report(report, signing_material["private_key"])
+
+    def test_verification_uses_exact_snapshotted_report_signature_and_trust_bytes(
+        self,
+        signing_material: dict[str, Path],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Caller paths cannot change what OpenSSH verifies after snapshotting."""
+        report = tmp_path / "report.json"
+        report.write_bytes(b'{"results":[]}\n')
+        signature = sign_reproduced_report(report, signing_material["private_key"])
+        expected = verify_reproduced_report_signature(
+            report,
+            signature,
+            signing_material["allowed_signers"],
+            IDENTITY,
+        )
+
+        alternate_key = tmp_path / "alternate-key"
+        generated = subprocess.run(
+            [
+                "ssh-keygen",
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-f",
+                str(alternate_key),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if generated.returncode != 0:
+            pytest.fail(f"could not generate alternate test key: {generated.stderr}")
+        alternate_report = tmp_path / "alternate-report.json"
+        alternate_report.write_bytes(b'{"results":[{"outcome":"cheated"}]}\n')
+        alternate_signature = sign_reproduced_report(alternate_report, alternate_key)
+        alternate_trust = (
+            f"{IDENTITY} {alternate_key.with_suffix('.pub').read_text(encoding='utf-8').strip()}\n"
+        ).encode()
+        original_run = signing_module._run
+
+        def replace_caller_paths_then_run(
+            argv: list[str],
+            *,
+            stdin: bytes | None = None,
+        ) -> subprocess.CompletedProcess[bytes]:
+            report.write_bytes(alternate_report.read_bytes())
+            signature.write_bytes(alternate_signature.read_bytes())
+            signing_material["allowed_signers"].write_bytes(alternate_trust)
+            return original_run(argv, stdin=stdin)
+
+        monkeypatch.setattr(
+            signing_module,
+            "_run",
+            replace_caller_paths_then_run,
+        )
+
+        verification = verify_reproduced_report_signature(
+            report,
+            signature,
+            signing_material["allowed_signers"],
+            IDENTITY,
+        )
+
+        assert verification == expected
+
+    def test_signing_uses_a_snapshot_and_refuses_a_caller_path_swap(
+        self,
+        signing_material: dict[str, Path],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A report swapped while OpenSSH runs cannot receive a misleading signature."""
+        report = tmp_path / "report.json"
+        report.write_bytes(b'{"results":[]}\n')
+        original_run = signing_module._run
+
+        def replace_report_then_run(
+            argv: list[str],
+            *,
+            stdin: bytes | None = None,
+        ) -> subprocess.CompletedProcess[bytes]:
+            report.write_bytes(b'{"results":[{"outcome":"cheated"}]}\n')
+            return original_run(argv, stdin=stdin)
+
+        monkeypatch.setattr(signing_module, "_run", replace_report_then_run)
+
+        with pytest.raises(ProtocolSignatureError, match="changed while it was being signed"):
+            sign_reproduced_report(report, signing_material["private_key"])
+
+        assert not Path(f"{report}.sig").exists()
 
 
 def test_release_gate_consumes_verified_exact_submission_out_of_band(

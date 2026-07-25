@@ -16,6 +16,7 @@ import yaml
 from click.testing import CliRunner
 
 import stinger.benchmark.records as records_module
+import stinger.benchmark.reproduction as reproduction_module
 import stinger.cli as cli_module
 from stinger import BENCHMARK_PROTOCOL_VERSION
 from stinger.benchmark.evidence import (
@@ -33,10 +34,15 @@ from stinger.benchmark.gates import (
     BenchmarkReleaseSubmission,
     CorpusScenarioRecord,
     ErrorDispositionRecord,
+    IndependentReproductionRecord,
+    IndependentReproductionStatement,
     RepositorySize,
     SealedCorpusRecord,
+    authorize_benchmark_submission,
+    authorize_reproduction_statement,
     canonical_report_sha256,
     evaluate_baseline_configuration_record,
+    evaluate_benchmark_release,
 )
 from stinger.benchmark.ordering import ScenarioOrderItem, deterministic_blocked_ids
 from stinger.benchmark.protocol import BenchmarkRuntimeProvenance, BenchmarkSplit, ProviderId
@@ -45,7 +51,23 @@ from stinger.benchmark.records import (
     build_baseline_configuration_record,
     write_baseline_configuration_record,
 )
-from stinger.benchmark.signing import sign_protocol
+from stinger.benchmark.reproduction import (
+    COMPARISON_MANIFEST_FILE,
+    DISCREPANCY_LEDGER_FILE,
+    REPRODUCTION_STATEMENT_FILE,
+    ReproductionBuilderError,
+    build_reproduction_diff,
+    build_reproduction_record,
+    build_reproduction_statement,
+    write_reproduction_diff,
+    write_reproduction_record,
+)
+from stinger.benchmark.signing import (
+    sign_protocol,
+    sign_release_submission,
+    sign_reproduced_report,
+    sign_reproduction_statement,
+)
 from stinger.cli import main
 from stinger.config import AgentConfig, RunConfig
 from stinger.harness.sandbox import Isolation
@@ -82,6 +104,28 @@ class BaselineArtifacts:
     report: Report
     receipt: VerifiedArtifactReceipt
     record: BaselineConfigurationRecord
+
+
+def _new_signing_identity(
+    root: Path,
+    *,
+    label: str,
+    identity: str,
+) -> tuple[Path, Path]:
+    """Create an ephemeral Ed25519 evaluator key and one-principal trust file."""
+    private_key = root / label
+    generated = subprocess.run(
+        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(private_key)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if generated.returncode != 0:
+        pytest.fail(f"could not generate test signing key: {generated.stderr}")
+    public_key = private_key.with_suffix(".pub").read_text(encoding="utf-8").strip()
+    allowed_signers = root / f"{label}.allowed_signers"
+    allowed_signers.write_text(f"{identity} {public_key}\n", encoding="utf-8")
+    return private_key, allowed_signers
 
 
 def _repository_size(index: int) -> RepositorySize:
@@ -406,6 +450,129 @@ def _build_with_stubbed_receipt(
         machine_identity_artifact=machine_identity or artifacts.machine_identity,
         error_dispositions=dispositions,
     )
+
+
+def _create_independent_reproduced_evidence(
+    root: Path,
+    artifacts: BaselineArtifacts,
+    *,
+    report: Report | None = None,
+) -> tuple[Report, Path, Path, Path]:
+    """Build a fresh bundle pair whose classification may match but run evidence differs."""
+    if report is None:
+        reproduced_results = [
+            result.model_copy(
+                update={
+                    "transcript_path": (
+                        f"independent/{result.scenario_id}/{result.repetition}/transcript.txt"
+                    ),
+                    "diff_path": (
+                        f"independent/{result.scenario_id}/{result.repetition}/after.diff"
+                    ),
+                    "duration_s": result.duration_s + 0.25,
+                }
+            )
+            for result in artifacts.report.results
+        ]
+        report = build_report(
+            reproduced_results,
+            corpus_hash=artifacts.report.corpus_hash,
+            config_fingerprint=artifacts.report.config_fingerprint,
+            generated_at="2026-07-25T00:00:00+00:00",
+            benchmark_metadata=artifacts.report.benchmark_metadata,
+            benchmark_runtime_provenance=artifacts.report.benchmark_runtime_provenance,
+            bootstrap_samples=10_000,
+        )
+
+    scenarios = discover_scenarios(artifacts.corpus_path)
+    evidence = root / "rerunnable-evidence"
+    for result in report.results:
+        transcript = evidence / result.transcript_path
+        diff = evidence / result.diff_path
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text("independently reviewed synthetic transcript\n", encoding="utf-8")
+        diff.write_text("", encoding="utf-8")
+    write_repro_package(evidence, report, artifacts.config, scenarios)
+
+    config_path = root / "config.resolved.json"
+    report_path = root / "report.json"
+    config_path.write_text(artifacts.config.resolved_json(), encoding="utf-8")
+    report_path.write_text(render_json(report), encoding="utf-8")
+    public_bundle = root / "public-bundle"
+    escrow_bundle = root / "escrow-bundle"
+    create_public_evidence_bundle(
+        public_bundle,
+        protocol=artifacts.protocol,
+        protocol_signature=Path(f"{artifacts.protocol}.sig"),
+        allowed_signers=artifacts.allowed_signers,
+        signer_identity=SIGNER_IDENTITY,
+        config=config_path,
+        report=report_path,
+        permitted_logs={},
+        leakage_policy=artifacts.policy,
+    )
+    create_escrow_evidence_bundle(
+        escrow_bundle,
+        protocol=artifacts.protocol,
+        protocol_signature=Path(f"{artifacts.protocol}.sig"),
+        allowed_signers=artifacts.allowed_signers,
+        signer_identity=SIGNER_IDENTITY,
+        config=config_path,
+        report=report_path,
+        sealed_corpus=artifacts.corpus_path,
+        rerunnable_evidence=evidence,
+    )
+    return report, public_bundle, escrow_bundle, report_path
+
+
+def _release_gate_reproduction_count(
+    root: Path,
+    artifacts: BaselineArtifacts,
+    *,
+    statement_path: Path,
+    statement_signature: Path,
+    evaluator_allowed_signers: Path,
+    evaluator_identity: str,
+    record: IndependentReproductionRecord,
+) -> int:
+    """Feed exact builder output through signed authorization and the public release gate."""
+    reproduction_authorization = authorize_reproduction_statement(
+        statement_path,
+        statement_signature,
+        evaluator_allowed_signers,
+        evaluator_identity,
+    )
+    submission_template = BenchmarkReleaseSubmission.model_validate(
+        yaml.safe_load((ROOT / "benchmark" / "candidate-submission.yaml").read_text())
+    )
+    submission = submission_template.model_copy(
+        update={
+            "corpus": artifacts.corpus_record,
+            "baselines": (artifacts.record,),
+            "independent_reproduction": record,
+        }
+    )
+    submission_path = root / "release-submission.json"
+    submission_path.write_text(submission.model_dump_json() + "\n", encoding="utf-8")
+    release_identity = "human-release-operator@example.test"
+    release_key, release_allowed_signers = _new_signing_identity(
+        root,
+        label="release-key",
+        identity=release_identity,
+    )
+    release_signature = sign_release_submission(submission_path, release_key)
+    signed_submission, release_authorization = authorize_benchmark_submission(
+        submission_path,
+        release_signature,
+        release_allowed_signers,
+        release_identity,
+    )
+    gate = evaluate_benchmark_release(
+        signed_submission,
+        authorization=release_authorization,
+        reproduction_authorization=reproduction_authorization,
+    )
+    return gate.metrics.independent_reproductions
 
 
 def test_builds_publication_eligible_record_from_verified_artifacts(
@@ -815,6 +982,533 @@ def test_cli_failure_does_not_echo_sensitive_marker_path(
     assert "a marker file is empty" in outcome.output
     assert str(sensitive) not in outcome.output
     assert not destination.exists()
+
+
+def test_builds_zero_discrepancy_independent_reproduction_from_verified_artifacts(
+    tmp_path: Path,
+    baseline_artifacts: BaselineArtifacts,
+) -> None:
+    """The complete H2 path derives every statement and record hash from real artifacts."""
+    artifacts = baseline_artifacts
+    reproduced_report_model, reproduced_public, reproduced_escrow, reproduced_report = (
+        _create_independent_reproduced_evidence(
+            tmp_path / "independent-run",
+            artifacts,
+        )
+    )
+    reproduced_machine = tmp_path / "reproduced-machine.identity"
+    reproduced_machine.write_bytes(b"synthetic-independent-machine-attestation-v1\n")
+
+    evaluator_identity = "independent-evaluator@example.test"
+    evaluator_key, evaluator_allowed_signers = _new_signing_identity(
+        tmp_path,
+        label="evaluator-key",
+        identity=evaluator_identity,
+    )
+    report_signature = sign_reproduced_report(reproduced_report, evaluator_key)
+
+    resolution_file = tmp_path / "resolution.json"
+    review_template = build_reproduction_diff(artifacts.report, reproduced_report_model)
+    assert review_template.discrepancies == ()
+    write_reproduction_diff(resolution_file, review_template)
+    attestation = tmp_path / "unaffiliated-attestation.txt"
+    attestation.write_text(
+        "The synthetic evaluator is unaffiliated with the benchmark project.\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "reproduction-output"
+    statement = build_reproduction_statement(
+        "synthetic-independent-evaluator",
+        configuration_id=artifacts.record.configuration_id,
+        corpus=artifacts.corpus_record,
+        target_baseline_record=artifacts.record,
+        target_public_bundle=artifacts.public_bundle,
+        target_escrow_bundle=artifacts.escrow_bundle,
+        target_machine_identity_artifact=artifacts.machine_identity,
+        reproduced_public_bundle=reproduced_public,
+        reproduced_escrow_bundle=reproduced_escrow,
+        reproduced_machine_identity_artifact=reproduced_machine,
+        leakage_policy=artifacts.policy,
+        protocol_allowed_signers=artifacts.allowed_signers,
+        protocol_signer_identity=SIGNER_IDENTITY,
+        reproduced_report_signature=report_signature,
+        evaluator_allowed_signers=evaluator_allowed_signers,
+        evaluator_signer_identity=evaluator_identity,
+        resolution_file=resolution_file,
+        unaffiliated_attestation=attestation,
+        output_directory=output,
+    )
+
+    statement_path = output / REPRODUCTION_STATEMENT_FILE
+    comparison_path = output / COMPARISON_MANIFEST_FILE
+    ledger_path = output / DISCREPANCY_LEDGER_FILE
+    assert (
+        IndependentReproductionStatement.model_validate_json(statement_path.read_text())
+        == statement
+    )
+    assert statement.target_report_sha256 == artifacts.record.report_sha256
+    assert statement.reproduced_report_sha256 == canonical_report_sha256(reproduced_report_model)
+    assert statement.reproduced_report_sha256 != statement.target_report_sha256
+    assert (
+        statement.reproduced_report_signature_sha256
+        == hashlib.sha256(report_signature.read_bytes()).hexdigest()
+    )
+    assert (
+        statement.comparison_manifest_sha256
+        == hashlib.sha256(comparison_path.read_bytes()).hexdigest()
+    )
+    assert (
+        statement.discrepancy_ledger_sha256 == hashlib.sha256(ledger_path.read_bytes()).hexdigest()
+    )
+    assert statement.target_machine_fingerprint_sha256 != (
+        statement.reproduced_machine_fingerprint_sha256
+    )
+    assert (
+        statement.unaffiliated_attestation_sha256
+        == hashlib.sha256(attestation.read_bytes()).hexdigest()
+    )
+    assert statement.discrepancies == ()
+
+    statement_signature = sign_reproduction_statement(statement_path, evaluator_key)
+    record = build_reproduction_record(
+        statement_path,
+        statement_signature,
+        evaluator_allowed_signers,
+        evaluator_identity,
+    )
+    record_path = tmp_path / "reproduction-record.json"
+    write_reproduction_record(record_path, record)
+    assert IndependentReproductionRecord.model_validate_json(record_path.read_text()) == record
+    assert record.evaluator_id == statement.evaluator_id
+    assert record.configuration_id == statement.configuration_id
+    assert record.signer_identity == evaluator_identity
+    assert record.statement_sha256 == hashlib.sha256(statement_path.read_bytes()).hexdigest()
+    assert (
+        record.statement_signature_sha256
+        == hashlib.sha256(statement_signature.read_bytes()).hexdigest()
+    )
+    assert (
+        record.verifier_allowed_signers_sha256
+        == hashlib.sha256(evaluator_allowed_signers.read_bytes()).hexdigest()
+    )
+    mismatched_statement = statement.model_copy(
+        update={
+            "reproduced_report_signing_key_fingerprint": f"SHA256:{'Z' * 43}",
+        }
+    )
+    mismatched_path = tmp_path / "mismatched-authority-statement.json"
+    mismatched_path.write_bytes(reproduction_module._canonical_model_bytes(mismatched_statement))
+    mismatched_signature = sign_reproduction_statement(mismatched_path, evaluator_key)
+    with pytest.raises(ReproductionBuilderError, match="authorities are inconsistent"):
+        build_reproduction_record(
+            mismatched_path,
+            mismatched_signature,
+            evaluator_allowed_signers,
+            evaluator_identity,
+        )
+
+    output_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (statement_path, comparison_path, ledger_path, record_path)
+    )
+    assert str(artifacts.escrow_bundle) not in output_text
+    assert str(reproduced_escrow) not in output_text
+    assert CANARY not in output_text
+    assert DUMMY_SECRET not in output_text
+    assert attestation.read_text(encoding="utf-8").strip() not in output_text
+
+    assert (
+        _release_gate_reproduction_count(
+            tmp_path,
+            artifacts,
+            statement_path=statement_path,
+            statement_signature=statement_signature,
+            evaluator_allowed_signers=evaluator_allowed_signers,
+            evaluator_identity=evaluator_identity,
+            record=record,
+        )
+        == 1
+    )
+
+
+def test_reproduction_builder_rejects_copied_target_evidence(
+    tmp_path: Path,
+    baseline_artifacts: BaselineArtifacts,
+) -> None:
+    """Relocating the target bundles and changing machine prose is not a reproduction."""
+    artifacts = baseline_artifacts
+    reproduced_public = tmp_path / "copied-public"
+    reproduced_escrow = tmp_path / "copied-escrow"
+    shutil.copytree(artifacts.public_bundle, reproduced_public)
+    shutil.copytree(artifacts.escrow_bundle, reproduced_escrow)
+    reproduced_machine = tmp_path / "different-machine.identity"
+    reproduced_machine.write_text("different caller-entered machine prose\n", encoding="utf-8")
+
+    with pytest.raises(ReproductionBuilderError, match="indistinguishable"):
+        build_reproduction_statement(
+            "synthetic-independent-evaluator",
+            configuration_id=artifacts.record.configuration_id,
+            corpus=artifacts.corpus_record,
+            target_baseline_record=artifacts.record,
+            target_public_bundle=artifacts.public_bundle,
+            target_escrow_bundle=artifacts.escrow_bundle,
+            target_machine_identity_artifact=artifacts.machine_identity,
+            reproduced_public_bundle=reproduced_public,
+            reproduced_escrow_bundle=reproduced_escrow,
+            reproduced_machine_identity_artifact=reproduced_machine,
+            leakage_policy=artifacts.policy,
+            protocol_allowed_signers=artifacts.allowed_signers,
+            protocol_signer_identity=SIGNER_IDENTITY,
+            reproduced_report_signature=tmp_path / "unused-report.sig",
+            evaluator_allowed_signers=tmp_path / "unused-evaluator-trust",
+            evaluator_signer_identity="independent-evaluator@example.test",
+            resolution_file=tmp_path / "unused-resolution.json",
+            unaffiliated_attestation=tmp_path / "unused-attestation.txt",
+            output_directory=tmp_path / "must-not-exist",
+        )
+
+
+def test_reproduction_builder_rejects_a_reformatted_target_report(
+    baseline_artifacts: BaselineArtifacts,
+) -> None:
+    """Whitespace or key-order churn cannot disguise the same typed target report."""
+    receipt = baseline_artifacts.receipt
+    reformatted = (
+        json.dumps(receipt.report.model_dump(mode="json"), indent=4).encode("utf-8") + b"\n"
+    )
+    reproduced_receipt = replace(
+        receipt,
+        public_bundle=replace(
+            receipt.public_bundle,
+            manifest_sha256="d" * 64,
+            report_bytes=reformatted,
+        ),
+        escrow_bundle=replace(
+            receipt.escrow_bundle,
+            manifest_sha256="e" * 64,
+            report_bytes=reformatted,
+        ),
+    )
+
+    with pytest.raises(ReproductionBuilderError, match="indistinguishable"):
+        reproduction_module._require_distinguishable_evidence(
+            receipt,
+            reproduced_receipt,
+        )
+
+
+def test_builds_resolved_nonzero_reproduction_and_reaches_release_gate(
+    tmp_path: Path,
+    baseline_artifacts: BaselineArtifacts,
+) -> None:
+    """Real differing evidence survives review, signing, record derivation, and gate use."""
+    artifacts = baseline_artifacts
+    reproduced_results = [
+        result.model_copy(
+            update={
+                "transcript_path": (
+                    f"independent/{result.scenario_id}/{result.repetition}/transcript.txt"
+                ),
+                "diff_path": f"independent/{result.scenario_id}/{result.repetition}/after.diff",
+                "duration_s": result.duration_s + 0.5,
+            }
+        )
+        for result in artifacts.report.results
+    ]
+    reproduced_results[0] = reproduced_results[0].model_copy(
+        update={
+            "outcome": Outcome.CHEATED,
+            "detector_results": [
+                DetectorResult(
+                    detector="synthetic-independent-check",
+                    fired=True,
+                    evidence="synthetic classification evidence",
+                )
+            ],
+        }
+    )
+    reproduced_report_model = build_report(
+        reproduced_results,
+        corpus_hash=artifacts.report.corpus_hash,
+        config_fingerprint=artifacts.report.config_fingerprint,
+        generated_at="2026-07-26T00:00:00+00:00",
+        benchmark_metadata=artifacts.report.benchmark_metadata,
+        benchmark_runtime_provenance=artifacts.report.benchmark_runtime_provenance,
+        bootstrap_samples=10_000,
+    )
+    reproduced_report_model, reproduced_public, reproduced_escrow, reproduced_report = (
+        _create_independent_reproduced_evidence(
+            tmp_path / "independent-run",
+            artifacts,
+            report=reproduced_report_model,
+        )
+    )
+    reproduced_machine = tmp_path / "reproduced-machine.identity"
+    reproduced_machine.write_text("independent-machine-attestation-v2\n", encoding="utf-8")
+    evaluator_identity = "independent-evaluator@example.test"
+    evaluator_key, evaluator_allowed_signers = _new_signing_identity(
+        tmp_path,
+        label="evaluator-key",
+        identity=evaluator_identity,
+    )
+    report_signature = sign_reproduced_report(reproduced_report, evaluator_key)
+    review_template = build_reproduction_diff(artifacts.report, reproduced_report_model)
+    assert {item.field for item in review_template.discrepancies} == {
+        "outcome",
+        "detector_results",
+    }
+    resolution_file = tmp_path / "resolution.json"
+    write_reproduction_diff(
+        resolution_file,
+        review_template.model_copy(
+            update={
+                "discrepancies": tuple(
+                    item.model_copy(
+                        update={
+                            "resolution": "Independent evaluator confirmed this difference.",
+                            "resolved": True,
+                        }
+                    )
+                    for item in review_template.discrepancies
+                )
+            }
+        ),
+    )
+    attestation = tmp_path / "unaffiliated-attestation.txt"
+    attestation.write_text(
+        "The synthetic evaluator is unaffiliated with the benchmark project.\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "reproduction-output"
+    statement = build_reproduction_statement(
+        "synthetic-independent-evaluator",
+        configuration_id=artifacts.record.configuration_id,
+        corpus=artifacts.corpus_record,
+        target_baseline_record=artifacts.record,
+        target_public_bundle=artifacts.public_bundle,
+        target_escrow_bundle=artifacts.escrow_bundle,
+        target_machine_identity_artifact=artifacts.machine_identity,
+        reproduced_public_bundle=reproduced_public,
+        reproduced_escrow_bundle=reproduced_escrow,
+        reproduced_machine_identity_artifact=reproduced_machine,
+        leakage_policy=artifacts.policy,
+        protocol_allowed_signers=artifacts.allowed_signers,
+        protocol_signer_identity=SIGNER_IDENTITY,
+        reproduced_report_signature=report_signature,
+        evaluator_allowed_signers=evaluator_allowed_signers,
+        evaluator_signer_identity=evaluator_identity,
+        resolution_file=resolution_file,
+        unaffiliated_attestation=attestation,
+        output_directory=output,
+    )
+    assert statement.discrepancies
+    assert all(item.resolved and item.resolution.strip() for item in statement.discrepancies)
+
+    statement_path = output / REPRODUCTION_STATEMENT_FILE
+    statement_signature = sign_reproduction_statement(statement_path, evaluator_key)
+    record = build_reproduction_record(
+        statement_path,
+        statement_signature,
+        evaluator_allowed_signers,
+        evaluator_identity,
+    )
+    assert (
+        _release_gate_reproduction_count(
+            tmp_path,
+            artifacts,
+            statement_path=statement_path,
+            statement_signature=statement_signature,
+            evaluator_allowed_signers=evaluator_allowed_signers,
+            evaluator_identity=evaluator_identity,
+            record=record,
+        )
+        == 1
+    )
+
+
+def test_reproduction_builder_rejects_output_inside_verified_input(
+    tmp_path: Path,
+    baseline_artifacts: BaselineArtifacts,
+) -> None:
+    """Builder output cannot mutate a bundle after that bundle was verified."""
+    artifacts = baseline_artifacts
+    with pytest.raises(ReproductionBuilderError, match="separate from every input"):
+        build_reproduction_statement(
+            "synthetic-independent-evaluator",
+            configuration_id=artifacts.record.configuration_id,
+            corpus=artifacts.corpus_record,
+            target_baseline_record=artifacts.record,
+            target_public_bundle=artifacts.public_bundle,
+            target_escrow_bundle=artifacts.escrow_bundle,
+            target_machine_identity_artifact=artifacts.machine_identity,
+            reproduced_public_bundle=tmp_path / "reproduced-public",
+            reproduced_escrow_bundle=tmp_path / "reproduced-escrow",
+            reproduced_machine_identity_artifact=tmp_path / "reproduced-machine",
+            leakage_policy=artifacts.policy,
+            protocol_allowed_signers=artifacts.allowed_signers,
+            protocol_signer_identity=SIGNER_IDENTITY,
+            reproduced_report_signature=tmp_path / "report.sig",
+            evaluator_allowed_signers=tmp_path / "evaluator-trust",
+            evaluator_signer_identity="independent-evaluator@example.test",
+            resolution_file=tmp_path / "resolution.json",
+            unaffiliated_attestation=tmp_path / "attestation.txt",
+            output_directory=artifacts.public_bundle / "reproduction-output",
+        )
+
+
+def test_reproduction_builder_requires_exact_benchmark_v1_corpus_shape(
+    baseline_artifacts: BaselineArtifacts,
+) -> None:
+    """A 100-scenario 20-per-family floor is not the frozen 120-task benchmark."""
+    truncated = baseline_artifacts.corpus_record.model_copy(
+        update={"scenarios": baseline_artifacts.corpus_record.scenarios[:100]}
+    )
+
+    with pytest.raises(ReproductionBuilderError, match="120-scenario"):
+        reproduction_module._require_publication_corpus_shape(
+            truncated,
+            BenchmarkProtocolManifest(),
+        )
+    shared_cluster = baseline_artifacts.corpus_record.model_copy(
+        update={
+            "scenarios": tuple(
+                scenario.model_copy(update={"cluster_id": "shared.cluster"})
+                for scenario in baseline_artifacts.corpus_record.scenarios
+            )
+        }
+    )
+    with pytest.raises(ReproductionBuilderError, match="independent 120-scenario"):
+        reproduction_module._require_publication_corpus_shape(
+            shared_cluster,
+            BenchmarkProtocolManifest(),
+        )
+    unstratified = baseline_artifacts.corpus_record.model_copy(
+        update={
+            "scenarios": tuple(
+                scenario.model_copy(update={"repository_size": RepositorySize.SMALL})
+                for scenario in baseline_artifacts.corpus_record.scenarios
+            )
+        }
+    )
+    with pytest.raises(ReproductionBuilderError, match="strata"):
+        reproduction_module._require_publication_corpus_shape(
+            unstratified,
+            BenchmarkProtocolManifest(),
+        )
+
+
+def test_reproduction_builder_rejects_a_same_version_weakened_protocol(
+    baseline_artifacts: BaselineArtifacts,
+) -> None:
+    """A correctly signed same-version manifest cannot weaken publication thresholds."""
+    weakened = baseline_artifacts.receipt.protocol.model_copy(
+        update={"min_scorable_outcomes_per_family": 1}
+    )
+    weakened_receipt = replace(
+        baseline_artifacts.receipt,
+        protocol=weakened,
+    )
+
+    with pytest.raises(ReproductionBuilderError, match="protocol trust"):
+        reproduction_module._cross_bind_protocol_trust(
+            weakened_receipt,
+            weakened_receipt,
+        )
+
+
+def test_reproduction_builder_rejects_same_machine(
+    tmp_path: Path,
+    baseline_artifacts: BaselineArtifacts,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copied evidence package cannot claim an independent machine."""
+    artifacts = baseline_artifacts
+    monkeypatch.setattr(
+        reproduction_module,
+        "verify_evidence_bundle_pair",
+        lambda *args, **kwargs: artifacts.receipt,
+    )
+    monkeypatch.setattr(
+        reproduction_module,
+        "_build_baseline_configuration_record_from_receipt",
+        lambda *args, **kwargs: artifacts.record,
+    )
+    monkeypatch.setattr(
+        reproduction_module,
+        "_require_distinguishable_evidence",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(ReproductionBuilderError, match="machine attestations must differ"):
+        build_reproduction_statement(
+            "synthetic-independent-evaluator",
+            configuration_id=artifacts.record.configuration_id,
+            corpus=artifacts.corpus_record,
+            target_baseline_record=artifacts.record,
+            target_public_bundle=artifacts.public_bundle,
+            target_escrow_bundle=artifacts.escrow_bundle,
+            target_machine_identity_artifact=artifacts.machine_identity,
+            reproduced_public_bundle=tmp_path / "reproduced-public",
+            reproduced_escrow_bundle=tmp_path / "reproduced-escrow",
+            reproduced_machine_identity_artifact=artifacts.machine_identity,
+            leakage_policy=artifacts.policy,
+            protocol_allowed_signers=artifacts.allowed_signers,
+            protocol_signer_identity=SIGNER_IDENTITY,
+            reproduced_report_signature=tmp_path / "unused.sig",
+            evaluator_allowed_signers=tmp_path / "unused.allowed_signers",
+            evaluator_signer_identity="independent-evaluator@example.test",
+            resolution_file=tmp_path / "unused-resolution.json",
+            unaffiliated_attestation=tmp_path / "unused-attestation.txt",
+            output_directory=tmp_path / "must-not-exist",
+        )
+
+
+def test_reproduction_builder_rejects_target_record_not_rederived_exactly(
+    tmp_path: Path,
+    baseline_artifacts: BaselineArtifacts,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supplied target record cannot substitute caller-entered artifact hashes."""
+    artifacts = baseline_artifacts
+    monkeypatch.setattr(
+        reproduction_module,
+        "verify_evidence_bundle_pair",
+        lambda *args, **kwargs: artifacts.receipt,
+    )
+    monkeypatch.setattr(
+        reproduction_module,
+        "_build_baseline_configuration_record_from_receipt",
+        lambda *args, **kwargs: artifacts.record,
+    )
+    monkeypatch.setattr(
+        reproduction_module,
+        "_require_distinguishable_evidence",
+        lambda *args, **kwargs: None,
+    )
+    altered = artifacts.record.model_copy(update={"public_bundle_manifest_sha256": "f" * 64})
+
+    with pytest.raises(ReproductionBuilderError, match="does not match"):
+        build_reproduction_statement(
+            "synthetic-independent-evaluator",
+            configuration_id=artifacts.record.configuration_id,
+            corpus=artifacts.corpus_record,
+            target_baseline_record=altered,
+            target_public_bundle=artifacts.public_bundle,
+            target_escrow_bundle=artifacts.escrow_bundle,
+            target_machine_identity_artifact=artifacts.machine_identity,
+            reproduced_public_bundle=tmp_path / "reproduced-public",
+            reproduced_escrow_bundle=tmp_path / "reproduced-escrow",
+            reproduced_machine_identity_artifact=tmp_path / "reproduced-machine",
+            leakage_policy=artifacts.policy,
+            protocol_allowed_signers=artifacts.allowed_signers,
+            protocol_signer_identity=SIGNER_IDENTITY,
+            reproduced_report_signature=tmp_path / "unused.sig",
+            evaluator_allowed_signers=tmp_path / "unused.allowed_signers",
+            evaluator_signer_identity="independent-evaluator@example.test",
+            resolution_file=tmp_path / "unused-resolution.json",
+            unaffiliated_attestation=tmp_path / "unused-attestation.txt",
+            output_directory=tmp_path / "must-not-exist",
+        )
 
 
 def test_marker_reader_rejects_symlink_and_fifo_without_path_disclosure(

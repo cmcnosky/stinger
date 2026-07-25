@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -12,6 +15,7 @@ from stinger import BENCHMARK_PROTOCOL_VERSION
 from stinger.benchmark.gates import (
     AgentQAAttemptRecord,
     BaselineConfigurationRecord,
+    BenchmarkGateReport,
     BenchmarkProtocolManifest,
     BenchmarkReleaseSubmission,
     BetaOperatorRecord,
@@ -29,6 +33,7 @@ from stinger.benchmark.gates import (
     ReleaseEvidenceRecord,
     ReleaseStatus,
     RepositorySize,
+    ReproductionDiscrepancyRecord,
     ResolutionKind,
     ResolutionVariantRecord,
     ReviewDecision,
@@ -41,7 +46,9 @@ from stinger.benchmark.gates import (
     canonical_report_sha256,
     evaluate_benchmark_release,
     load_benchmark_protocol,
+    reproduction_discrepancy_id,
     reproduction_discrepancy_ledger_sha256,
+    reproduction_value_sha256,
 )
 from stinger.benchmark.ordering import ScenarioOrderItem, deterministic_blocked_ids
 from stinger.benchmark.protocol import (
@@ -54,6 +61,7 @@ from stinger.benchmark.protocol import (
 from stinger.benchmark.signing import (
     RELEASE_SIGNATURE_NAMESPACE,
     REPRODUCTION_SIGNATURE_NAMESPACE,
+    ProtocolSignatureError,
     sign_release_submission,
     sign_reproduction_statement,
 )
@@ -66,6 +74,7 @@ AGENT_DIGEST = f"sha256:{'a' * 64}"
 VERIFY_DIGEST = f"sha256:{'b' * 64}"
 STINGER_COMMIT = "c" * 40
 CORPUS_HASH = "d" * 64
+HONEST_OUTCOME_SHA256 = reproduction_value_sha256(Outcome.HONEST.value)
 
 
 def _reviews() -> tuple[FairnessReviewRecord, ...]:
@@ -316,13 +325,14 @@ def _reproduction_statement(
     submission: BenchmarkReleaseSubmission,
     *,
     identity: str = "verifier@example.test",
+    discrepancies: tuple[ReproductionDiscrepancyRecord, ...] = (),
 ) -> IndependentReproductionStatement:
     """Build the verifier statement that binds a complete independent reproduction."""
     baseline = submission.baselines[0]
     metadata = baseline.report.benchmark_metadata
     assert metadata is not None
     assert metadata.agent_configuration_fingerprint is not None
-    discrepancies = ()
+    reproduced_report_sha256 = "4" * 64
     return IndependentReproductionStatement(
         benchmark_protocol_version=BENCHMARK_PROTOCOL_VERSION,
         evaluator_id="independent-evaluator",
@@ -335,15 +345,22 @@ def _reproduction_statement(
         target_public_bundle_manifest_sha256=baseline.public_bundle_manifest_sha256,
         target_escrow_bundle_manifest_sha256=baseline.escrow_bundle_manifest_sha256,
         target_machine_fingerprint_sha256=baseline.machine_fingerprint_sha256,
-        reproduced_report_sha256="4" * 64,
+        reproduced_report_sha256=reproduced_report_sha256,
         reproduced_report_signature_sha256="5" * 64,
+        reproduced_report_signer_identity=identity,
+        reproduced_report_signing_key_fingerprint=f"SHA256:{'V' * 43}",
+        reproduced_report_allowed_signers_sha256="3" * 64,
         reproduced_public_bundle_manifest_sha256="6" * 64,
         reproduced_escrow_bundle_manifest_sha256="7" * 64,
         reproduced_machine_fingerprint_sha256="8" * 64,
         reproduced_config_fingerprint=baseline.report.config_fingerprint,
         reproduced_agent_configuration_fingerprint=metadata.agent_configuration_fingerprint,
         comparison_manifest_sha256="9" * 64,
-        discrepancy_ledger_sha256=reproduction_discrepancy_ledger_sha256(discrepancies),
+        discrepancy_ledger_sha256=reproduction_discrepancy_ledger_sha256(
+            discrepancies,
+            target_report_sha256=baseline.report_sha256,
+            reproduced_report_sha256=reproduced_report_sha256,
+        ),
         completed_families=tuple(Family),
         scenario_count=len(submission.corpus.scenarios),
         repetitions=submission.protocol.repetitions,
@@ -361,19 +378,33 @@ def _reproduction_proof(
 ) -> tuple[IndependentReproductionRecord, VerifiedReproductionAuthorization]:
     """Build an exact signed-statement authorization boundary for gate-level tests."""
     statement = _reproduction_statement(submission, identity=identity)
+    return _reproduction_proof_from_statement(
+        statement,
+        key_fingerprint=key_fingerprint,
+        allowed_signers_sha256=allowed_signers_sha256,
+    )
+
+
+def _reproduction_proof_from_statement(
+    statement: IndependentReproductionStatement,
+    *,
+    key_fingerprint: str = f"SHA256:{'V' * 43}",
+    allowed_signers_sha256: str = "3" * 64,
+) -> tuple[IndependentReproductionRecord, VerifiedReproductionAuthorization]:
+    """Build gate-level authorization for an exact typed verifier statement."""
     statement_sha256 = "1" * 64
     signature_sha256 = "2" * 64
     record = IndependentReproductionRecord(
         evaluator_id=statement.evaluator_id,
         configuration_id=statement.configuration_id,
-        signer_identity=identity,
+        signer_identity=statement.signer_identity,
         statement_sha256=statement_sha256,
         statement_signature_sha256=signature_sha256,
         verifier_allowed_signers_sha256=allowed_signers_sha256,
     )
     authorization = VerifiedReproductionAuthorization(
         statement=statement,
-        identity=identity,
+        identity=statement.signer_identity,
         namespace=REPRODUCTION_SIGNATURE_NAMESPACE,
         statement_sha256=statement_sha256,
         canonical_statement_sha256=_canonical_sha256(statement),
@@ -382,6 +413,49 @@ def _reproduction_proof(
         signing_key_fingerprint=key_fingerprint,
     )
     return record, authorization
+
+
+def _discrepancy(
+    *,
+    scenario_id: str = "T-B01",
+    repetition: int = 0,
+    field: str = "outcome",
+    target_value_sha256: str = HONEST_OUTCOME_SHA256,
+    reproduced_value_sha256: str = "b" * 64,
+) -> ReproductionDiscrepancyRecord:
+    """Build one resolved discrepancy with its canonical deterministic identifier."""
+    return ReproductionDiscrepancyRecord(
+        discrepancy_id=reproduction_discrepancy_id(
+            scenario_id,
+            repetition,
+            field,
+            target_value_sha256,
+            reproduced_value_sha256,
+        ),
+        scenario_id=scenario_id,
+        repetition=repetition,
+        field=field,
+        target_value_sha256=target_value_sha256,
+        reproduced_value_sha256=reproduced_value_sha256,
+        resolution="independent evaluator confirmed the classification difference",
+        resolved=True,
+    )
+
+
+def _evaluate_reproduction_statement(
+    submission: BenchmarkReleaseSubmission,
+    statement: IndependentReproductionStatement,
+    *,
+    authorization: VerifiedReproductionAuthorization | None = None,
+) -> BenchmarkGateReport:
+    """Evaluate one exact reproduction statement through the complete release gate."""
+    record, default_authorization = _reproduction_proof_from_statement(statement)
+    changed = submission.model_copy(update={"independent_reproduction": record})
+    return evaluate_benchmark_release(
+        changed,
+        authorization=_release_authorization(changed),
+        reproduction_authorization=authorization or default_authorization,
+    )
 
 
 def _signing_material(
@@ -568,6 +642,244 @@ def test_release_and_reproduction_roles_must_be_cryptographically_distinct(
     assert PublicationIssueCode.INDEPENDENT_REPRODUCTION_INVALID in _codes(result)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("reproduced_report_signer_identity", "release-operator@example.test"),
+        (
+            "reproduced_report_signing_key_fingerprint",
+            f"SHA256:{'R' * 43}",
+        ),
+        ("reproduced_report_allowed_signers_sha256", "b" * 64),
+    ),
+)
+def test_report_and_statement_must_use_the_same_evaluator_authority(
+    complete_submission: BenchmarkReleaseSubmission,
+    field: str,
+    value: str,
+) -> None:
+    """A verifier statement cannot adopt a report signed by another authority."""
+    statement = _reproduction_statement(complete_submission).model_copy(update={field: value})
+
+    result = _evaluate_reproduction_statement(complete_submission, statement)
+
+    assert result.metrics.independent_reproductions == 0
+    assert PublicationIssueCode.INDEPENDENT_REPRODUCTION_INVALID in _codes(result)
+
+
+def test_reproduction_must_not_reuse_target_report_or_bundle_artifacts(
+    complete_submission: BenchmarkReleaseSubmission,
+) -> None:
+    """Signed statements cannot bypass the builder's copied-evidence invariant."""
+    statement = _reproduction_statement(complete_submission)
+    for update in (
+        {"reproduced_report_sha256": statement.target_report_sha256},
+        {
+            "reproduced_public_bundle_manifest_sha256": (
+                statement.target_public_bundle_manifest_sha256
+            )
+        },
+        {
+            "reproduced_escrow_bundle_manifest_sha256": (
+                statement.target_escrow_bundle_manifest_sha256
+            )
+        },
+    ):
+        result = _evaluate_reproduction_statement(
+            complete_submission,
+            statement.model_copy(update=update),
+        )
+
+        assert result.metrics.independent_reproductions == 0
+        assert PublicationIssueCode.INDEPENDENT_REPRODUCTION_INVALID in _codes(result)
+
+
+def test_reproduction_discrepancy_ledger_binds_both_complete_report_hashes() -> None:
+    """The same ledger cannot be replayed against a different target or reproduced report."""
+    discrepancies = (
+        _discrepancy(),
+        _discrepancy(
+            field="goal_met",
+            target_value_sha256="c" * 64,
+            reproduced_value_sha256="d" * 64,
+        ),
+    )
+    target_hash = "1" * 64
+    reproduced_hash = "2" * 64
+    bound = reproduction_discrepancy_ledger_sha256(
+        discrepancies,
+        target_report_sha256=target_hash,
+        reproduced_report_sha256=reproduced_hash,
+    )
+
+    assert bound == reproduction_discrepancy_ledger_sha256(
+        tuple(reversed(discrepancies)),
+        target_report_sha256=target_hash,
+        reproduced_report_sha256=reproduced_hash,
+    )
+    assert bound != reproduction_discrepancy_ledger_sha256(
+        discrepancies,
+        target_report_sha256="3" * 64,
+        reproduced_report_sha256=reproduced_hash,
+    )
+    assert bound != reproduction_discrepancy_ledger_sha256(
+        discrepancies,
+        target_report_sha256=target_hash,
+        reproduced_report_sha256="4" * 64,
+    )
+
+
+def test_resolved_canonical_discrepancy_remains_valid_reproduction_evidence(
+    complete_submission: BenchmarkReleaseSubmission,
+) -> None:
+    """A real classification difference may pass when every binding is canonical."""
+    statement = _reproduction_statement(
+        complete_submission,
+        discrepancies=(_discrepancy(),),
+    )
+
+    result = _evaluate_reproduction_statement(complete_submission, statement)
+
+    assert result.metrics.independent_reproductions == 1
+    assert PublicationIssueCode.INDEPENDENT_REPRODUCTION_INVALID not in _codes(result)
+
+
+@pytest.mark.parametrize(
+    ("scenario_id", "repetition"),
+    (
+        ("not-in-target-report", 0),
+        ("T-B01", 5),
+    ),
+)
+def test_reproduction_rejects_discrepancies_at_invalid_semantic_locations(
+    complete_submission: BenchmarkReleaseSubmission,
+    scenario_id: str,
+    repetition: int,
+) -> None:
+    """A resolved entry cannot name a scenario/repetition absent from the target report."""
+    statement = _reproduction_statement(
+        complete_submission,
+        discrepancies=(_discrepancy(scenario_id=scenario_id, repetition=repetition),),
+    )
+
+    result = _evaluate_reproduction_statement(complete_submission, statement)
+
+    assert result.metrics.independent_reproductions == 0
+    assert PublicationIssueCode.INDEPENDENT_REPRODUCTION_INVALID in _codes(result)
+
+
+def test_reproduction_rejects_duplicate_discrepancy_semantic_locations(
+    complete_submission: BenchmarkReleaseSubmission,
+) -> None:
+    """Different ids cannot disguise two dispositions for the same result field."""
+    discrepancies = (
+        _discrepancy(),
+        _discrepancy(
+            target_value_sha256="c" * 64,
+            reproduced_value_sha256="d" * 64,
+        ),
+    )
+    statement = _reproduction_statement(
+        complete_submission,
+        discrepancies=discrepancies,
+    )
+
+    result = _evaluate_reproduction_statement(complete_submission, statement)
+
+    assert result.metrics.independent_reproductions == 0
+    assert PublicationIssueCode.INDEPENDENT_REPRODUCTION_INVALID in _codes(result)
+
+
+def test_reproduction_rejects_nonclassification_discrepancy_fields(
+    complete_submission: BenchmarkReleaseSubmission,
+) -> None:
+    """Run-specific noise cannot be inserted into the signed discrepancy ledger."""
+    statement = _reproduction_statement(
+        complete_submission,
+        discrepancies=(_discrepancy(field="duration_s"),),
+    )
+
+    result = _evaluate_reproduction_statement(complete_submission, statement)
+
+    assert result.metrics.independent_reproductions == 0
+    assert PublicationIssueCode.INDEPENDENT_REPRODUCTION_INVALID in _codes(result)
+
+
+def test_reproduction_rejects_nondeterministic_discrepancy_ids(
+    complete_submission: BenchmarkReleaseSubmission,
+) -> None:
+    """A caller-entered id cannot replace the canonical location/value binding."""
+    discrepancy = _discrepancy().model_copy(update={"discrepancy_id": "0" * 64})
+    statement = _reproduction_statement(
+        complete_submission,
+        discrepancies=(discrepancy,),
+    )
+
+    result = _evaluate_reproduction_statement(complete_submission, statement)
+
+    assert result.metrics.independent_reproductions == 0
+    assert PublicationIssueCode.INDEPENDENT_REPRODUCTION_INVALID in _codes(result)
+
+
+def test_reproduction_rejects_a_discrepancy_with_equal_value_hashes(
+    complete_submission: BenchmarkReleaseSubmission,
+) -> None:
+    """A signed ledger cannot call identical classification evidence discrepant."""
+    discrepancy = _discrepancy(
+        target_value_sha256="a" * 64,
+        reproduced_value_sha256="a" * 64,
+    )
+    statement = _reproduction_statement(
+        complete_submission,
+        discrepancies=(discrepancy,),
+    )
+
+    result = _evaluate_reproduction_statement(complete_submission, statement)
+
+    assert result.metrics.independent_reproductions == 0
+    assert PublicationIssueCode.INDEPENDENT_REPRODUCTION_INVALID in _codes(result)
+
+
+def test_reproduction_rejects_a_false_target_value_hash(
+    complete_submission: BenchmarkReleaseSubmission,
+) -> None:
+    """Canonical IDs and ledgers cannot detach a discrepancy from target evidence."""
+    discrepancy = _discrepancy(
+        target_value_sha256="c" * 64,
+        reproduced_value_sha256="d" * 64,
+    )
+    statement = _reproduction_statement(
+        complete_submission,
+        discrepancies=(discrepancy,),
+    )
+
+    result = _evaluate_reproduction_statement(complete_submission, statement)
+
+    assert result.metrics.independent_reproductions == 0
+    assert PublicationIssueCode.INDEPENDENT_REPRODUCTION_INVALID in _codes(result)
+
+
+def test_reproduction_rechecks_the_canonical_typed_statement_hash(
+    complete_submission: BenchmarkReleaseSubmission,
+) -> None:
+    """The parsed statement cannot drift after the authorization receipt was built."""
+    statement = _reproduction_statement(complete_submission)
+    _, authorization = _reproduction_proof_from_statement(statement)
+    changed_authorization = replace(
+        authorization,
+        canonical_statement_sha256="0" * 64,
+    )
+
+    result = _evaluate_reproduction_statement(
+        complete_submission,
+        statement,
+        authorization=changed_authorization,
+    )
+
+    assert result.metrics.independent_reproductions == 0
+    assert PublicationIssueCode.INDEPENDENT_REPRODUCTION_INVALID in _codes(result)
+
+
 def test_distinct_authorities_can_reach_the_true_publication_success_path(
     complete_submission: BenchmarkReleaseSubmission,
     tmp_path: Path,
@@ -580,12 +892,34 @@ def test_distinct_authorities_can_reach_the_true_publication_success_path(
         label="verifier-key",
         identity=verifier_identity,
     )
+    fingerprint_result = subprocess.run(
+        [
+            "ssh-keygen",
+            "-lf",
+            str(verifier_key.with_suffix(".pub")),
+            "-E",
+            "sha256",
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert fingerprint_result.returncode == 0
+    verifier_fingerprint = fingerprint_result.stdout.split()[1]
     statement_path = tmp_path / "reproduction-statement.json"
+    statement = _reproduction_statement(
+        submission,
+        identity=verifier_identity,
+    ).model_copy(
+        update={
+            "reproduced_report_signing_key_fingerprint": verifier_fingerprint,
+            "reproduced_report_allowed_signers_sha256": hashlib.sha256(
+                verifier_policy.read_bytes()
+            ).hexdigest(),
+        }
+    )
     statement_path.write_text(
-        _reproduction_statement(
-            submission,
-            identity=verifier_identity,
-        ).model_dump_json(indent=2),
+        statement.model_dump_json(indent=2),
         encoding="utf-8",
     )
     statement_signature = sign_reproduction_statement(statement_path, verifier_key)
@@ -632,6 +966,33 @@ def test_distinct_authorities_can_reach_the_true_publication_success_path(
     assert result.publishable is True
     assert result.status is ReleaseStatus.INDEPENDENTLY_REPRODUCED
     assert result.metrics.independent_reproductions == 1
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "fifo"])
+def test_authorization_rejects_unsafe_artifact_paths_without_blocking(
+    tmp_path: Path,
+    unsafe_kind: str,
+) -> None:
+    """Public authorization snapshots never follow links or wait on special files."""
+    regular = tmp_path / "regular.json"
+    regular.write_text("{}\n", encoding="utf-8")
+    unsafe = tmp_path / f"unsafe-{unsafe_kind}"
+    if unsafe_kind == "symlink":
+        unsafe.symlink_to(regular)
+    else:
+        os.mkfifo(unsafe)
+
+    for authorize in (
+        authorize_benchmark_submission,
+        authorize_reproduction_statement,
+    ):
+        with pytest.raises(ProtocolSignatureError, match="regular nonsymlink"):
+            authorize(
+                unsafe,
+                tmp_path / "unused.sig",
+                tmp_path / "unused.allowed_signers",
+                "verifier@example.test",
+            )
 
 
 def test_checked_in_protocol_yaml_matches_the_code_contract() -> None:

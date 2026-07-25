@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -39,6 +40,40 @@ CANARY = "STINGER-SEALED-CANARY-5b8f21"
 BAIT_SECRET = "sk-dummy-stinger-bait-only-8fj2"
 SIGNER_IDENTITY = "stinger-release@example.test"
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_regular_file_reader_rejects_symlink_swap_and_fifo_without_blocking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Evidence snapshots use one no-follow descriptor across validation and reading."""
+    source = tmp_path / "source.json"
+    replacement = tmp_path / "replacement.json"
+    source.write_bytes(b'{"original":true}\n')
+    replacement.write_bytes(b'{"replacement":true}\n')
+    original_open = os.open
+    swapped = False
+
+    def swap_before_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+    ) -> int:
+        nonlocal swapped
+        if not swapped and Path(path) == source:
+            swapped = True
+            source.unlink()
+            source.symlink_to(replacement)
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(evidence_module.os, "open", swap_before_open)
+    with pytest.raises(EvidenceBundleError, match="real regular file"):
+        evidence_module._read_regular_file(source, "synthetic evidence")
+
+    fifo = tmp_path / "evidence.fifo"
+    os.mkfifo(fifo)
+    with pytest.raises(EvidenceBundleError, match="real regular file"):
+        evidence_module._read_regular_file(fifo, "synthetic evidence")
 
 
 @pytest.fixture
@@ -156,6 +191,39 @@ def evidence_inputs(tmp_path: Path, t02_dir: Path) -> dict[str, Path]:
         "allowed_signers": allowed_signers,
         "private_key": private_key,
     }
+
+
+def test_escrow_semantics_reuse_required_file_snapshots(
+    tmp_path: Path,
+    evidence_inputs: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A required metadata path swapped after its read is never reopened."""
+    rubric = evidence_inputs["evidence"] / "rubric.version"
+    replacement = tmp_path / "replacement-rubric.version"
+    replacement.write_text("999.999.999\n", encoding="utf-8")
+    original_read = evidence_module._read_regular_file
+    swapped = False
+
+    def read_then_swap(path: Path, label: str) -> bytes:
+        nonlocal swapped
+        content = original_read(path, label)
+        if not swapped and path == rubric:
+            swapped = True
+            rubric.unlink()
+            rubric.symlink_to(replacement)
+        return content
+
+    monkeypatch.setattr(evidence_module, "_read_regular_file", read_then_swap)
+    evidence_module._verify_escrow_semantics(
+        evidence_inputs["corpus"],
+        evidence_inputs["evidence"],
+        protocol=evidence_module.BenchmarkProtocolManifest(),
+        config=evidence_module._load_resolved_config(evidence_inputs["config"]),
+        report=load_report(evidence_inputs["report"].read_text(encoding="utf-8")),
+    )
+
+    assert swapped
 
 
 def policy(inputs: dict[str, Path]) -> PublicLeakagePolicy:

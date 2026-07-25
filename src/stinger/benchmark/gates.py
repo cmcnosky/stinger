@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -72,6 +74,15 @@ _SEMVER_PATTERN = re.compile(
 _CLUSTER_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$")
 _ANONYMOUS_CONFIGURATION_PATTERN = re.compile(r"^anonymous-[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$")
 _SSH_KEY_FINGERPRINT_PATTERN = re.compile(r"^SHA256:[A-Za-z0-9+/]+={0,2}$")
+_REPRODUCTION_DISCREPANCY_FIELDS = frozenset(
+    {
+        "outcome",
+        "detector_results",
+        "goal_met",
+        "agent_claimed_done",
+        "run_error",
+    }
+)
 
 
 def _require_sha256(value: str, *, field_name: str) -> str:
@@ -536,6 +547,9 @@ class IndependentReproductionStatement(_FrozenModel):
     target_machine_fingerprint_sha256: str
     reproduced_report_sha256: str
     reproduced_report_signature_sha256: str
+    reproduced_report_signer_identity: str
+    reproduced_report_signing_key_fingerprint: str
+    reproduced_report_allowed_signers_sha256: str
     reproduced_public_bundle_manifest_sha256: str
     reproduced_escrow_bundle_manifest_sha256: str
     reproduced_machine_fingerprint_sha256: str
@@ -559,6 +573,7 @@ class IndependentReproductionStatement(_FrozenModel):
         "target_machine_fingerprint_sha256",
         "reproduced_report_sha256",
         "reproduced_report_signature_sha256",
+        "reproduced_report_allowed_signers_sha256",
         "reproduced_public_bundle_manifest_sha256",
         "reproduced_escrow_bundle_manifest_sha256",
         "reproduced_machine_fingerprint_sha256",
@@ -729,7 +744,7 @@ def load_benchmark_protocol(path: Path) -> BenchmarkProtocolManifest:
         ValueError: If the YAML root is not a mapping.
         pydantic.ValidationError: If fields are missing, extra, or ill-typed.
     """
-    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw = yaml.safe_load(_read_regular_file_bytes(path, label="benchmark protocol").decode("utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("benchmark protocol YAML root must be a mapping")
     return BenchmarkProtocolManifest.model_validate(raw)
@@ -742,7 +757,9 @@ def load_benchmark_submission(path: Path) -> BenchmarkReleaseSubmission:
     then fail the release gate with explicit issue codes. Missing or extra schema fields do
     not parse, because an unknown record cannot count as release evidence.
     """
-    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw = yaml.safe_load(
+        _read_regular_file_bytes(path, label="benchmark release submission").decode("utf-8")
+    )
     if not isinstance(raw, dict):
         raise ValueError("benchmark release submission root must be a mapping")
     return BenchmarkReleaseSubmission.model_validate(raw)
@@ -760,7 +777,12 @@ def authorize_benchmark_submission(
     OpenSSH verified, closing the gap between a signed file and the parsed model passed to
     the release evaluator.
     """
-    content = path.read_bytes()
+    try:
+        content = _read_regular_file_bytes(path, label="release submission")
+    except ValueError as exc:
+        raise ProtocolSignatureError(
+            "release submission must be a regular nonsymlink file"
+        ) from exc
     verification = verify_release_submission_signature(
         path,
         signature,
@@ -788,7 +810,12 @@ def authorize_reproduction_statement(
     identity: str,
 ) -> VerifiedReproductionAuthorization:
     """Load and externally verify an independent reproduction statement."""
-    content = path.read_bytes()
+    try:
+        content = _read_regular_file_bytes(path, label="reproduction statement")
+    except ValueError as exc:
+        raise ProtocolSignatureError(
+            "reproduction statement must be a regular nonsymlink file"
+        ) from exc
     verification = verify_reproduction_statement_signature(
         path,
         signature,
@@ -819,6 +846,31 @@ def _load_benchmark_submission_bytes(content: bytes) -> BenchmarkReleaseSubmissi
     if not isinstance(raw, dict):
         raise ValueError("benchmark release submission root must be a mapping")
     return BenchmarkReleaseSubmission.model_validate(raw)
+
+
+def _read_regular_file_bytes(path: Path, *, label: str) -> bytes:
+    """Read exact nonempty bytes without following links or blocking on a FIFO."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"{label} must be a regular nonsymlink file") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"{label} must be a regular nonsymlink file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    content = b"".join(chunks)
+    if not content:
+        raise ValueError(f"{label} must not be empty")
+    return content
 
 
 def evaluate_benchmark_release(
@@ -1867,17 +1919,26 @@ def _valid_reproduction(
     )
     discrepancies = statement.discrepancies
     discrepancy_ids = [item.discrepancy_id for item in discrepancies]
+    discrepancy_locations = [
+        (item.scenario_id, item.repetition, item.field) for item in discrepancies
+    ]
     families = statement.completed_families
     target_agent_fingerprint = (
         None
         if baseline is None or baseline.report.benchmark_metadata is None
         else baseline.report.benchmark_metadata.agent_configuration_fingerprint
     )
+    target_results = (
+        {}
+        if baseline is None
+        else {(result.scenario_id, result.repetition): result for result in baseline.report.results}
+    )
     return (
         baseline is not None
         and authorization.namespace == REPRODUCTION_SIGNATURE_NAMESPACE
         and _SSH_KEY_FINGERPRINT_PATTERN.fullmatch(authorization.signing_key_fingerprint)
         is not None
+        and authorization.canonical_statement_sha256 == _canonical_sha256(statement)
         and authorization.identity != release_authorization.identity
         and authorization.signing_key_fingerprint != release_authorization.signing_key_fingerprint
         and authorization.allowed_signers_sha256 != release_authorization.allowed_signers_sha256
@@ -1886,6 +1947,11 @@ def _valid_reproduction(
         and reproduction.verifier_allowed_signers_sha256 == authorization.allowed_signers_sha256
         and reproduction.signer_identity == authorization.identity
         and statement.signer_identity == authorization.identity
+        and statement.reproduced_report_signer_identity == authorization.identity
+        and statement.reproduced_report_signing_key_fingerprint
+        == authorization.signing_key_fingerprint
+        and statement.reproduced_report_allowed_signers_sha256
+        == authorization.allowed_signers_sha256
         and statement.evaluator_id == reproduction.evaluator_id
         and bool(statement.evaluator_id.strip())
         and statement.configuration_id == reproduction.configuration_id
@@ -1898,6 +1964,11 @@ def _valid_reproduction(
         and statement.target_public_bundle_manifest_sha256 == baseline.public_bundle_manifest_sha256
         and statement.target_escrow_bundle_manifest_sha256 == baseline.escrow_bundle_manifest_sha256
         and statement.target_machine_fingerprint_sha256 == baseline.machine_fingerprint_sha256
+        and statement.reproduced_report_sha256 != statement.target_report_sha256
+        and statement.reproduced_public_bundle_manifest_sha256
+        != statement.target_public_bundle_manifest_sha256
+        and statement.reproduced_escrow_bundle_manifest_sha256
+        != statement.target_escrow_bundle_manifest_sha256
         and statement.reproduced_config_fingerprint == baseline.report.config_fingerprint
         and statement.reproduced_agent_configuration_fingerprint == target_agent_fingerprint
         and statement.reproduced_machine_fingerprint_sha256 != baseline.machine_fingerprint_sha256
@@ -1906,11 +1977,33 @@ def _valid_reproduction(
         and statement.scenario_count == submission.protocol.total_scenarios
         and statement.repetitions == submission.protocol.repetitions
         and statement.discrepancy_ledger_sha256
-        == reproduction_discrepancy_ledger_sha256(discrepancies)
+        == reproduction_discrepancy_ledger_sha256(
+            discrepancies,
+            target_report_sha256=statement.target_report_sha256,
+            reproduced_report_sha256=statement.reproduced_report_sha256,
+        )
         and len(discrepancy_ids) == len(set(discrepancy_ids))
+        and len(discrepancy_locations) == len(set(discrepancy_locations))
         and all(
-            item.discrepancy_id.strip()
-            and item.field.strip()
+            item.scenario_id
+            and item.scenario_id == item.scenario_id.strip()
+            and (item.scenario_id, item.repetition) in target_results
+            and item.field in _REPRODUCTION_DISCREPANCY_FIELDS
+            and item.target_value_sha256
+            == reproduction_value_sha256(
+                target_results[(item.scenario_id, item.repetition)].model_dump(mode="json")[
+                    item.field
+                ]
+            )
+            and item.discrepancy_id
+            == reproduction_discrepancy_id(
+                item.scenario_id,
+                item.repetition,
+                item.field,
+                item.target_value_sha256,
+                item.reproduced_value_sha256,
+            )
+            and item.target_value_sha256 != item.reproduced_value_sha256
             and item.resolved
             and item.resolution.strip()
             for item in discrepancies
@@ -1920,10 +2013,67 @@ def _valid_reproduction(
 
 def reproduction_discrepancy_ledger_sha256(
     discrepancies: tuple[ReproductionDiscrepancyRecord, ...],
+    *,
+    target_report_sha256: str,
+    reproduced_report_sha256: str,
 ) -> str:
-    """Hash the canonical discrepancy ledger covered by the verifier statement."""
-    ordered = tuple(sorted(discrepancies, key=lambda item: item.discrepancy_id))
-    return _canonical_sha256(ordered)
+    """Hash both reports and the canonical ledger covered by the verifier statement."""
+    target_hash = _require_sha256(
+        target_report_sha256,
+        field_name="target_report_sha256",
+    )
+    reproduced_hash = _require_sha256(
+        reproduced_report_sha256,
+        field_name="reproduced_report_sha256",
+    )
+    ordered = sorted(
+        discrepancies,
+        key=lambda item: (
+            item.scenario_id,
+            item.repetition,
+            item.field,
+            _canonical_payload_sha256(item.model_dump(mode="json")),
+        ),
+    )
+    return _canonical_payload_sha256(
+        {
+            "target_report_sha256": target_hash,
+            "reproduced_report_sha256": reproduced_hash,
+            "discrepancies": [item.model_dump(mode="json") for item in ordered],
+        }
+    )
+
+
+def reproduction_discrepancy_id(
+    scenario_id: str,
+    repetition: int,
+    field: str,
+    target_value_sha256: str,
+    reproduced_value_sha256: str,
+) -> str:
+    """Derive one discrepancy id from its immutable semantic location and value hashes."""
+    if repetition < 0:
+        raise ValueError("repetition must be non-negative")
+    return _canonical_payload_sha256(
+        {
+            "scenario_id": scenario_id,
+            "repetition": repetition,
+            "field": field,
+            "target_value_sha256": _require_sha256(
+                target_value_sha256,
+                field_name="target_value_sha256",
+            ),
+            "reproduced_value_sha256": _require_sha256(
+                reproduced_value_sha256,
+                field_name="reproduced_value_sha256",
+            ),
+        }
+    )
+
+
+def reproduction_value_sha256(value: object) -> str:
+    """Hash one present classification-field value without conflating JSON null."""
+    return _canonical_payload_sha256({"present": True, "value": value})
 
 
 def _evaluate_release_evidence(
@@ -2072,5 +2222,6 @@ __all__ = [
     "evaluate_benchmark_release",
     "load_benchmark_protocol",
     "load_benchmark_submission",
+    "reproduction_discrepancy_id",
     "reproduction_discrepancy_ledger_sha256",
 ]

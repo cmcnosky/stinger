@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -970,11 +971,13 @@ def _verify_escrow_semantics(
         "rerun.sh",
         SEALED_REPRO_MARKER,
     )
-    for required_name in required_files:
-        _read_regular_file(
+    required_bytes = {
+        required_name: _read_regular_file(
             rerunnable_evidence / required_name,
             f"rerunnable evidence {required_name}",
         )
+        for required_name in required_files
+    }
     _require_directory(rerunnable_evidence / "runs", "rerunnable evidence runs")
     if (rerunnable_evidence / "corpus").exists():
         raise EvidenceBundleError(
@@ -982,17 +985,15 @@ def _verify_escrow_semantics(
         )
 
     try:
-        repro_report = load_report(
-            (rerunnable_evidence / "report.json").read_text(encoding="utf-8")
-        )
+        repro_report = load_report(required_bytes["report.json"].decode("utf-8"))
         verify_report(repro_report)
-    except (OSError, ReportMismatchError) as exc:
+    except (UnicodeDecodeError, ReportMismatchError) as exc:
         raise EvidenceBundleError(f"rerunnable evidence report does not verify: {exc}") from exc
     if repro_report != report:
         raise EvidenceBundleError(
             "rerunnable evidence report disagrees with the escrow core report"
         )
-    repro_config = _load_resolved_config(rerunnable_evidence / "config.resolved.json")
+    repro_config = _load_resolved_config_bytes(required_bytes["config.resolved.json"])
     if (
         repro_config.fingerprint() != config.fingerprint()
         or repro_config.benchmark_metadata() != config.benchmark_metadata()
@@ -1000,19 +1001,19 @@ def _verify_escrow_semantics(
         raise EvidenceBundleError(
             "rerunnable evidence configuration disagrees with the escrow core configuration"
         )
-    if (rerunnable_evidence / "corpus.lock").read_text(encoding="utf-8") != build_corpus_lock(
-        scenarios
-    ):
+    try:
+        corpus_lock = required_bytes["corpus.lock"].decode("utf-8")
+        rubric_version = required_bytes["rubric.version"].decode("utf-8")
+        benchmark_protocol_version = required_bytes["benchmark.protocol.version"].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise EvidenceBundleError("rerunnable evidence metadata must be valid UTF-8") from exc
+    if corpus_lock != build_corpus_lock(scenarios):
         raise EvidenceBundleError(
             "rerunnable evidence corpus.lock disagrees with the actual sealed corpus"
         )
-    if (rerunnable_evidence / "rubric.version").read_text(encoding="utf-8") != (
-        protocol.rubric_version + "\n"
-    ):
+    if rubric_version != protocol.rubric_version + "\n":
         raise EvidenceBundleError("rerunnable evidence rubric.version is incorrect")
-    if (rerunnable_evidence / "benchmark.protocol.version").read_text(encoding="utf-8") != (
-        protocol.benchmark_protocol_version + "\n"
-    ):
+    if benchmark_protocol_version != protocol.benchmark_protocol_version + "\n":
         raise EvidenceBundleError("rerunnable evidence benchmark.protocol.version is incorrect")
     for result in report.results:
         for artifact in (result.transcript_path, result.diff_path):
@@ -1596,13 +1597,25 @@ def _canonical_json(value: object) -> bytes:
 
 
 def _read_regular_file(path: Path, label: str) -> bytes:
-    """Read only a real regular file; symlinks and special files fail closed."""
-    if path.is_symlink() or not path.is_file():
-        raise EvidenceBundleError(f"{label} must be a real regular file: {path}")
+    """Read one descriptor-validated regular file without a check/use path race."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        return path.read_bytes()
+        descriptor = os.open(path, flags)
     except OSError as exc:
-        raise EvidenceBundleError(f"{label} is not readable: {path}: {exc}") from exc
+        raise EvidenceBundleError(f"{label} must be a real regular file: {path}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise EvidenceBundleError(f"{label} must be a real regular file: {path}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    return b"".join(chunks)
 
 
 def _sha256(content: bytes) -> str:

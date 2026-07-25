@@ -34,6 +34,7 @@ from stinger.benchmark.evidence import (
     verify_public_evidence_bundle,
 )
 from stinger.benchmark.gates import (
+    BaselineConfigurationRecord,
     BenchmarkGateReport,
     BenchmarkProtocolManifest,
     BenchmarkReleaseSubmission,
@@ -52,10 +53,19 @@ from stinger.benchmark.records import (
     build_baseline_configuration_record,
     write_baseline_configuration_record,
 )
+from stinger.benchmark.reproduction import (
+    ReproductionBuilderError,
+    build_reproduction_diff,
+    build_reproduction_record,
+    build_reproduction_statement,
+    write_reproduction_diff,
+    write_reproduction_record,
+)
 from stinger.benchmark.signing import (
     ProtocolSignatureError,
     sign_protocol,
     sign_release_submission,
+    sign_reproduced_report,
     sign_reproduction_statement,
     verify_protocol_signature,
 )
@@ -146,6 +156,22 @@ def sign_benchmark_reproduction(statement: Path, private_key: Path) -> None:
     except ProtocolSignatureError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"signed benchmark reproduction statement: {signature}")
+
+
+@benchmark_commands.command(name="sign-reproduced-report")
+@click.argument("report", type=click.Path(path_type=Path))
+@click.option(
+    "--private-key",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+def sign_benchmark_reproduced_report(report: Path, private_key: Path) -> None:
+    """Sign exact reproduced report bytes in the evaluator-report namespace."""
+    try:
+        sign_reproduced_report(report, private_key)
+    except ProtocolSignatureError as exc:
+        raise click.ClickException("reproduced report signing failed") from exc
+    click.echo("reproduced report signed")
 
 
 @benchmark_commands.command(name="verify-protocol")
@@ -360,10 +386,40 @@ def compare_benchmark_reports(
     click.echo(comparison.model_dump_json(indent=2))
 
 
+@benchmark_commands.command(name="reproduction-diff")
+@click.argument("target", type=click.Path(path_type=Path))
+@click.argument("reproduced", type=click.Path(path_type=Path))
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def reproduction_diff(target: Path, reproduced: Path, output: Path) -> None:
+    """Create an unresolved private review template from two verified reports."""
+    try:
+        template = build_reproduction_diff(
+            _load_private_report(target),
+            _load_private_report(reproduced),
+        )
+        write_reproduction_diff(output, template)
+    except (
+        OSError,
+        UnicodeDecodeError,
+        ValidationError,
+        ReportMismatchError,
+        ReproductionBuilderError,
+        ValueError,
+    ) as exc:
+        raise click.ClickException("reproduction diff construction failed") from exc
+    click.echo("private reproduction discrepancy template created")
+
+
 def _load_report_path(path: Path) -> Report:
     """Load a report file or a reproducibility directory without trusting its numbers."""
     source = path / "report.json" if path.is_dir() else path
     return load_report(source.read_text(encoding="utf-8"))
+
+
+def _load_private_report(path: Path) -> Report:
+    """Load exact report bytes without following links or echoing a private path."""
+    content = _read_private_regular_file(path, label="report")
+    return load_report(content.decode("utf-8"))
 
 
 @benchmark_commands.command(name="bundle-public")
@@ -664,14 +720,162 @@ def build_baseline_record(
     click.echo("baseline configuration record created from verified artifacts")
 
 
+@benchmark_commands.command(name="build-reproduction-statement")
+@click.option("--evaluator-id", required=True)
+@click.option("--configuration-id", required=True)
+@click.option("--corpus-record", type=click.Path(path_type=Path), required=True)
+@click.option("--target-baseline-record", type=click.Path(path_type=Path), required=True)
+@click.option("--target-public-bundle", type=click.Path(path_type=Path), required=True)
+@click.option("--target-escrow-bundle", type=click.Path(path_type=Path), required=True)
+@click.option("--target-machine-identity", type=click.Path(path_type=Path), required=True)
+@click.option("--reproduced-public-bundle", type=click.Path(path_type=Path), required=True)
+@click.option("--reproduced-escrow-bundle", type=click.Path(path_type=Path), required=True)
+@click.option(
+    "--reproduced-machine-identity",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option(
+    "--forbidden-source",
+    type=click.Path(path_type=Path),
+    multiple=True,
+    required=True,
+)
+@click.option(
+    "--marker-file",
+    type=click.Path(path_type=Path),
+    multiple=True,
+    required=True,
+)
+@click.option(
+    "--protocol-allowed-signers",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option("--protocol-signer-identity", required=True)
+@click.option(
+    "--reproduced-report-signature",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option(
+    "--evaluator-allowed-signers",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option("--evaluator-signer-identity", required=True)
+@click.option("--resolution-file", type=click.Path(path_type=Path), required=True)
+@click.option(
+    "--unaffiliated-attestation",
+    type=click.Path(path_type=Path),
+    required=True,
+)
+@click.option(
+    "--reproduced-error-dispositions",
+    type=click.Path(path_type=Path),
+)
+@click.option("--output-directory", type=click.Path(path_type=Path), required=True)
+def build_reproduction_statement_command(
+    evaluator_id: str,
+    configuration_id: str,
+    corpus_record: Path,
+    target_baseline_record: Path,
+    target_public_bundle: Path,
+    target_escrow_bundle: Path,
+    target_machine_identity: Path,
+    reproduced_public_bundle: Path,
+    reproduced_escrow_bundle: Path,
+    reproduced_machine_identity: Path,
+    forbidden_source: tuple[Path, ...],
+    marker_file: tuple[Path, ...],
+    protocol_allowed_signers: Path,
+    protocol_signer_identity: str,
+    reproduced_report_signature: Path,
+    evaluator_allowed_signers: Path,
+    evaluator_signer_identity: str,
+    resolution_file: Path,
+    unaffiliated_attestation: Path,
+    reproduced_error_dispositions: Path | None,
+    output_directory: Path,
+) -> None:
+    """Build canonical reproduction artifacts only from verified evidence."""
+    try:
+        corpus = _load_sealed_corpus_record(corpus_record)
+        baseline = _load_baseline_configuration_record(target_baseline_record)
+        policy = _public_leakage_policy(forbidden_source, marker_file)
+        dispositions = _load_error_dispositions(reproduced_error_dispositions)
+        build_reproduction_statement(
+            evaluator_id,
+            configuration_id=configuration_id,
+            corpus=corpus,
+            target_baseline_record=baseline,
+            target_public_bundle=target_public_bundle,
+            target_escrow_bundle=target_escrow_bundle,
+            target_machine_identity_artifact=target_machine_identity,
+            reproduced_public_bundle=reproduced_public_bundle,
+            reproduced_escrow_bundle=reproduced_escrow_bundle,
+            reproduced_machine_identity_artifact=reproduced_machine_identity,
+            leakage_policy=policy,
+            protocol_allowed_signers=protocol_allowed_signers,
+            protocol_signer_identity=protocol_signer_identity,
+            reproduced_report_signature=reproduced_report_signature,
+            evaluator_allowed_signers=evaluator_allowed_signers,
+            evaluator_signer_identity=evaluator_signer_identity,
+            resolution_file=resolution_file,
+            unaffiliated_attestation=unaffiliated_attestation,
+            output_directory=output_directory,
+            reproduced_error_dispositions=dispositions,
+        )
+    except (ReproductionBuilderError, EvidenceBundleError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    except (OSError, UnicodeDecodeError, ValidationError, ValueError, yaml.YAMLError) as exc:
+        raise click.ClickException("reproduction statement input is invalid") from exc
+    click.echo("reproduction statement artifacts created from verified evidence")
+
+
+@benchmark_commands.command(name="build-reproduction-record")
+@click.option("--statement", type=click.Path(path_type=Path), required=True)
+@click.option("--signature", type=click.Path(path_type=Path), required=True)
+@click.option("--allowed-signers", type=click.Path(path_type=Path), required=True)
+@click.option("--signer-identity", required=True)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def build_reproduction_record_command(
+    statement: Path,
+    signature: Path,
+    allowed_signers: Path,
+    signer_identity: str,
+    output: Path,
+) -> None:
+    """Derive a release record from an externally signed canonical statement."""
+    try:
+        record = build_reproduction_record(
+            statement,
+            signature,
+            allowed_signers,
+            signer_identity,
+        )
+        write_reproduction_record(output, record)
+    except ReproductionBuilderError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except (OSError, UnicodeDecodeError, ValidationError, ValueError) as exc:
+        raise click.ClickException("reproduction record input is invalid") from exc
+    click.echo("independent reproduction record created from signed statement")
+
+
 def _load_sealed_corpus_record(path: Path) -> SealedCorpusRecord:
     """Load a closed corpus record without echoing its storage path on failure."""
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("corpus record is unavailable")
-    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw = yaml.safe_load(_read_private_regular_file(path, label="corpus record").decode("utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("corpus record root must be a mapping")
     return SealedCorpusRecord.model_validate(raw)
+
+
+def _load_baseline_configuration_record(path: Path) -> BaselineConfigurationRecord:
+    """Load one closed target baseline record without disclosing its path."""
+    raw = yaml.safe_load(_read_private_regular_file(path, label="baseline record").decode("utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("baseline record root must be a mapping")
+    return BaselineConfigurationRecord.model_validate(raw)
 
 
 def _load_error_dispositions(
@@ -680,9 +884,9 @@ def _load_error_dispositions(
     """Load an optional closed list of human error dispositions."""
     if path is None:
         return ()
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("error disposition record is unavailable")
-    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw = yaml.safe_load(
+        _read_private_regular_file(path, label="error disposition record").decode("utf-8")
+    )
     return TypeAdapter(tuple[ErrorDispositionRecord, ...]).validate_python(raw)
 
 
@@ -723,6 +927,31 @@ def _read_private_marker(path: Path) -> bytes:
     if not marker:
         raise EvidenceBundleError("a marker file is empty")
     return marker
+
+
+def _read_private_regular_file(path: Path, *, label: str) -> bytes:
+    """Read a nonempty regular nonsymlink private input without FIFO blocking."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"{label} must be a readable regular nonsymlink file") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"{label} must be a readable regular nonsymlink file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    content = b"".join(chunks)
+    if not content:
+        raise ValueError(f"{label} must not be empty")
+    return content
 
 
 def _parse_named_paths(values: tuple[str, ...]) -> dict[str, Path]:

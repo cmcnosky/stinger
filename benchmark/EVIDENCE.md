@@ -32,10 +32,11 @@ stinger benchmark sign-release /access-controlled/path/release-submission.yaml \
 ```
 
 The unaffiliated evaluator independently creates and signs the exact reproduction
-statement. Its schema is `IndependentReproductionStatement` in
-`stinger benchmark release-schema`; it binds the target and reproduced reports,
-configuration identities, public/escrow manifests, separate-machine fingerprints, and
-discrepancy ledger.
+statement. Its closed `IndependentReproductionStatement` model binds the target and
+reproduced reports, configuration identities, public/escrow manifests, separate-machine
+fingerprints, and discrepancy ledger. `release-schema` emits the submission schema, which
+references the derived `IndependentReproductionRecord`; it does not emit the private
+statement-builder schema.
 
 ```bash
 stinger benchmark sign-reproduction /verifier/path/reproduction-statement.yaml \
@@ -56,7 +57,9 @@ stinger benchmark release-check /access-controlled/path/release-submission.yaml 
 ```
 
 The release signature uses a namespace distinct from protocol signatures. The verifier
-statement uses a third namespace and cannot be substituted for Chris's release authority.
+statement uses a third namespace and the reproduced report uses the dedicated
+`stinger-benchmark-reproduced-report` namespace. Neither can be substituted for Chris's
+release authority or for one another.
 Namespaces prevent cross-artifact substitution but do not prove that two people signed:
 the final gate also requires different signer identities, different verified signing-key
 fingerprints, and different signer-policy files for the release and reproduction roles.
@@ -135,3 +138,81 @@ visible rather than being upgraded into claims the artifacts cannot prove.
 The public `release-check` interface does not use the active corpus, escrow bundle, marker
 files, or leakage policy. It consumes the already-derived record inside the signed release
 submission.
+
+## Artifact-derived reproduction evidence
+
+An independent evaluator first signs the exact reproduced `report.json` bytes:
+
+```bash
+stinger benchmark sign-reproduced-report /verifier/path/report.json \
+  --private-key /verifier/path/verifier-key
+```
+
+The signature namespace is distinct from the later reproduction-statement signature.
+The private review template compares target and reproduced results by
+`(scenario_id, repetition)`. Structural mismatches fail immediately; only `outcome`,
+`detector_results`, `goal_met`, `agent_claimed_done`, and `run_error` can become
+reviewable discrepancies. Timestamps, durations, and transcript/diff path strings are
+run-specific noise and do not become discrepancies:
+
+```bash
+stinger benchmark reproduction-diff \
+  /verifier/path/target-report.json \
+  /verifier/path/reproduced-report.json \
+  --output /verifier/private/discrepancy-review.json
+```
+
+The evaluator changes only each generated entry's `resolution` and `resolved` fields.
+Missing, extra, duplicate, altered, blank, unresolved, or report-transplanted entries fail
+closed.
+
+`build-reproduction-statement --help` lists the complete private workflow. It requires:
+
+- the accepted target baseline record and both target bundle paths;
+- both independently produced reproduced bundle paths;
+- the active leakage policy, protocol trust policy, and protocol signer identity;
+- distinct target and reproduced machine-identity attestations;
+- the reproduced-report signature plus independently obtained evaluator trust;
+- the resolved private discrepancy file; and
+- a nonblank UTF-8 unaffiliated-attestation file.
+
+The builder re-verifies both public/escrow pairs, reconstructs the supplied target baseline
+record and requires exact equality, derives a publication-eligible reproduced-side record,
+verifies the exact reproduced report signature, and recomputes a reproduced-minus-target
+paired comparison at 10,000 draws, seed 0, and 95% confidence. It rejects aliased bundle
+paths, byte-indistinguishable copied target evidence, output paths inside any verified or
+private input tree, and any corpus other than the frozen 120-scenario, 24-per-family shape.
+It then atomically creates, without replacing an existing directory:
+
+- `comparison.manifest.json`;
+- `discrepancy-ledger.json`; and
+- `reproduction-statement.json`.
+
+Every report, signature, bundle-manifest, machine, comparison, ledger, and attestation hash
+is derived from verified exact bytes or from the canonical typed report. Attestation and
+machine contents are never copied. Before publication, the builder rejects active canaries,
+dummy-secret markers, escrow paths, and other private input paths in its outputs.
+
+After reviewing those artifacts, the evaluator signs `reproduction-statement.json` with
+`sign-reproduction`, using the same evaluator identity, signing key, and external trust
+policy that signed the reproduced report. The release gate enforces all three bindings.
+The release-side record is then derived rather than hand-entered:
+
+```bash
+stinger benchmark build-reproduction-record \
+  --statement /verifier/private/reproduction-output/reproduction-statement.json \
+  --signature /verifier/private/reproduction-output/reproduction-statement.json.sig \
+  --allowed-signers /independently-obtained/path/verifier_allowed_signers \
+  --signer-identity independent-verifier@example.org \
+  --output /new/path/independent-reproduction-record.json
+```
+
+`release-check` still receives only the signed statement, its detached signature, and the
+verifier trust policy. It never opens escrow, the sealed corpus, marker files, or leakage
+policies. It verifies the evaluator's signed artifact hashes and the report-bound,
+deterministic discrepancy ledger, rejects target artifact reuse, and requires the report and
+statement to use the same evaluator authority; it does not independently rerun the private
+builder. This is an explicit trust boundary: without receiving the reproduced report or
+private evidence, `release-check` cannot independently repeat the report-signature
+verification and relies on the unaffiliated evaluator's signed statement that the builder
+completed it.
