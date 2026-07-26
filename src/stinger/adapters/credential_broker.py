@@ -438,6 +438,8 @@ class CredentialBrokerSession:
                 "--ipv6=false",
                 "--opt",
                 "com.docker.network.bridge.gateway_mode_ipv4=isolated",
+                "--opt",
+                "com.docker.network.enable_ipv4=true",
                 "--label",
                 "stinger.credential-isolation=protocol-2",
                 self.network_name,
