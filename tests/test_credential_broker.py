@@ -44,7 +44,8 @@ from stinger.config import AgentConfig
 from stinger.docker_runtime import DockerRuntimeIdentity
 
 REPOSITORY = Path(__file__).resolve().parents[1]
-DOCKER_TEST_IMAGE = "python:3.12-slim"
+DOCKER_TEST_IMAGE = "stinger-runner:1"
+REQUIRE_REAL_DOCKER_TESTS_ENV = "STINGER_REQUIRE_REAL_DOCKER_TESTS"
 RAW_CREDENTIAL = "synthetic/raw+provider=credential%value-0123456789~~~???"
 BROKER_LEASE = "synthetic-opaque-broker-lease-abcdefghijklmnopqrstuvwxyz"
 APPROVED_AGENT_PATH = "/openai/v1/responses"
@@ -1681,6 +1682,16 @@ def _docker_fixture_ready() -> bool:
     return True
 
 
+def _require_docker_fixture() -> None:
+    """Require the real topology fixture in CI and skip only local unprepared runs."""
+    if _docker_fixture_ready():
+        return
+    message = f"needs a running Docker daemon and preloaded {DOCKER_TEST_IMAGE}"
+    if os.environ.get(REQUIRE_REAL_DOCKER_TESTS_ENV) == "1":
+        pytest.fail(f"{message}; {REQUIRE_REAL_DOCKER_TESTS_ENV}=1")
+    pytest.skip(message)
+
+
 def _docker(
     arguments: Sequence[str],
     *,
@@ -2293,23 +2304,17 @@ def _exercise_real_docker_topology(
             _docker(("network", "rm", name), check=False)
 
 
-@pytest.mark.skipif(
-    not _docker_fixture_ready(),
-    reason=f"needs a running Docker daemon and preloaded {DOCKER_TEST_IMAGE}",
-)
 def test_real_docker_agent_cannot_read_or_bypass_synthetic_broker(
     tmp_path: Path,
 ) -> None:
     """The approved call works without opening another network or DNS destination."""
+    _require_docker_fixture()
     _exercise_real_docker_topology(tmp_path, mode="approved")
 
 
-@pytest.mark.skipif(
-    not _docker_fixture_ready(),
-    reason=f"needs a running Docker daemon and preloaded {DOCKER_TEST_IMAGE}",
-)
 def test_real_docker_broker_as_router_fails_closed(
     tmp_path: Path,
 ) -> None:
     """An absolute-form target cannot turn the broker into an egress router."""
+    _require_docker_fixture()
     _exercise_real_docker_topology(tmp_path, mode="router-rejection")

@@ -29,8 +29,10 @@ jobs:
         run: pip install -e ".[dev]"
       - name: Build the verification image
         # Runners have Docker, so the container-isolation tests run here for real rather
-        # than skipping. The export recipe is deliberately deterministic: the signed
-        # Protocol 2 policy rejects any image ID other than the one frozen for amd64.
+        # than skipping. The loaded verifier image also supplies the pinned Python runtime
+        # for the synthetic provider/broker/agent topology; no mutable helper image is
+        # pulled into the daemon. The export recipe is deliberately deterministic: the
+        # signed Protocol 2 policy rejects any image ID other than the one frozen for amd64.
         run: |
           docker buildx build --no-cache --provenance=false \
             --build-arg SOURCE_DATE_EPOCH=0 \
@@ -57,6 +59,8 @@ jobs:
           PY
       - name: Gate
         run: ./scripts/check.sh
+        env:
+          STINGER_REQUIRE_REAL_DOCKER_TESTS: "1"
 
   installed:
     name: the installed package works
