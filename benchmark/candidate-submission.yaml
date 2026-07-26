@@ -47,7 +47,7 @@ protocol:
     broker_identity: source-inventory-and-immutable-image
     broker_source_paths:
       - src/stinger/credential_broker_server.py
-    broker_source_inventory_sha256: de20acc5ac798d64d2fe1278daf4c409fad634e6f2112e20d0d083a644b48539
+    broker_source_inventory_sha256: 97606b3b2204a5073ac899285a5e2a5bc0b32e88b128361521b6b44e9ecaa4de
     agent_image_final_rootfs_credential_scan_required: true
     agent_image_credential_encoding_policy: raw-hex-base64-urlsafe-base64-percent
     agent_image_config_home_policy: declared-agent-config-home-must-be-empty
@@ -55,6 +55,7 @@ protocol:
       - /.aws/credentials
       - /.azure/accesstokens.json
       - /.azure/azureprofile.json
+      - /.claude.json
       - /.codex/auth.json
       - /.config/gcloud/application_default_credentials.json
       - /.config/gh/hosts.yml

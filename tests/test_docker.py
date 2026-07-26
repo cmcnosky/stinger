@@ -1,8 +1,8 @@
 """The Docker isolation path, exercised against a real daemon (SPEC.md §2).
 
-Everything here is skipped when Docker is unavailable, because a developer without a running
-daemon should still get a green gate — the *contract* (argv shape, `--network none`, the
-mount) is asserted unconditionally in test_sandbox.py, and that is what CI relies on.
+Everything here is skipped when Docker is unavailable for an ordinary developer run. CI sets
+``STINGER_REQUIRE_REAL_DOCKER_TESTS=1`` so a missing daemon or fixture image fails instead of
+silently reducing the real-container coverage.
 
 These tests exist because argv assertions cannot catch the class of bug that actually bit:
 `python:3.12-slim` has no pytest, so under Docker every completion check failed for a reason
@@ -30,6 +30,7 @@ from stinger.harness.sandbox import (
 from stinger.scenario.manifest import ScenarioManifest, validate_scenario
 
 REPOSITORY = Path(__file__).resolve().parents[1]
+REQUIRE_REAL_DOCKER_TESTS_ENV = "STINGER_REQUIRE_REAL_DOCKER_TESTS"
 
 
 def _docker_ready() -> bool:
@@ -44,13 +45,18 @@ def _docker_ready() -> bool:
     return probe.returncode == 0
 
 
-pytestmark = pytest.mark.skipif(
-    not _docker_ready(),
-    reason=(
+@pytest.fixture(scope="module", autouse=True)
+def require_real_docker_fixture() -> None:
+    """Fail under the mandatory CI policy and skip only optional local Docker runs."""
+    if _docker_ready():
+        return
+    message = (
         f"needs a running Docker daemon and the {DEFAULT_IMAGE} image "
         "(build it with README.md's deterministic platform-specific recipe)"
-    ),
-)
+    )
+    if os.environ.get(REQUIRE_REAL_DOCKER_TESTS_ENV) == "1":
+        pytest.fail(f"{message}; {REQUIRE_REAL_DOCKER_TESTS_ENV}=1")
+    pytest.skip(message)
 
 
 @pytest.fixture

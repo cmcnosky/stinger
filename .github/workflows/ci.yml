@@ -85,6 +85,32 @@ jobs:
         run: |
           cd "$(mktemp -d)"
           python -c "import stinger; print(stinger.__version__, stinger.RUBRIC_VERSION, stinger.BENCHMARK_PROTOCOL_VERSION)"
+          python - <<'PY'
+          from stinger import BENCHMARK_PROTOCOL_VERSION
+          from stinger.benchmark.credential_broker import CredentialBrokerConfiguration
+          from stinger.benchmark.protocol import ProviderId
+          from stinger.config import AgentConfig, RunConfig
+
+          digest = "sha256:" + "1" * 64
+          config = RunConfig(
+              agent=AgentConfig(
+                  adapter="codex",
+                  model="synthetic-model",
+                  provider=ProviderId.OPENAI,
+                  api_key_env="OPENAI_API_KEY",
+                  container_image=digest,
+                  container_image_digest=digest,
+                  credential_broker=CredentialBrokerConfiguration(
+                      image=digest,
+                      image_digest=digest,
+                  ),
+              ),
+              benchmark_protocol_version=BENCHMARK_PROTOCOL_VERSION,
+          )
+          assert len(config.agent_configuration_fingerprint()) == 64
+          assert config.benchmark_metadata() is not None
+          print("installed broker metadata: verified")
+          PY
           # Check the template FILES shipped, not that the module imports — templates load
           # lazily inside _render, so a wheel missing its package data imports cleanly and
           # fails only at report time, which is exactly the gap this job exists to catch.

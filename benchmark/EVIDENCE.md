@@ -11,14 +11,18 @@ benchmark evidence.
 > network. Codex routing is the signed `openai_base_url` CLI override, never
 > `OPENAI_BASE_URL`; Claude Code routing is `ANTHROPIC_BASE_URL`. Policy, broker
 > configuration, exact destination and empty file/mount projection, broker source/image,
-> and Docker runtime are mechanically bound. The agent runs on an isolated IPv4 bridge with
+> both fresh network identities, and Docker runtime are mechanically bound. The agent runs on an isolated IPv4 bridge with
 > no host gateway or IPv6, resolves only the broker alias through Docker's embedded DNS with
-> loopback-only upstream resolution, and has inherited image healthchecks disabled. Before
+> loopback-only upstream resolution, and has inherited image healthchecks disabled. The broker
+> reaches its fixed provider only through a fresh user-defined IPv4 NAT bridge containing no
+> unrelated container. Before
 > launch, Stinger rejects raw, hex, standard or URL-safe Base64, and percent-encoded credential
 > forms in the final argv, workdir paths/links/files, image metadata, or exported final rootfs;
 > signed prohibited credential-path suffixes and a nonempty agent config home also fail
 > closed.
-> Per-invocation identities/audit and cleanup are evidence-bound. Tests use only synthetic
+> Exact loaded configuration bytes, effective destination/test-mode readiness, bounded
+> connection lifetime/concurrency, per-invocation identities/audit, and cleanup of both
+> networks are evidence-bound. Tests use only synthetic
 > credentials and local fake providers. No live provider or sealed review, QA, blind solve,
 > pilot, baseline, or reproduction has been run or is claimed.
 
@@ -555,12 +559,12 @@ The random challenge is never placed in the prompt and never affects scoring.
 
 Every brokered invocation also creates `credential-isolation.receipt.json`. It is bound to
 the same invocation ID and runtime-provenance hash and records only non-secret commitments:
-the signed policy; exact broker configuration, source, immutable image, allowed destination,
-and minimal agent projection; Docker runtime; raw/hex/Base64/URL-safe-Base64/percent scan of
+the signed policy; exact loaded broker configuration, source, immutable image, effective
+allowed destination, and minimal agent projection; Docker runtime; raw/hex/Base64/URL-safe-Base64/percent scan of
 the final argv, workdir, image metadata, and exported final rootfs; signed prohibited-path and
-empty-config-home checks; agent/broker/network, command, environment, mount, and attachment
-inventories; isolated gateway, IPv6, DNS, and disabled-healthcheck state; broker audit/counts;
-and verified cleanup. `invocation.receipt.json` binds its exact file hash, and the run
+empty-config-home checks; agent/broker/two-network, command, environment, mount, and attachment
+inventories; isolated gateway, IPv6, DNS, disabled-healthcheck, deadline, and concurrency
+state; broker audit/counts; and verified cleanup. `invocation.receipt.json` binds its exact file hash, and the run
 aggregate binds the complete ordered set. Missing, extra, duplicated, noncanonical, drifted,
 rejected-request, encoded-credential, bypass, arbitrary-egress, or cleanup-failure evidence
 is fatal. The receipt does not turn the still-unapproved agent image into a supply-chain

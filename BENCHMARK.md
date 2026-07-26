@@ -49,17 +49,21 @@ an opaque lease in the CLI's expected credential environment variable. The non-s
 is also closed: Codex receives the broker location only as the signed `openai_base_url` CLI
 override and never as `OPENAI_BASE_URL`; Claude Code receives it as `ANTHROPIC_BASE_URL`.
 The broker is dual-homed so it can reach one signed upstream while the agent has no direct
-egress path. The agent side is an isolated IPv4 bridge with no host gateway and IPv6
-disabled. Docker's embedded DNS still resolves the broker alias, but its upstream is pinned
+egress path. Its outbound side is a fresh, user-defined IPv4 NAT bridge containing only that
+invocation's broker, never Docker's shared default bridge. The agent side is an isolated IPv4
+bridge with no host gateway and IPv6 disabled. Docker's embedded DNS still resolves the broker alias, but its upstream is pinned
 to loopback with root-only search and bounded retries. Inherited image healthchecks are
 disabled. The signed policy fixes the provider, HTTPS scheme/host/port, POST path mappings,
 forwarded headers, stripped authorization/proxy headers, and injected authentication form.
 Arbitrary destinations, methods, paths, redirects, proxy headers, invalid leases, reflected
 credentials, and any rejected request fail the invocation closed.
 
-Preflight commits the canonical credential policy, broker configuration, allowed-destination
+Preflight commits the canonical credential policy, exact broker configuration bytes loaded,
+effective allowed-destination
 inventory, empty file/mount projection, broker source inventory, immutable protocol-approved
-broker image, and exact Docker runtime identity into report metadata and runtime provenance.
+broker image, both fresh network identities, and exact Docker runtime identity into report
+metadata and runtime provenance. Readiness also proves production test mode is disabled and
+binds the absolute connection deadline plus bounded worker count before agent launch.
 Before any networked container starts, Stinger scans the final agent argv and workdir paths,
 links, and file contents. It then scans canonical agent-image runtime metadata and the
 exported final root filesystem. All four surfaces reject the raw credential plus lower/upper
@@ -69,10 +73,10 @@ environment values, or a nonempty declared/default Codex or Claude config home a
 closed. The scan inventory hash is evidence, not approval of the agent image's supply chain.
 
 After each agent invocation Stinger verifies the exact agent container, broker container,
-fresh network, command/environment/mount/attachment inventories, isolated gateway,
-IPv6/DNS/healthcheck state, broker audit and request counts, absence of encoded credential
-evidence, broker bypass, or unapproved egress, and fail-closed removal of both containers and
-the network. A closed non-secret
+both fresh networks and their membership, command/environment/mount/attachment inventories,
+isolated gateway, IPv6/DNS/healthcheck state, broker audit and accepted/completed request
+counts, absence of encoded credential evidence, broker bypass, or unapproved egress, and
+fail-closed removal of both containers and both networks. A closed non-secret
 `credential-isolation.receipt.json` binds those facts to the invocation and runtime. Its hash
 is carried by the invocation receipt and run aggregate, so missing, extra, duplicated,
 noncanonical, or drifted evidence is ineligible.
@@ -220,10 +224,11 @@ commitments, execution-evidence commitments, and supported provider response IDs
 present. Missing or cloned invocation evidence fails escrow verification.
 
 A credentialed invocation also emits a closed credential-isolation receipt. It binds the
-exact runtime, broker policy/configuration/source/image, provider destination allowlist,
+exact runtime, broker policy/loaded-configuration/source/image, provider destination allowlist,
 minimal lease/routing projection, prelaunch argv/workdir/image-metadata/final-rootfs scan,
-agent/broker/network identities, observed command/environment/mount/network inventories,
-isolated gateway, IPv6/DNS/healthcheck state, broker audit, and verified cleanup. The ordinary
+agent/broker/two-network identities, observed command/environment/mount/network inventories,
+isolated gateway, IPv6/DNS/healthcheck and connection-bound state, broker audit, and verified
+cleanup. The ordinary
 direct environment and credential-mount paths cannot produce this evidence and are rejected
 in Protocol 2. Missing, mismatched, duplicated, rejected-request, bypass, egress, encoded
 credential, or cleanup-failure evidence resolves to a non-scoring error.

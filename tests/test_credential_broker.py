@@ -41,7 +41,7 @@ from stinger.benchmark.credential_broker import (
 )
 from stinger.benchmark.protocol import ProviderId
 from stinger.config import AgentConfig
-from stinger.docker_runtime import DockerRuntimeIdentity
+from stinger.docker_runtime import DockerRuntimeIdentity, observe_docker_runtime
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 DOCKER_TEST_IMAGE = "stinger-runner:1"
@@ -60,22 +60,45 @@ def _test_configuration(
     upstream_origin: str,
     *,
     lease: str = BROKER_LEASE,
+    provider: str = "openai",
 ) -> dict[str, object]:
     """Return one closed test-only route to a local fake provider."""
+    if provider == "openai":
+        agent_base_url = f"http://{BROKER_ALIAS}:8765/openai/v1"
+        agent_path = APPROVED_AGENT_PATH
+        upstream_path = APPROVED_UPSTREAM_PATH
+        forwarded_headers = ["accept", "content-type", "user-agent"]
+        injected_auth_header = "authorization"
+        injected_auth_scheme = "bearer"
+    elif provider == "anthropic":
+        agent_base_url = f"http://{BROKER_ALIAS}:8765/anthropic"
+        agent_path = "/anthropic/v1/messages"
+        upstream_path = "/v1/messages"
+        forwarded_headers = [
+            "accept",
+            "anthropic-beta",
+            "anthropic-version",
+            "content-type",
+            "user-agent",
+        ]
+        injected_auth_header = "x-api-key"
+        injected_auth_scheme = "raw"
+    else:
+        raise ValueError("test provider is invalid")
     return {
         "format_version": "1",
         "configuration_sha256": "1" * 64,
-        "provider": "openai",
-        "agent_base_url": f"http://{BROKER_ALIAS}:8765/openai/v1",
+        "provider": provider,
+        "agent_base_url": agent_base_url,
         "upstream_https_origin": upstream_origin,
         "path_mappings": [
             {
-                "agent_path": APPROVED_AGENT_PATH,
-                "upstream_path": APPROVED_UPSTREAM_PATH,
+                "agent_path": agent_path,
+                "upstream_path": upstream_path,
                 "methods": ["POST"],
             }
         ],
-        "forwarded_agent_headers": ["accept", "content-type", "user-agent"],
+        "forwarded_agent_headers": forwarded_headers,
         "stripped_agent_headers": [
             "authorization",
             "cookie",
@@ -83,8 +106,8 @@ def _test_configuration(
             "proxy-authorization",
             "x-api-key",
         ],
-        "injected_auth_header": "authorization",
-        "injected_auth_scheme": "bearer",
+        "injected_auth_header": injected_auth_header,
+        "injected_auth_scheme": injected_auth_scheme,
         "lease_sha256": _sha256(lease.encode("utf-8")),
         "test_only_allow_http": True,
     }
@@ -123,6 +146,7 @@ class _FakeProviderHandler(BaseHTTPRequestHandler):
 
     response_body: ClassVar[bytes] = b'{"provider":"ok"}\n'
     response_headers: ClassVar[tuple[tuple[str, str], ...]] = ()
+    response_chunk_delay_seconds: ClassVar[float] = 0
     observations: ClassVar[list[dict[str, object]]]
     observation_lock: ClassVar[threading.Lock]
 
@@ -134,6 +158,7 @@ class _FakeProviderHandler(BaseHTTPRequestHandler):
             "body": body.decode("utf-8"),
             "headers": {name.lower(): value for name, value in self.headers.items()},
             "path": self.path,
+            "x_api_key": self.headers.get("X-Api-Key"),
         }
         with self.observation_lock:
             self.observations.append(observation)
@@ -141,7 +166,16 @@ class _FakeProviderHandler(BaseHTTPRequestHandler):
         for name, value in self.response_headers:
             self.send_header(name, value)
         self.end_headers()
-        self.wfile.write(self.response_body)
+        if self.response_chunk_delay_seconds:
+            for value in self.response_body:
+                try:
+                    self.wfile.write(bytes((value,)))
+                    self.wfile.flush()
+                except OSError:
+                    break
+                time.sleep(self.response_chunk_delay_seconds)
+        else:
+            self.wfile.write(self.response_body)
 
     def log_message(self, format: str, *args: object) -> None:
         """Keep synthetic request details out of test output."""
@@ -156,24 +190,33 @@ class _LocalBroker:
     observations: list[dict[str, object]]
     raw_credential: str
     lease: str
+    server: broker_server.CredentialBrokerHTTPServer
+    agent_path: str
+    lease_header: str
+    lease_scheme: str
 
     def request(
         self,
         *,
         method: str = "POST",
-        target: str = APPROVED_AGENT_PATH,
+        target: str | None = None,
         headers: Mapping[str, str] | None = None,
         body: bytes = b'{"input":"synthetic"}',
     ) -> tuple[int, list[tuple[str, str]], bytes]:
+        lease_value = self.lease
+        if self.lease_scheme == "bearer":
+            lease_value = f"Bearer {lease_value}"
         request_headers = {
-            "Authorization": f"Bearer {self.lease}",
+            self.lease_header: lease_value,
             "Content-Type": "application/json",
             "Host": f"{BROKER_ALIAS}:8765",
             **(dict(headers) if headers is not None else {}),
         }
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         try:
-            connection.request(method, target, body=body, headers=request_headers)
+            connection.request(
+                method, target or self.agent_path, body=body, headers=request_headers
+            )
             response = connection.getresponse()
             return response.status, response.getheaders(), response.read()
         finally:
@@ -187,6 +230,10 @@ def _running_local_broker(
     raw_credential: str = RAW_CREDENTIAL,
     response_body: bytes = b'{"provider":"ok"}\n',
     response_headers: tuple[tuple[str, str], ...] = (),
+    response_chunk_delay_seconds: float = 0,
+    client_timeout_seconds: float | None = None,
+    absolute_timeout_seconds: float | None = None,
+    provider_name: str = "openai",
 ) -> Iterator[_LocalBroker]:
     """Run the real broker handler against a loopback-only fake provider."""
 
@@ -197,6 +244,7 @@ def _running_local_broker(
 
     ProviderHandler.response_body = response_body
     ProviderHandler.response_headers = response_headers
+    ProviderHandler.response_chunk_delay_seconds = response_chunk_delay_seconds
     ProviderHandler.observations = observations
     ProviderHandler.observation_lock = threading.Lock()
     provider = ThreadingHTTPServer(("127.0.0.1", 0), ProviderHandler)
@@ -208,16 +256,33 @@ def _running_local_broker(
     root.mkdir()
     config_path = root / "config.json"
     audit_path = root / "audit.jsonl"
-    config = _test_configuration(f"http://127.0.0.1:{provider.server_address[1]}")
+    config = _test_configuration(
+        f"http://127.0.0.1:{provider.server_address[1]}",
+        provider=provider_name,
+    )
     _write_configuration(config_path, config)
-    loaded = broker_server._load_configuration(config_path)
+    loaded, configuration_bytes_sha256 = broker_server._load_configuration_with_identity(
+        config_path,
+        test_only_authorized=True,
+    )
     audit_path.write_bytes(
         canonical_json_bytes(
             {
+                "agent_base_url": loaded["agent_base_url"],
+                "allowed_destination_inventory_sha256": (
+                    broker_server._allowed_destination_inventory_sha256(loaded)
+                ),
+                "client_socket_timeout_seconds": broker_server.CLIENT_SOCKET_TIMEOUT_SECONDS,
+                "connection_deadline_seconds": broker_server.CONNECTION_DEADLINE_SECONDS,
+                "configuration_bytes_sha256": configuration_bytes_sha256,
                 "configuration_sha256": loaded["configuration_sha256"],
                 "decision": "ready",
                 "listen": "127.0.0.1:test",
+                "max_concurrent_connections": broker_server.MAX_CONCURRENT_CONNECTIONS,
                 "provider": loaded["provider"],
+                "test_only_allow_http": True,
+                "upstream_https_origin": loaded["upstream_https_origin"],
+                "upstream_socket_timeout_seconds": (broker_server.UPSTREAM_SOCKET_TIMEOUT_SECONDS),
             }
         )
     )
@@ -225,14 +290,20 @@ def _running_local_broker(
     class BrokerHandler(broker_server.CredentialBrokerHandler):
         pass
 
+    if client_timeout_seconds is not None:
+        BrokerHandler.timeout = client_timeout_seconds
+    if absolute_timeout_seconds is not None:
+        BrokerHandler.absolute_timeout_seconds = absolute_timeout_seconds
     BrokerHandler.config = loaded
+    BrokerHandler.configuration_bytes_sha256 = configuration_bytes_sha256
     BrokerHandler.raw_credential = raw_credential
     BrokerHandler.lease = BROKER_LEASE
     BrokerHandler.audit_path = audit_path
     BrokerHandler.audit_lock = threading.Lock()
     BrokerHandler.request_sequence = 0
-    broker = ThreadingHTTPServer(("127.0.0.1", 0), BrokerHandler)
-    broker.daemon_threads = True
+    BrokerHandler.upstream_connections = set()
+    BrokerHandler.upstream_lock = threading.Lock()
+    broker = broker_server.CredentialBrokerHTTPServer(("127.0.0.1", 0), BrokerHandler)
     broker_thread = threading.Thread(target=broker.serve_forever, daemon=True)
     broker_thread.start()
     try:
@@ -242,8 +313,14 @@ def _running_local_broker(
             observations=observations,
             raw_credential=raw_credential,
             lease=BROKER_LEASE,
+            server=broker,
+            agent_path=str(loaded["path_mappings"][0]["agent_path"]),
+            lease_header=str(loaded["injected_auth_header"]),
+            lease_scheme=str(loaded["injected_auth_scheme"]),
         )
     finally:
+        BrokerHandler.cancel_active_upstreams()
+        broker.close_active_connections()
         broker.shutdown()
         broker.server_close()
         broker_thread.join(timeout=5)
@@ -289,21 +366,24 @@ def test_configuration_requires_canonical_closed_schema(tmp_path: Path) -> None:
     payload = _test_configuration("http://127.0.0.1:12345")
     path = tmp_path / "config.json"
     _write_configuration(path, payload)
-    assert broker_server._load_configuration(path) == payload
+    assert broker_server._load_configuration(path, test_only_authorized=True) == payload
+
+    with pytest.raises(broker_server.BrokerConfigurationError, match="process authorization"):
+        broker_server._load_configuration(path)
 
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     with pytest.raises(broker_server.BrokerConfigurationError, match="canonical JSON"):
-        broker_server._load_configuration(path)
+        broker_server._load_configuration(path, test_only_authorized=True)
 
     extra = {**payload, "proxy_url": "http://evil.invalid:80"}
     _write_configuration(path, extra)
     with pytest.raises(broker_server.BrokerConfigurationError, match="schema is not exact"):
-        broker_server._load_configuration(path)
+        broker_server._load_configuration(path, test_only_authorized=True)
 
     wrong_type = {**payload, "test_only_allow_http": 1}
     _write_configuration(path, wrong_type)
     with pytest.raises(broker_server.BrokerConfigurationError, match="must be boolean"):
-        broker_server._load_configuration(path)
+        broker_server._load_configuration(path, test_only_authorized=True)
 
 
 @pytest.mark.parametrize(
@@ -351,7 +431,7 @@ def test_configuration_rejects_open_or_ambiguous_test_routes(
     path = tmp_path / f"{case}.json"
     _write_configuration(path, payload)
     with pytest.raises(broker_server.BrokerConfigurationError):
-        broker_server._load_configuration(path)
+        broker_server._load_configuration(path, test_only_authorized=True)
 
 
 @pytest.mark.parametrize(
@@ -399,6 +479,28 @@ def test_approved_request_injects_raw_credential_only_at_fake_provider(
         headers = observed["headers"]
         assert isinstance(headers, dict)
         assert "x-unapproved-agent-header" not in headers
+        assert _audit_events(broker.audit_path)[-1]["decision"] == "allowed"
+
+
+def test_anthropic_request_replaces_opaque_lease_with_x_api_key(
+    tmp_path: Path,
+) -> None:
+    """The second signed provider route injects only its exact Anthropic auth form."""
+    with _running_local_broker(tmp_path, provider_name="anthropic") as broker:
+        status, _, body = broker.request(
+            headers={
+                "Anthropic-Version": "2023-06-01",
+                "Anthropic-Beta": "synthetic-feature",
+            }
+        )
+        assert status == 200
+        assert body == b'{"provider":"ok"}\n'
+        assert len(broker.observations) == 1
+        observed = broker.observations[0]
+        assert observed["path"] == "/v1/messages"
+        assert observed["authorization"] is None
+        assert observed["x_api_key"] == broker.raw_credential
+        assert broker.lease not in json.dumps(observed, sort_keys=True)
         assert _audit_events(broker.audit_path)[-1]["decision"] == "allowed"
 
 
@@ -630,6 +732,176 @@ def test_content_length_overflow_is_rejected_and_audited(tmp_path: Path) -> None
         assert not broker.observations
 
 
+def test_incomplete_request_body_times_out_and_is_audited(tmp_path: Path) -> None:
+    """A malicious partial body cannot hold a non-daemon broker thread forever."""
+    with _running_local_broker(tmp_path, client_timeout_seconds=0.1) as broker:
+        request = _request_bytes(body=b"{}").replace(
+            b"Content-Length: 2\r\n",
+            b"Content-Length: 100\r\n",
+        )
+        started = time.monotonic()
+        with socket.create_connection(("127.0.0.1", broker.port), timeout=3) as connection:
+            connection.sendall(request)
+            response = connection.recv(64 * 1024)
+        assert time.monotonic() - started < 2
+        assert response.startswith(b"HTTP/1.1 403")
+        event = _audit_events(broker.audit_path)[-1]
+        assert event["decision"] == "rejected"
+        assert event["reason"] == "request body read timed out"
+        assert not broker.observations
+
+
+@pytest.mark.parametrize(
+    "partial",
+    (
+        b"POST /openai/v1/responses HTTP/1.1",
+        b"POST /openai/v1/responses HTTP/1.1\r\nHost: stinger-credential-broker",
+    ),
+)
+def test_absolute_deadline_audits_partial_request_line_or_headers(
+    tmp_path: Path,
+    partial: bytes,
+) -> None:
+    """Slow parser inputs cannot outlive the source-pinned absolute deadline."""
+    with _running_local_broker(
+        tmp_path,
+        client_timeout_seconds=1,
+        absolute_timeout_seconds=0.1,
+    ) as broker:
+        started = time.monotonic()
+        with socket.create_connection(("127.0.0.1", broker.port), timeout=2) as connection:
+            connection.sendall(partial)
+            try:
+                closed = connection.recv(1)
+            except OSError:
+                closed = b""
+            assert closed == b""
+        assert time.monotonic() - started < 1
+        event = _audit_events(broker.audit_path)[-1]
+        assert event["decision"] == "rejected"
+        assert event["reason"] == "absolute connection deadline exceeded"
+
+
+def test_absolute_deadline_stops_slow_drip_body(tmp_path: Path) -> None:
+    """Bytes arriving inside the inactivity timeout cannot extend total connection life."""
+    with _running_local_broker(
+        tmp_path,
+        client_timeout_seconds=1,
+        absolute_timeout_seconds=0.15,
+    ) as broker:
+        request = _request_bytes(body=b"").replace(
+            b"Content-Length: 0\r\n\r\n",
+            b"Content-Length: 100\r\n\r\n",
+        )
+        started = time.monotonic()
+        with socket.create_connection(("127.0.0.1", broker.port), timeout=2) as connection:
+            connection.sendall(request)
+            for _ in range(20):
+                try:
+                    connection.sendall(b"x")
+                except OSError:
+                    break
+                time.sleep(0.03)
+            try:
+                closed = connection.recv(1)
+            except OSError:
+                closed = b""
+            assert closed == b""
+        assert time.monotonic() - started < 1
+        event = _audit_events(broker.audit_path)[-1]
+        assert event["decision"] == "rejected"
+        assert event["reason"] == "absolute connection deadline exceeded"
+        assert not broker.observations
+
+
+def test_absolute_deadline_stops_slow_drip_upstream(tmp_path: Path) -> None:
+    """An approved streaming provider cannot keep a credentialed worker alive forever."""
+    with _running_local_broker(
+        tmp_path,
+        response_body=b"x" * 20,
+        response_chunk_delay_seconds=0.03,
+        client_timeout_seconds=1,
+        absolute_timeout_seconds=0.15,
+    ) as broker:
+        connection = http.client.HTTPConnection("127.0.0.1", broker.port, timeout=2)
+        started = time.monotonic()
+        try:
+            connection.request(
+                "POST",
+                APPROVED_AGENT_PATH,
+                body=b"{}",
+                headers={
+                    "Authorization": f"Bearer {broker.lease}",
+                    "Content-Type": "application/json",
+                    "Host": f"{BROKER_ALIAS}:8765",
+                },
+            )
+            try:
+                response = connection.getresponse()
+                response.read()
+            except (http.client.HTTPException, OSError):
+                pass
+        finally:
+            connection.close()
+        assert time.monotonic() - started < 1
+        assert len(broker.observations) == 1
+        events = _audit_events(broker.audit_path)
+        assert any(
+            event["decision"] == "rejected"
+            and event["reason"] == "absolute connection deadline exceeded"
+            for event in events
+        )
+
+
+def test_connection_worker_limit_rejects_before_spawning_an_extra_thread(
+    tmp_path: Path,
+) -> None:
+    """A malicious agent cannot create an unbounded number of broker workers."""
+    connections: list[socket.socket] = []
+    with _running_local_broker(
+        tmp_path,
+        client_timeout_seconds=5,
+        absolute_timeout_seconds=5,
+    ) as broker:
+        try:
+            for _ in range(broker_server.MAX_CONCURRENT_CONNECTIONS + 1):
+                connection = socket.create_connection(("127.0.0.1", broker.port), timeout=2)
+                connection.sendall(b"P")
+                connections.append(connection)
+            deadline = time.monotonic() + 2
+            counts = broker.server.connection_counts()
+            while counts[1] != 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+                counts = broker.server.connection_counts()
+            assert counts == (broker_server.MAX_CONCURRENT_CONNECTIONS, 1, 32)
+            try:
+                closed = connections[-1].recv(1)
+            except OSError:
+                closed = b""
+            assert closed == b""
+        finally:
+            for connection in connections:
+                connection.close()
+
+
+def test_pipelined_second_request_is_not_processed(tmp_path: Path) -> None:
+    """Connection closure after one request prevents lease reuse by HTTP pipelining."""
+    with _running_local_broker(tmp_path) as broker:
+        request = _request_bytes() + _request_bytes(target="/openai/v1/not-allowlisted")
+        with socket.create_connection(("127.0.0.1", broker.port), timeout=3) as connection:
+            connection.sendall(request)
+            connection.shutdown(socket.SHUT_WR)
+            chunks: list[bytes] = []
+            while chunk := connection.recv(64 * 1024):
+                chunks.append(chunk)
+        assert b"".join(chunks).count(b"HTTP/1.1") == 1
+        assert len(broker.observations) == 1
+        assert [event["decision"] for event in _audit_events(broker.audit_path)[-2:]] == [
+            "attempt",
+            "allowed",
+        ]
+
+
 def _runtime_identity() -> DockerRuntimeIdentity:
     return DockerRuntimeIdentity(
         client_path="/usr/bin/docker",
@@ -707,6 +979,8 @@ def test_controller_rejects_ambiguous_environment_and_credential_paths() -> None
 
     for path in (
         "credentials/provider.json",
+        "tmp/.CLAUDE.JSON",
+        "tmp/.claude.json",
         "root/.codex/auth.json",
         "home/agent/.claude/session.json",
         "root/.aws/credentials",
@@ -774,6 +1048,11 @@ def test_controller_rootfs_scan_rejects_known_paths_and_hashes_benign_image(
     _write_tar(credential_file, (("root/.codex/auth.json", b"{}\n"),))
     with pytest.raises(broker_controller.CredentialBrokerError, match="credential-file path"):
         session._scan_rootfs_archive(credential_file)
+
+    claude_file = tmp_path / "claude-credential-file.tar"
+    _write_tar(claude_file, (("tmp/.claude.json", b"synthetic non-secret state\n"),))
+    with pytest.raises(broker_controller.CredentialBrokerError, match="credential-file path"):
+        session._scan_rootfs_archive(claude_file)
 
 
 def test_controller_rejects_any_file_under_the_agent_config_home(
@@ -878,6 +1157,7 @@ def _internal_network_record(
         "EnableIPv6": False,
         "Ingress": False,
         "Internal": True,
+        "Labels": {"stinger.credential-isolation": "protocol-2"},
         "Name": session.network_name,
         "IPAM": {
             "Config": [{"Subnet": "172.30.0.0/16"}],
@@ -886,6 +1166,35 @@ def _internal_network_record(
         },
         "Options": {
             "com.docker.network.bridge.gateway_mode_ipv4": "isolated",
+            "com.docker.network.enable_ipv4": "true",
+        },
+    }
+
+
+def _outbound_network_record(
+    session: broker_controller.CredentialBrokerSession,
+    *,
+    containers: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Return exact synthetic Docker evidence for the broker-only NAT bridge."""
+    return {
+        "Attachable": False,
+        "Containers": dict(containers or {}),
+        "Driver": "bridge",
+        "Id": "d" * 64,
+        "EnableIPv4": True,
+        "EnableIPv6": False,
+        "Ingress": False,
+        "Internal": False,
+        "Labels": {"stinger.credential-isolation": "protocol-2"},
+        "Name": session.outbound_network_name,
+        "IPAM": {
+            "Config": [{"Gateway": "172.31.0.1", "Subnet": "172.31.0.0/16"}],
+            "Driver": "default",
+            "Options": {},
+        },
+        "Options": {
+            "com.docker.network.bridge.gateway_mode_ipv4": "nat",
             "com.docker.network.enable_ipv4": "true",
         },
     }
@@ -933,6 +1242,53 @@ def test_controller_creates_exact_isolated_network(
     assert captured["runtime"] == session._runtime
     assert captured["observe_if_missing"] is False
     assert session._network_id == "a" * 64
+
+
+def test_controller_creates_exact_dedicated_outbound_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The broker receives a fresh user-defined NAT bridge, never shared default bridge."""
+    session = _controller_session(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def run_docker(
+        arguments: Sequence[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        captured["arguments"] = tuple(arguments)
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(
+            args=["docker"],
+            returncode=0,
+            stdout="d" * 64 + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(broker_controller, "run_docker", run_docker)
+    monkeypatch.setattr(
+        session,
+        "_inspect_outbound_network",
+        lambda: _outbound_network_record(session),
+    )
+    session._create_outbound_network()
+
+    assert captured["arguments"] == (
+        "network",
+        "create",
+        "--driver",
+        "bridge",
+        "--ipv6=false",
+        "--opt",
+        "com.docker.network.bridge.gateway_mode_ipv4=nat",
+        "--opt",
+        "com.docker.network.enable_ipv4=true",
+        "--label",
+        "stinger.credential-isolation=protocol-2",
+        session.outbound_network_name,
+    )
+    assert captured["runtime"] == session._runtime
+    assert captured["observe_if_missing"] is False
+    assert session._outbound_network_id == "d" * 64
 
 
 @pytest.mark.parametrize(
@@ -1023,6 +1379,64 @@ def test_controller_requires_exact_post_run_broker_network_membership(
         monkeypatch.setattr(session, "_inspect_network", lambda value=drifted: value)
         with pytest.raises(broker_controller.CredentialBrokerError, match="membership"):
             session._verify_internal_network_membership()
+
+
+def test_controller_requires_exact_outbound_network_membership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No unrelated container may share the broker's invocation-private NAT bridge."""
+    session = _controller_session(monkeypatch)
+    session._outbound_network_id = "d" * 64
+    exact = _outbound_network_record(
+        session,
+        containers={"2" * 64: {"Name": session.broker_container_name}},
+    )
+    monkeypatch.setattr(session, "_inspect_outbound_network", lambda: exact)
+    session._verify_outbound_network_membership()
+
+    for names in ((), ("unrelated",), (session.broker_container_name, "unrelated")):
+        drifted = copy.deepcopy(exact)
+        drifted["Containers"] = {
+            str(index) * 64: {"Name": name} for index, name in enumerate(names, start=3)
+        }
+        monkeypatch.setattr(session, "_inspect_outbound_network", lambda value=drifted: value)
+        with pytest.raises(broker_controller.CredentialBrokerError, match="membership"):
+            session._verify_outbound_network_membership()
+
+
+@pytest.mark.parametrize("internal_attempted", (False, True))
+def test_controller_cleanup_proves_all_attempted_networks_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    internal_attempted: bool,
+) -> None:
+    """Partial and complete startup paths remove every network they attempted to create."""
+    session = _controller_session(monkeypatch)
+    session._network_creation_attempted = internal_attempted
+    session._outbound_network_creation_attempted = True
+    calls: list[tuple[str, ...]] = []
+
+    def run_docker(
+        arguments: Sequence[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        calls.append(tuple(arguments))
+        return subprocess.CompletedProcess(
+            args=["docker"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(broker_controller, "run_docker", run_docker)
+    session._remove_networks()
+
+    removed = [arguments[2] for arguments in calls if arguments[:2] == ("network", "rm")]
+    expected = [session.outbound_network_name]
+    if internal_attempted:
+        expected.insert(0, session.network_name)
+    assert removed == expected
+    assert sum(arguments[:2] == ("network", "ls") for arguments in calls) == 2
 
 
 def _agent_runtime_record(
@@ -1128,6 +1542,7 @@ def test_controller_rejects_agent_network_and_healthcheck_drift(
     session._started = True
     session._agent_image_metadata_scanned = True
     session._network_id = "a" * 64
+    session._outbound_network_id = "d" * 64
     expected_command = ("python", "/work/agent.py")
     workdir = tmp_path / "work"
     workdir.mkdir()
@@ -1205,6 +1620,7 @@ def test_controller_accepts_exact_gatewayless_agent_runtime(
     session._started = True
     session._agent_image_metadata_scanned = True
     session._network_id = "a" * 64
+    session._outbound_network_id = "d" * 64
     expected_command = ("python", "/work/agent.py")
     workdir = tmp_path / "work"
     workdir.mkdir()
@@ -1225,7 +1641,14 @@ def test_controller_accepts_exact_gatewayless_agent_runtime(
         "agent_networks": [session.network_name],
         "bridge_gateway_mode_ipv4": "isolated",
         "broker_alias": BROKER_ALIAS,
-        "broker_networks": ["bridge", session.network_name],
+        "broker_networks": [
+            "fresh-dedicated-provider-egress-network",
+            session.network_name,
+        ],
+        "broker_outbound_network_id_sha256": _sha256(("d" * 64).encode("ascii")),
+        "broker_outbound_network_name_sha256": _sha256(
+            session.outbound_network_name.encode("ascii")
+        ),
         "container_dns_upstream": "loopback-only",
         "host_gateway_present": False,
         "internal_network": True,
@@ -1257,8 +1680,11 @@ def _valid_controller_audit_events(
     session: broker_controller.CredentialBrokerSession,
 ) -> list[dict[str, object]]:
     configuration_sha256 = "c" * 64
+    session._configuration_bytes = b'{"synthetic":"configuration"}\n'
+    configuration_bytes_sha256 = _sha256(session._configuration_bytes)
     path_sha256 = _sha256(APPROVED_AGENT_PATH.encode("utf-8"))
     common: dict[str, object] = {
+        "configuration_bytes_sha256": configuration_bytes_sha256,
         "configuration_sha256": configuration_sha256,
         "method": "POST",
         "path_sha256": path_sha256,
@@ -1266,12 +1692,7 @@ def _valid_controller_audit_events(
         "upstream_https_origin": session._route.upstream_https_origin,
     }
     return [
-        {
-            "configuration_sha256": configuration_sha256,
-            "decision": "ready",
-            "listen": "0.0.0.0:8765",
-            "provider": "openai",
-        },
+        session._expected_ready_event(),
         {
             **common,
             "decision": "attempt",
@@ -1283,12 +1704,119 @@ def _valid_controller_audit_events(
             "reason": "exact route completed",
         },
         {
+            "accepted_connection_count": 1,
+            "allowed_destination_inventory_sha256": "d" * 64,
+            "capacity_rejection_count": 0,
+            "client_socket_timeout_seconds": 30,
+            "connection_deadline_seconds": 600,
+            "configuration_bytes_sha256": configuration_bytes_sha256,
             "configuration_sha256": configuration_sha256,
             "decision": "quiesced",
             "provider": "openai",
             "request_count": 1,
+            "max_concurrent_connections": 32,
+            "test_only_allow_http": False,
+            "upstream_https_origin": session._route.upstream_https_origin,
+            "upstream_socket_timeout_seconds": 120,
         },
     ]
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "agent_base_url",
+        "allowed_destination_inventory_sha256",
+        "client_socket_timeout_seconds",
+        "connection_deadline_seconds",
+        "configuration_bytes_sha256",
+        "max_concurrent_connections",
+        "test_only_allow_http",
+        "upstream_https_origin",
+        "upstream_socket_timeout_seconds",
+    ),
+)
+def test_controller_rejects_effective_broker_identity_drift_before_agent_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    """Readiness attests the bytes and effective route consumed by the broker process."""
+    session = _controller_session(monkeypatch)
+    session._identity_hashes = ("a" * 64, "c" * 64, "d" * 64, "e" * 64)
+    session._configuration_bytes = b'{"synthetic":"configuration"}\n'
+    audit_path = tmp_path / "audit.jsonl"
+    session._audit_path = audit_path
+    event = session._expected_ready_event()
+    replacements: dict[str, object] = {
+        "agent_base_url": "http://evil.invalid:8765/openai/v1",
+        "allowed_destination_inventory_sha256": "f" * 64,
+        "client_socket_timeout_seconds": 0,
+        "connection_deadline_seconds": 0,
+        "configuration_bytes_sha256": "f" * 64,
+        "max_concurrent_connections": 0,
+        "test_only_allow_http": True,
+        "upstream_https_origin": "http://evil.invalid:80",
+        "upstream_socket_timeout_seconds": 0,
+    }
+    event[field] = replacements[field]
+    audit_path.write_bytes(canonical_json_bytes(event))
+
+    with pytest.raises(broker_controller.CredentialBrokerError, match="readiness identity"):
+        session._wait_until_ready()
+
+
+def test_controller_rejects_tampered_then_restored_config_from_loaded_byte_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restoring host bytes cannot erase evidence of a different config the broker loaded."""
+    session = _controller_session(monkeypatch)
+    session._identity_hashes = ("a" * 64, "c" * 64, "d" * 64, "e" * 64)
+    original = _production_configuration()
+    original["configuration_sha256"] = "c" * 64
+    original["lease_sha256"] = _sha256(session._lease.encode("utf-8"))
+    original_bytes = canonical_json_bytes(original)
+    session._configuration_bytes = original_bytes
+    config_path = tmp_path / "config.json"
+    audit_path = tmp_path / "audit.jsonl"
+    session._config_path = config_path
+    session._audit_path = audit_path
+    config_path.write_bytes(original_bytes)
+
+    tampered = _test_configuration("http://127.0.0.1:9", lease=session._lease)
+    tampered["configuration_sha256"] = "c" * 64
+    _write_configuration(config_path, tampered)
+    loaded, loaded_bytes_sha256 = broker_server._load_configuration_with_identity(
+        config_path,
+        test_only_authorized=True,
+    )
+    config_path.write_bytes(original_bytes)
+    audit_path.write_bytes(
+        canonical_json_bytes(
+            {
+                "agent_base_url": loaded["agent_base_url"],
+                "allowed_destination_inventory_sha256": (
+                    broker_server._allowed_destination_inventory_sha256(loaded)
+                ),
+                "client_socket_timeout_seconds": broker_server.CLIENT_SOCKET_TIMEOUT_SECONDS,
+                "connection_deadline_seconds": broker_server.CONNECTION_DEADLINE_SECONDS,
+                "configuration_bytes_sha256": loaded_bytes_sha256,
+                "configuration_sha256": "c" * 64,
+                "decision": "ready",
+                "listen": "0.0.0.0:8765",
+                "max_concurrent_connections": broker_server.MAX_CONCURRENT_CONNECTIONS,
+                "provider": "openai",
+                "test_only_allow_http": True,
+                "upstream_https_origin": "http://127.0.0.1:9",
+                "upstream_socket_timeout_seconds": (broker_server.UPSTREAM_SOCKET_TIMEOUT_SECONDS),
+            }
+        )
+    )
+
+    with pytest.raises(broker_controller.CredentialBrokerError, match="readiness identity"):
+        session._wait_until_ready()
+    assert config_path.read_bytes() == original_bytes
 
 
 @pytest.mark.parametrize(
@@ -1300,6 +1828,8 @@ def _valid_controller_audit_events(
         "missing-attempt",
         "request-id-gap",
         "wrong-path",
+        "capacity-rejection",
+        "accepted-count-mismatch",
         "noncanonical",
     ),
 )
@@ -1328,6 +1858,10 @@ def test_controller_requires_closed_attempt_terminal_audit_pairs(
         events[2]["request_id"] = 2
     elif drift == "wrong-path":
         events[1]["path_sha256"] = "f" * 64
+    elif drift == "capacity-rejection":
+        events[-1]["capacity_rejection_count"] = 1
+    elif drift == "accepted-count-mismatch":
+        events[-1]["accepted_connection_count"] = 2
     encoded = b"".join(canonical_json_bytes(event) for event in events)
     if drift == "noncanonical":
         encoded = encoded.replace(b'"decision":"ready"', b'"decision": "ready"', 1)
@@ -1430,7 +1964,7 @@ def test_controller_starts_broker_with_exact_secret_and_runtime_projection(
         "--name",
         session.broker_container_name,
         "--network",
-        "bridge",
+        session.outbound_network_name,
         "--workdir",
         "/",
         "--read-only",
@@ -1497,6 +2031,7 @@ def _broker_runtime_record(
     audit_path.parent.mkdir()
     session._config_path = config_path
     session._audit_path = audit_path
+    session._outbound_network_id = "d" * 64
     return {
         "Id": "b" * 64,
         "Image": digest,
@@ -1522,7 +2057,7 @@ def _broker_runtime_record(
             "CapDrop": ["ALL"],
             "ExtraHosts": None,
             "Links": None,
-            "NetworkMode": "bridge",
+            "NetworkMode": session.outbound_network_name,
             "PidMode": "",
             "PortBindings": None,
             "Privileged": False,
@@ -1560,7 +2095,11 @@ def _broker_runtime_record(
         ],
         "NetworkSettings": {
             "Networks": {
-                "bridge": {},
+                session.outbound_network_name: {
+                    "Gateway": "172.31.0.1",
+                    "GlobalIPv6Address": "",
+                    "IPv6Gateway": "",
+                },
                 session.network_name: {"Aliases": [BROKER_ALIAS]},
             },
             "Ports": {},
@@ -2054,6 +2593,7 @@ def _exercise_real_docker_topology(
                 BROKER_SERVER_PATH,
                 BROKER_CONFIG_PATH,
                 BROKER_AUDIT_PATH,
+                broker_server.TEST_ONLY_ARGUMENT,
             ),
             environment=broker_environment,
         )
@@ -2266,6 +2806,7 @@ def _exercise_real_docker_topology(
             BROKER_SERVER_PATH,
             BROKER_CONFIG_PATH,
             BROKER_AUDIT_PATH,
+            broker_server.TEST_ONLY_ARGUMENT,
         ]
         assert broker_config["User"] == uid_gid
         assert broker_config["WorkingDir"] == "/"
@@ -2322,3 +2863,47 @@ def test_real_docker_broker_as_router_fails_closed(
     """An absolute-form target cannot turn the broker into an egress router."""
     _require_docker_fixture()
     _exercise_real_docker_topology(tmp_path, mode="router-rejection")
+
+
+def test_real_controller_start_and_abort_use_dedicated_broker_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production controller creates, attests, and removes its synthetic-key topology."""
+    _require_docker_fixture()
+    runtime = observe_docker_runtime()
+    image_id = _docker(
+        ("image", "inspect", "--format", "{{.Id}}", DOCKER_TEST_IMAGE)
+    ).stdout.strip()
+    assert image_id.startswith("sha256:")
+    monkeypatch.setenv("OPENAI_API_KEY", RAW_CREDENTIAL)
+    config = AgentConfig(
+        adapter="codex",
+        model="synthetic-model",
+        provider=ProviderId.OPENAI,
+        api_key_env="OPENAI_API_KEY",
+        container_image=DOCKER_TEST_IMAGE,
+        container_image_digest=image_id,
+        credential_broker=CredentialBrokerConfiguration(
+            image=DOCKER_TEST_IMAGE,
+            image_digest=image_id,
+        ),
+    )
+    session = broker_controller.CredentialBrokerSession(
+        config,
+        runtime=runtime,
+        repository=REPOSITORY,
+    )
+
+    session.start()
+    try:
+        broker_record = session._inspect_container(session.broker_container_name)
+        networks = broker_record["NetworkSettings"]["Networks"]
+        assert set(networks) == {session.network_name, session.outbound_network_name}
+        assert "bridge" not in networks
+        session._verify_outbound_network_membership()
+    finally:
+        session.abort()
+
+    listed = set(_docker(("network", "ls", "--format", "{{.Name}}")).stdout.splitlines())
+    assert session.network_name not in listed
+    assert session.outbound_network_name not in listed

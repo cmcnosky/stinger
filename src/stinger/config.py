@@ -33,7 +33,6 @@ from pydantic import (
 
 from stinger.benchmark.credential_broker import (
     CredentialBrokerConfiguration,
-    broker_source_inventory_sha256,
     credential_identity_payloads,
     provider_route,
 )
@@ -41,6 +40,7 @@ from stinger.benchmark.protocol import (
     BenchmarkRunMetadata,
     ProviderId,
     canonical_agent_configuration_fingerprint,
+    compiled_credential_isolation_policy,
 )
 from stinger.harness.sandbox import DEFAULT_IMAGE, Isolation
 from stinger.models import Family
@@ -342,8 +342,12 @@ class RunConfig(BaseModel):
         api_key_env = self.agent.api_key_env
         if broker is None or api_key_env is None:
             return None
-        source_inventory_sha256 = broker_source_inventory_sha256(
-            Path(__file__).resolve().parents[2]
+        # Configuration identity binds the source hash signed into Protocol 2. Runtime
+        # provenance and the broker controller independently observe the actual checkout
+        # bytes before any sealed agent launch; metadata construction must also work from an
+        # installed wheel where repository source is intentionally absent.
+        source_inventory_sha256 = (
+            compiled_credential_isolation_policy().broker_source_inventory_sha256
         )
         route = provider_route(self.agent.adapter, self.agent.provider)
         (

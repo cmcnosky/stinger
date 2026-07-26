@@ -204,10 +204,11 @@ the CLI's expected credential environment variable. The non-secret broker route 
 projected only through the provider mapping: Codex uses the signed `openai_base_url` CLI
 override and MUST NOT receive `OPENAI_BASE_URL`; Claude Code uses the
 `ANTHROPIC_BASE_URL` environment variable. The agent MUST receive no credential files or
-extra mounts. The broker MAY join the internal network and its normal outbound Docker
-network, but it MUST accept only the exact signed provider, HTTPS origin, POST path mappings,
-request headers, and lease-auth scheme; it MUST strip agent authorization/proxy headers,
-reject arbitrary
+extra mounts. The broker MUST join the internal network and one fresh, dedicated,
+user-defined IPv4 NAT bridge for provider egress; it MUST NOT use Docker's shared default
+bridge. That outbound network MUST contain only the invocation's broker. The broker MUST
+accept only the exact signed provider, HTTPS origin, POST path mappings, request headers, and
+lease-auth scheme; it MUST strip agent authorization/proxy headers, reject arbitrary
 methods, paths, destinations, redirects, and reflected credentials, and inject the raw
 provider credential only into the fixed upstream request.
 
@@ -219,8 +220,12 @@ upstream MUST be `127.0.0.1`, with a root-only search domain and bounded timeout
 arbitrary external name resolution cannot become a route around the broker.
 
 Before agent launch, the harness MUST bind and verify the canonical policy, exact broker
-configuration, allowed-destination inventory, minimal projection inventory, broker source
-inventory, immutable protocol-approved broker image, and Docker runtime identity. It MUST
+configuration bytes actually loaded, effective allowed-destination inventory, minimal
+projection inventory, broker source inventory, immutable protocol-approved broker image,
+dedicated network identities, and Docker runtime identity. Test-only routing MUST require a
+process argument absent from the exact production broker command. The readiness evidence
+MUST bind the effective destination, test-mode state, absolute connection deadline, and
+bounded concurrency policy. It MUST
 also materialize and export the pinned agent image's final root filesystem, reject declared
 volumes, extra credential/proxy environment values, and any credential exposure. Before
 creating the network it MUST scan the final agent argv and the workdir's paths, symlink
@@ -234,10 +239,10 @@ the resulting metadata/rootfs inventory hash.
 
 After every invocation the harness MUST verify the exact agent/broker/network identities and
 attachment, command/environment/mount/network inventories, disabled healthcheck, isolated
-gateway, IPv6 and DNS settings, broker audit, absence of encoded credential evidence or a
-bypass path, and removal of the agent container, broker container, and fresh network. Missing
-or conflicting evidence, any rejected broker request, or unverified cleanup resolves to
-`error`.
+gateway, IPv6 and DNS settings, broker audit, accepted/finished connection counts, absence of
+encoded credential evidence or a bypass path, and removal of the agent container, broker
+container, and both fresh networks. Missing or conflicting evidence, any rejected broker
+request, capacity rejection, or unverified cleanup resolves to `error`.
 
 The closed Protocol 2 provider route set currently contains only `codex`/OpenAI and
 `claude-code`/Anthropic. Any unsupported adapter/provider pair MUST fail before agent start.

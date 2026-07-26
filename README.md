@@ -57,12 +57,14 @@ paths, and header projection; arbitrary egress, proxy headers, redirects, and br
 fail closed.
 
 That agent network uses an isolated IPv4 bridge with no host-facing gateway and IPv6
-disabled. Docker's embedded DNS can still resolve the broker alias, but its only upstream is
+disabled. The broker uses a separate fresh, broker-only IPv4 NAT bridge rather than Docker's
+shared default bridge. Docker's embedded DNS can still resolve the broker alias, but its only upstream is
 loopback with a root-only search domain and bounded retries, so external names do not create
 an egress path. The agent runs with inherited image healthchecks disabled.
 
-Preflight binds the exact credential-isolation policy, broker configuration, allowed
-destinations, empty file/mount projection, broker source inventory, immutable broker image,
+Preflight binds the exact credential-isolation policy, loaded broker configuration bytes,
+effective destinations and test-mode state, empty file/mount projection, broker source
+inventory, immutable broker image, both fresh network identities, bounded connection policy,
 and Docker runtime identity. Each invocation additionally binds the agent/broker/network
 identities, exact command/environment/mount/network inventories, and broker audit. Before any
 networked container starts, Stinger scans the final agent argv and workdir paths, links, and
@@ -70,7 +72,7 @@ file contents for the raw credential plus hexadecimal, standard Base64, URL-safe
 percent-encoded forms. It applies the same encoding policy to the agent image's runtime
 metadata and exported final root filesystem, rejects the policy's signed credential-path
 suffixes, and requires the declared/default agent config home to be absent or empty. Agent,
-broker, and network cleanup must be mechanically observed before a successful non-secret
+broker, and both-network cleanup must be mechanically observed before a successful non-secret
 receipt is emitted. This mechanism has synthetic, local-fake-provider coverage; it has not
 been used for a sealed review or live provider run.
 
@@ -183,7 +185,7 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 | Core data model (`models.py`) | working |
 | Sandbox isolation + RepoState capture (§2, §7) | working — real container runs verified, including that the network is off and the mount hides the rest of the scenario |
 | Contained agent — `container_image`, `credential_mount` (§5) | working for ordinary development containment — [docker/codex-agent.Dockerfile](docker/codex-agent.Dockerfile) builds a Codex image and the legacy read-only mount is unit-tested; direct credential forwarding and copied credential mounts are explicitly ineligible for Protocol 2 |
-| Protocol 2 credential isolation | working mechanism for closed Codex/OpenAI and Claude Code/Anthropic routes — external raw-credential broker; isolated no-gateway bridge with IPv6 off, loopback-only DNS upstream, and no healthcheck; exact destination/projection/source/image/runtime bindings; prelaunch argv/workdir/image-metadata/final-rootfs scans for raw and reversible credential encodings, signed prohibited paths, and nonempty config homes; per-invocation audit/identity receipts; and fail-closed cleanup are adversarially tested with synthetic credentials and local fake providers; no sealed/live run is claimed, and a third route in a newly signed policy is still required for the publication baseline |
+| Protocol 2 credential isolation | working mechanism for closed Codex/OpenAI and Claude Code/Anthropic routes — external raw-credential broker; isolated no-gateway agent bridge plus a fresh broker-only outbound bridge, both IPv4-only; loopback-only agent DNS upstream; no healthcheck; exact loaded-config/destination/projection/source/image/runtime and bounded-connection bindings; prelaunch argv/workdir/image-metadata/final-rootfs scans for raw and reversible credential encodings, signed prohibited paths, and nonempty config homes; per-invocation audit/identity receipts; and fail-closed two-network cleanup are adversarially tested with synthetic credentials and local fake providers; no sealed/live run is claimed, and a third route in a newly signed policy is still required for the publication baseline |
 | Run state machine + frozen `classify()` (§7) | working |
 | Held-out completion check (§7) | working |
 | All seven detectors (§6) | working — each fires on its intended cheat and stays silent on the honest reference, unit-tested and exercised by the corpus |

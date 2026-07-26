@@ -1,16 +1,18 @@
 """Host-side controller for Protocol 2's external credential broker.
 
 The controller is trusted harness code; the agent container is not.  It creates one fresh
-Docker-internal network per invocation, starts a dual-homed fixed-origin broker, and gives
-the agent only that network plus an opaque one-use lease.  The raw provider credential is
-forwarded by name into the broker container only.  After the agent exits, the controller
-mechanically inspects the stopped container, broker, network, mounts, and environment before
-removing all three and emitting a canonical non-secret receipt.
+Docker-internal agent network and one fresh provider-egress network per invocation, starts a
+dual-homed fixed-origin broker, and gives the agent only the internal network plus an opaque
+one-use lease.  The raw provider credential is forwarded by name into the broker container
+only.  After the agent exits, the controller mechanically inspects the stopped container,
+broker, networks, mounts, and environment before removing the topology and emitting a
+canonical non-secret receipt.
 """
 
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -69,6 +71,10 @@ _ROUTING_NAME = re.compile(
     re.IGNORECASE,
 )
 _READY_TIMEOUT_SECONDS = 15.0
+_BROKER_CLIENT_SOCKET_TIMEOUT_SECONDS = 30
+_BROKER_CONNECTION_DEADLINE_SECONDS = 600
+_BROKER_MAX_CONCURRENT_CONNECTIONS = 32
+_BROKER_UPSTREAM_SOCKET_TIMEOUT_SECONDS = 120
 _MAX_AUDIT_BYTES = 8 * 1024 * 1024
 _NETWORK_ABSENCE_OBSERVATIONS = 2
 _ROOTFS_SCAN_CACHE: dict[tuple[str, str, str, str], str] = {}
@@ -127,8 +133,10 @@ class CredentialBrokerSession:
             raise CredentialBrokerError("broker lease unexpectedly equals the provider credential")
         suffix = uuid4().hex[:12]
         self.network_name = f"stinger-credential-{suffix}"
+        self.outbound_network_name = f"stinger-broker-egress-{suffix}"
         self.broker_container_name = f"stinger-broker-{suffix}"
         self._network_id: str | None = None
+        self._outbound_network_id: str | None = None
         self._broker_container_id: str | None = None
         self._broker_image_id: str | None = None
         self._broker_repo_digests: tuple[str, ...] = ()
@@ -148,6 +156,7 @@ class CredentialBrokerSession:
         self._started = False
         self._finished = False
         self._network_creation_attempted = False
+        self._outbound_network_creation_attempted = False
         self._broker_quiesced = False
 
     @property
@@ -198,6 +207,7 @@ class CredentialBrokerSession:
             verify_docker_runtime(self._runtime)
             self._verify_static_identity()
             self._prepare_evidence_files()
+            self._create_outbound_network()
             self._create_internal_network()
             self._start_broker_container()
             self._connect_and_verify_broker()
@@ -241,6 +251,7 @@ class CredentialBrokerSession:
             )
             broker_runtime_inventory = self._verify_broker_runtime_state()
             self._verify_internal_network_membership()
+            self._verify_outbound_network_membership()
             self._quiesce_broker()
             audit_bytes, counts = self._load_and_verify_audit()
             self._verify_static_bytes_unchanged()
@@ -426,6 +437,52 @@ class CredentialBrokerSession:
         self._audit_path = audit_path
         self._configuration_bytes = encoded
 
+    def _create_outbound_network(self) -> None:
+        """Create one invocation-private IPv4 NAT bridge for the broker only."""
+        self._outbound_network_creation_attempted = True
+        result = run_docker(
+            (
+                "network",
+                "create",
+                "--driver",
+                "bridge",
+                "--ipv6=false",
+                "--opt",
+                "com.docker.network.bridge.gateway_mode_ipv4=nat",
+                "--opt",
+                "com.docker.network.enable_ipv4=true",
+                "--label",
+                "stinger.credential-isolation=protocol-2",
+                self.outbound_network_name,
+            ),
+            runtime=self._runtime,
+            observe_if_missing=False,
+        )
+        network_id = result.stdout.strip()
+        if result.returncode != 0 or _CONTAINER_ID.fullmatch(network_id) is None:
+            raise CredentialBrokerError("fresh broker outbound network could not be created")
+        self._outbound_network_id = network_id
+        network = self._inspect_outbound_network()
+        if (
+            network.get("Name") != self.outbound_network_name
+            or network.get("Id") != network_id
+            or network.get("Driver") != "bridge"
+            or network.get("EnableIPv4") is not True
+            or network.get("EnableIPv6") is not False
+            or network.get("Internal") is not False
+            or network.get("Attachable") is not False
+            or network.get("Ingress") is True
+            or network.get("Labels") != {"stinger.credential-isolation": "protocol-2"}
+            or network.get("Options")
+            != {
+                "com.docker.network.bridge.gateway_mode_ipv4": "nat",
+                "com.docker.network.enable_ipv4": "true",
+            }
+            or not _network_ipam_has_ipv4_gateway(network.get("IPAM"))
+            or network.get("Containers") not in ({}, None)
+        ):
+            raise CredentialBrokerError("fresh broker outbound network identity drifted")
+
     def _create_internal_network(self) -> None:
         self._network_creation_attempted = True
         result = run_docker(
@@ -461,6 +518,7 @@ class CredentialBrokerSession:
             or network.get("Internal") is not True
             or network.get("Attachable") is not False
             or network.get("Ingress") is True
+            or network.get("Labels") != {"stinger.credential-isolation": "protocol-2"}
             or network.get("Options")
             != {
                 "com.docker.network.bridge.gateway_mode_ipv4": "isolated",
@@ -485,7 +543,7 @@ class CredentialBrokerSession:
             "--name",
             self.broker_container_name,
             "--network",
-            "bridge",
+            self.outbound_network_name,
             "--workdir",
             "/",
             "--read-only",
@@ -570,12 +628,7 @@ class CredentialBrokerSession:
                     raise CredentialBrokerError("broker readiness evidence is invalid") from exc
                 if first != canonical_json_bytes(event):
                     raise CredentialBrokerError("broker readiness evidence is not canonical")
-                if event != {
-                    "configuration_sha256": self._require_identity_hashes()[1],
-                    "decision": "ready",
-                    "listen": "0.0.0.0:8765",
-                    "provider": self._route.provider.value,
-                }:
+                if event != self._expected_ready_event():
                     raise CredentialBrokerError("broker readiness identity does not match")
                 return
             state = self._inspect_container_state(self.broker_container_name)
@@ -687,7 +740,16 @@ class CredentialBrokerSession:
             "agent_container_id_sha256": sha256_bytes(container_id.encode("ascii")),
             "agent_networks": [self.network_name],
             "broker_alias": BROKER_ALIAS,
-            "broker_networks": ["bridge", self.network_name],
+            "broker_networks": [
+                "fresh-dedicated-provider-egress-network",
+                self.network_name,
+            ],
+            "broker_outbound_network_id_sha256": sha256_bytes(
+                self._require_outbound_network_id().encode("ascii")
+            ),
+            "broker_outbound_network_name_sha256": sha256_bytes(
+                self.outbound_network_name.encode("ascii")
+            ),
             "internal_network": True,
             "bridge_gateway_mode_ipv4": "isolated",
             "container_dns_upstream": "loopback-only",
@@ -759,9 +821,9 @@ class CredentialBrokerSession:
             or config.get("Image") != self._require_broker_image_id()
             or state.get("Running") is not True
             or state.get("Health") not in (None, {})
-            or host.get("NetworkMode") != "bridge"
+            or host.get("NetworkMode") != self.outbound_network_name
             or not isinstance(networks, dict)
-            or set(networks) != {"bridge", self.network_name}
+            or set(networks) != {self.outbound_network_name, self.network_name}
             or host.get("CapDrop") != ["ALL"]
             or host.get("CapAdd") not in (None, [])
             or host.get("AutoRemove") is not False
@@ -792,9 +854,18 @@ class CredentialBrokerSession:
         ):
             raise CredentialBrokerError("credential-broker runtime identity drifted")
         internal = networks[self.network_name]
+        outbound = networks[self.outbound_network_name]
         aliases = internal.get("Aliases") if isinstance(internal, dict) else None
         if not isinstance(aliases, list) or BROKER_ALIAS not in aliases:
             raise CredentialBrokerError("credential-broker internal alias is missing")
+        if (
+            not isinstance(internal, dict)
+            or internal.get("Gateway") not in {"", None}
+            or internal.get("IPv6Gateway") not in {"", None}
+            or not isinstance(outbound, dict)
+            or not _network_attachment_has_ipv4_gateway(outbound)
+        ):
+            raise CredentialBrokerError("credential-broker network attachment drifted")
         self._validate_broker_mounts(mounts)
         return {
             "auto_remove": False,
@@ -804,7 +875,16 @@ class CredentialBrokerSession:
             "extra_hosts": [],
             "healthcheck_disabled": True,
             "links": [],
-            "network_modes": ["bridge", "fresh-docker-internal-network-only"],
+            "network_modes": [
+                "fresh-dedicated-provider-egress-network",
+                "fresh-docker-internal-network-only",
+            ],
+            "outbound_network_id_sha256": sha256_bytes(
+                self._require_outbound_network_id().encode("ascii")
+            ),
+            "outbound_network_name_sha256": sha256_bytes(
+                self.outbound_network_name.encode("ascii")
+            ),
             "no_new_privileges": True,
             "pid_mode": "private-container",
             "port_bindings": [],
@@ -825,6 +905,7 @@ class CredentialBrokerSession:
             or network.get("Internal") is not True
             or network.get("EnableIPv4") is not True
             or network.get("EnableIPv6") is not False
+            or network.get("Labels") != {"stinger.credential-isolation": "protocol-2"}
             or network.get("Options")
             != {
                 "com.docker.network.bridge.gateway_mode_ipv4": "isolated",
@@ -846,6 +927,36 @@ class CredentialBrokerSession:
         # must therefore contain exactly the broker and no third container at this phase.
         if names != {self.broker_container_name}:
             raise CredentialBrokerError("agent network membership is not exact")
+
+    def _verify_outbound_network_membership(self) -> None:
+        """Require the fresh NAT bridge to contain only this invocation's broker."""
+        network = self._inspect_outbound_network()
+        if (
+            network.get("Id") != self._require_outbound_network_id()
+            or network.get("Name") != self.outbound_network_name
+            or network.get("Driver") != "bridge"
+            or network.get("Internal") is not False
+            or network.get("EnableIPv4") is not True
+            or network.get("EnableIPv6") is not False
+            or network.get("Labels") != {"stinger.credential-isolation": "protocol-2"}
+            or network.get("Options")
+            != {
+                "com.docker.network.bridge.gateway_mode_ipv4": "nat",
+                "com.docker.network.enable_ipv4": "true",
+            }
+            or not _network_ipam_has_ipv4_gateway(network.get("IPAM"))
+        ):
+            raise CredentialBrokerError("broker outbound network identity drifted")
+        containers = network.get("Containers") or {}
+        if not isinstance(containers, dict):
+            raise CredentialBrokerError("broker outbound network membership is invalid")
+        names = {
+            value.get("Name")
+            for value in containers.values()
+            if isinstance(value, dict) and isinstance(value.get("Name"), str)
+        }
+        if names != {self.broker_container_name}:
+            raise CredentialBrokerError("broker outbound network membership is not exact")
 
     def _quiesce_broker(self) -> None:
         """Gracefully stop the broker so its terminal audit is stable before reading it."""
@@ -890,20 +1001,26 @@ class CredentialBrokerSession:
         if not self._broker_quiesced or len(events) < 4:
             raise CredentialBrokerError("broker audit was read before a terminal quiescence")
         configuration_sha256 = self._require_identity_hashes()[1]
-        if events[0] != {
-            "configuration_sha256": configuration_sha256,
-            "decision": "ready",
-            "listen": "0.0.0.0:8765",
-            "provider": self._route.provider.value,
-        }:
+        configuration_bytes_sha256 = sha256_bytes(self._require_configuration_bytes())
+        if events[0] != self._expected_ready_event():
             raise CredentialBrokerError("broker audit readiness identity changed")
         terminal = events[-1]
         request_events = events[1:-1]
         if terminal != {
+            "accepted_connection_count": len({event.get("request_id") for event in request_events}),
+            "allowed_destination_inventory_sha256": self._require_identity_hashes()[2],
+            "capacity_rejection_count": 0,
+            "client_socket_timeout_seconds": _BROKER_CLIENT_SOCKET_TIMEOUT_SECONDS,
+            "connection_deadline_seconds": _BROKER_CONNECTION_DEADLINE_SECONDS,
+            "configuration_bytes_sha256": configuration_bytes_sha256,
             "configuration_sha256": configuration_sha256,
             "decision": "quiesced",
             "provider": self._route.provider.value,
             "request_count": len({event.get("request_id") for event in request_events}),
+            "max_concurrent_connections": _BROKER_MAX_CONCURRENT_CONNECTIONS,
+            "test_only_allow_http": False,
+            "upstream_https_origin": self._route.upstream_https_origin,
+            "upstream_socket_timeout_seconds": _BROKER_UPSTREAM_SOCKET_TIMEOUT_SECONDS,
         }:
             raise CredentialBrokerError("broker audit terminal identity changed")
         allowed_path_hashes = {
@@ -912,6 +1029,7 @@ class CredentialBrokerSession:
         decisions: dict[int, list[str]] = {}
         for event in request_events:
             if set(event) != {
+                "configuration_bytes_sha256",
                 "configuration_sha256",
                 "decision",
                 "method",
@@ -923,7 +1041,8 @@ class CredentialBrokerSession:
                 raise CredentialBrokerError("broker audit request schema is not exact")
             request_id = event["request_id"]
             if (
-                event["configuration_sha256"] != configuration_sha256
+                event["configuration_bytes_sha256"] != configuration_bytes_sha256
+                or event["configuration_sha256"] != configuration_sha256
                 or event["upstream_https_origin"] != self._route.upstream_https_origin
                 or event["method"] != "POST"
                 or event["path_sha256"] not in allowed_path_hashes
@@ -940,6 +1059,24 @@ class CredentialBrokerSession:
         ):
             raise CredentialBrokerError("broker did not record only approved provider requests")
         return encoded, (len(decisions), 0)
+
+    def _expected_ready_event(self) -> dict[str, object]:
+        """Return the exact broker-loaded identity required before agent launch."""
+        return {
+            "agent_base_url": self._route.agent_base_url,
+            "allowed_destination_inventory_sha256": self._require_identity_hashes()[2],
+            "client_socket_timeout_seconds": _BROKER_CLIENT_SOCKET_TIMEOUT_SECONDS,
+            "connection_deadline_seconds": _BROKER_CONNECTION_DEADLINE_SECONDS,
+            "configuration_bytes_sha256": sha256_bytes(self._require_configuration_bytes()),
+            "configuration_sha256": self._require_identity_hashes()[1],
+            "decision": "ready",
+            "listen": "0.0.0.0:8765",
+            "max_concurrent_connections": _BROKER_MAX_CONCURRENT_CONNECTIONS,
+            "provider": self._route.provider.value,
+            "test_only_allow_http": False,
+            "upstream_https_origin": self._route.upstream_https_origin,
+            "upstream_socket_timeout_seconds": _BROKER_UPSTREAM_SOCKET_TIMEOUT_SECONDS,
+        }
 
     def _verify_static_bytes_unchanged(self) -> None:
         config_path = self._require_config_path()
@@ -1063,6 +1200,23 @@ class CredentialBrokerSession:
             raise CredentialBrokerError("agent internal network evidence is invalid") from None
         if not isinstance(network, dict):
             raise CredentialBrokerError("agent internal network evidence is invalid")
+        return network
+
+    def _inspect_outbound_network(self) -> dict[str, Any]:
+        result = run_docker(
+            ("network", "inspect", self.outbound_network_name),
+            runtime=self._runtime,
+            observe_if_missing=False,
+        )
+        if result.returncode != 0:
+            raise CredentialBrokerError("broker outbound network is unavailable")
+        try:
+            raw = json.loads(result.stdout)
+            network = raw[0]
+        except (json.JSONDecodeError, IndexError, TypeError):
+            raise CredentialBrokerError("broker outbound network evidence is invalid") from None
+        if not isinstance(network, dict):
+            raise CredentialBrokerError("broker outbound network evidence is invalid")
         return network
 
     def _inspect_image_environment(self, image: str) -> dict[str, str]:
@@ -1380,9 +1534,9 @@ class CredentialBrokerSession:
                 terminate_docker_container(name, runtime=self._runtime, timeout=30)
             except BaseException as exc:
                 failure = failure or exc
-        if self._network_creation_attempted:
+        if self._network_creation_attempted or self._outbound_network_creation_attempted:
             try:
-                self._remove_network()
+                self._remove_networks()
             except BaseException as exc:
                 failure = failure or exc
         try:
@@ -1396,12 +1550,21 @@ class CredentialBrokerSession:
                 failure = failure or exc
         return failure
 
-    def _remove_network(self) -> None:
-        run_docker(
-            ("network", "rm", self.network_name),
-            runtime=self._runtime,
-            observe_if_missing=False,
+    def _remove_networks(self) -> None:
+        names = tuple(
+            name
+            for attempted, name in (
+                (self._network_creation_attempted, self.network_name),
+                (self._outbound_network_creation_attempted, self.outbound_network_name),
+            )
+            if attempted
         )
+        for name in names:
+            run_docker(
+                ("network", "rm", name),
+                runtime=self._runtime,
+                observe_if_missing=False,
+            )
         observations = 0
         attempts = 0
         while attempts < 4 and observations < _NETWORK_ABSENCE_OBSERVATIONS:
@@ -1413,15 +1576,15 @@ class CredentialBrokerSession:
             )
             if result.returncode != 0:
                 raise CredentialBrokerError("Docker network cleanup inventory failed")
-            names = {line.strip() for line in result.stdout.splitlines() if line.strip()}
-            if self.network_name in names:
+            observed_names = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+            if any(name in observed_names for name in names):
                 observations = 0
             else:
                 observations += 1
             if observations < _NETWORK_ABSENCE_OBSERVATIONS:
                 time.sleep(0.05)
         if observations < _NETWORK_ABSENCE_OBSERVATIONS:
-            raise CredentialBrokerError("agent internal network cleanup was not verified")
+            raise CredentialBrokerError("credential broker network cleanup was not verified")
 
     def _require_identity_hashes(self) -> tuple[str, str, str, str]:
         if self._identity_hashes is None:
@@ -1447,6 +1610,11 @@ class CredentialBrokerSession:
         if self._network_id is None:
             raise CredentialBrokerError("credential broker network identity is incomplete")
         return self._network_id
+
+    def _require_outbound_network_id(self) -> str:
+        if self._outbound_network_id is None:
+            raise CredentialBrokerError("broker outbound network identity is incomplete")
+        return self._outbound_network_id
 
     def _require_temporary_path(self) -> Path:
         if self._temporary_path is None:
@@ -1561,6 +1729,51 @@ def _network_ipam_is_isolated(raw: object) -> bool:
         return False
     subnet = configurations[0]["Subnet"]
     return isinstance(subnet, str) and bool(subnet)
+
+
+def _network_ipam_has_ipv4_gateway(raw: object) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    configurations = raw.get("Config")
+    if (
+        raw.get("Driver") != "default"
+        or raw.get("Options") not in ({}, None)
+        or not isinstance(configurations, list)
+        or len(configurations) != 1
+        or not isinstance(configurations[0], dict)
+        or set(configurations[0]) != {"Gateway", "Subnet"}
+    ):
+        return False
+    subnet_text = configurations[0]["Subnet"]
+    gateway_text = configurations[0]["Gateway"]
+    if not isinstance(subnet_text, str) or not isinstance(gateway_text, str):
+        return False
+    try:
+        subnet = ipaddress.ip_network(subnet_text)
+        gateway = ipaddress.ip_address(gateway_text)
+    except ValueError:
+        return False
+    return (
+        isinstance(subnet, ipaddress.IPv4Network)
+        and isinstance(gateway, ipaddress.IPv4Address)
+        and gateway in subnet
+        and gateway not in {subnet.network_address, subnet.broadcast_address}
+    )
+
+
+def _network_attachment_has_ipv4_gateway(raw: dict[str, Any]) -> bool:
+    gateway = raw.get("Gateway")
+    if (
+        not isinstance(gateway, str)
+        or not gateway
+        or raw.get("IPv6Gateway") not in {"", None}
+        or raw.get("GlobalIPv6Address") not in {"", None}
+    ):
+        return False
+    try:
+        return isinstance(ipaddress.ip_address(gateway), ipaddress.IPv4Address)
+    except ValueError:
+        return False
 
 
 def _credential_variants(raw: bytes) -> tuple[bytes, ...]:
