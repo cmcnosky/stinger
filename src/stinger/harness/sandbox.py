@@ -500,6 +500,9 @@ def docker_argv(
     argv: Sequence[str],
     *,
     network: bool = False,
+    network_name: str | None = None,
+    auto_remove: bool = True,
+    hardened_network_client: bool = False,
     forward_env: Sequence[str] = (),
     read_only_mounts: Mapping[str, str] | None = None,
     name: str | None = None,
@@ -517,7 +520,16 @@ def docker_argv(
         workdir: Host directory bind-mounted at /work and used as the working directory.
         argv: Command and arguments to run inside the container.
         network: When False (the default and the only setting valid for scoring), the
-            container gets `--network none`.
+            container gets `--network none` unless ``network_name`` selects a pre-created
+            internal network.
+        network_name: Exact Docker network for a credential-brokered agent. The caller must
+            have created and verified it as internal before using it. It is mutually
+            exclusive with unrestricted ``network=True``.
+        auto_remove: Remove the container after exit. Credential-isolated agent runs retain
+            the stopped container briefly so the broker controller can inspect its exact
+            environment, mounts, image, and network before verified cleanup.
+        hardened_network_client: Drop all Linux capabilities, prohibit privilege escalation,
+            and disable IPv4/IPv6 forwarding. Valid only on a named broker network.
         forward_env: Names of environment variables to forward from this process into the
             container. Names only — never `NAME=VALUE`. Docker reads the value from the
             `docker` process's own environment, which keeps a credential out of the argv
@@ -541,10 +553,22 @@ def docker_argv(
     Returns:
         The full argv for `subprocess.run`.
     """
-    wrapper = [
-        "run",
-        "--rm",
-    ]
+    if network and network_name is not None:
+        raise ValueError("unrestricted and named Docker network modes are mutually exclusive")
+    if hardened_network_client and network_name is None:
+        raise ValueError("hardened network clients require one named internal network")
+    if network_name is not None and (
+        not network_name
+        or network_name != network_name.strip()
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyz0123456789_.-" for character in network_name
+        )
+    ):
+        raise ValueError("Docker network name is invalid")
+
+    wrapper = ["run"]
+    if auto_remove:
+        wrapper.append("--rm")
     if entrypoint is not None:
         wrapper += ["--entrypoint", entrypoint]
     wrapper += [
@@ -567,8 +591,29 @@ def docker_argv(
         wrapper += ["--volume", f"{Path(host_path).resolve()}:{container_path}:ro"]
     for env_name in forward_env:
         wrapper += ["--env", env_name]
+    if hardened_network_client:
+        wrapper += [
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--no-healthcheck",
+            "--dns",
+            "127.0.0.1",
+            "--dns-search=.",
+            "--dns-option",
+            "timeout:1",
+            "--dns-option",
+            "attempts:1",
+            "--sysctl",
+            "net.ipv4.conf.all.forwarding=0",
+            "--sysctl",
+            "net.ipv6.conf.all.forwarding=0",
+        ]
     wrapper += _user_mapping()
-    if not network:
+    if network_name is not None:
+        wrapper += ["--network", network_name]
+    elif not network:
         wrapper += ["--network", "none"]
     return docker_command_argv([*wrapper, image, *argv], runtime=runtime)
 

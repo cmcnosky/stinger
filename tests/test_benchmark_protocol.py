@@ -21,9 +21,12 @@ from stinger.benchmark.protocol import (
     BenchmarkRunMetadata,
     BenchmarkRuntimeProvenance,
     BenchmarkSplit,
+    CredentialIsolationRuntimeProvenance,
     ProviderId,
     canonical_agent_configuration_fingerprint,
+    canonical_credential_isolation_policy_sha256,
     canonical_local_provider_binding_issues,
+    compiled_credential_isolation_policy,
     publication_pin_issues,
 )
 from stinger.benchmark.verification_image import (
@@ -44,6 +47,8 @@ COMMIT = "c" * 40
 
 def complete_metadata() -> BenchmarkRunMetadata:
     """A fully pinned provenance block suitable for publication-gate tests."""
+    policy = compiled_credential_isolation_policy()
+    broker_configuration_sha256 = "1" * 64
     fingerprint = canonical_agent_configuration_fingerprint(
         provider=ProviderId.OPENAI,
         model_id="example-model-2026-07-23",
@@ -52,6 +57,7 @@ def complete_metadata() -> BenchmarkRunMetadata:
         reasoning_effort="high",
         inference_settings={"temperature": 0.0, "max_output_tokens": 4096},
         agent_container_digest=DIGEST_A,
+        credential_broker_configuration_sha256=broker_configuration_sha256,
     )
     return BenchmarkRunMetadata(
         provider=ProviderId.OPENAI,
@@ -65,11 +71,18 @@ def complete_metadata() -> BenchmarkRunMetadata:
         verification_image_digest=DIGEST_B,
         run_seed=17,
         agent_configuration_fingerprint=fingerprint,
+        credential_isolation_policy_sha256=(canonical_credential_isolation_policy_sha256(policy)),
+        credential_broker_configuration_sha256=broker_configuration_sha256,
+        credential_allowed_destination_inventory_sha256="2" * 64,
+        credential_agent_projection_inventory_sha256="3" * 64,
+        credential_broker_source_inventory_sha256=(policy.broker_source_inventory_sha256),
+        credential_broker_image_digest=DIGEST_B,
     )
 
 
 def complete_runtime() -> BenchmarkRuntimeProvenance:
     """Mechanically observed values matching :func:`complete_metadata`."""
+    policy = compiled_credential_isolation_policy()
     return BenchmarkRuntimeProvenance(
         requested_provider=ProviderId.OPENAI,
         requested_model_id="example-model-2026-07-23",
@@ -92,6 +105,16 @@ def complete_runtime() -> BenchmarkRuntimeProvenance:
         resolved_version_invocation=("codex", "--version"),
         reasoning_effort="high",
         inference_settings={"temperature": 0.0, "max_output_tokens": 4096},
+        credential_isolation=CredentialIsolationRuntimeProvenance(
+            policy_sha256=canonical_credential_isolation_policy_sha256(policy),
+            broker_configuration_sha256="1" * 64,
+            allowed_destination_inventory_sha256="2" * 64,
+            agent_projection_inventory_sha256="3" * 64,
+            broker_source_inventory_sha256=policy.broker_source_inventory_sha256,
+            broker_image_id=DIGEST_B,
+            docker_runtime_fingerprint_sha256="e" * 64,
+            verified=True,
+        ),
         verified=True,
     )
 
@@ -180,6 +203,53 @@ class TestRunMetadata:
             )
             == ()
         )
+
+    def test_protocol_two_publication_fails_closed_without_isolation_evidence(self) -> None:
+        runtime = complete_runtime().model_copy(update={"credential_isolation": None})
+
+        assert "credential_isolation_runtime_missing" in publication_pin_issues(
+            complete_metadata(),
+            runtime,
+        )
+
+    def test_broker_configuration_and_projection_drift_fail_closed(self) -> None:
+        runtime = complete_runtime()
+        assert runtime.credential_isolation is not None
+        changed = runtime.model_copy(
+            update={
+                "credential_isolation": runtime.credential_isolation.model_copy(
+                    update={
+                        "broker_configuration_sha256": "4" * 64,
+                        "agent_projection_inventory_sha256": "5" * 64,
+                    }
+                )
+            }
+        )
+
+        issues = publication_pin_issues(complete_metadata(), changed)
+
+        assert "credential_isolation_configuration_mismatch" in issues
+        assert "credential_agent_projection_mismatch" in issues
+
+    def test_broker_image_and_docker_runtime_identity_mismatch_fail_closed(self) -> None:
+        runtime = complete_runtime()
+        assert runtime.credential_isolation is not None
+        changed = runtime.model_copy(
+            update={
+                "credential_isolation": runtime.credential_isolation.model_copy(
+                    update={
+                        "broker_image_id": DIGEST_A,
+                        "docker_runtime_fingerprint_sha256": "f" * 64,
+                    }
+                )
+            }
+        )
+
+        issues = publication_pin_issues(complete_metadata(), changed)
+
+        assert "credential_broker_image_identity_mismatch" in issues
+        assert "credential_broker_image_not_protocol_approved" in issues
+        assert "credential_isolation_docker_runtime_identity_mismatch" in issues
 
     @pytest.mark.parametrize(
         ("adapter", "provider", "model", "executable"),

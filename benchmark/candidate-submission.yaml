@@ -30,6 +30,103 @@ protocol:
             image_id: sha256:7e3c9970f164032e35dd2fbc82ddf712279fac2d3e631578988ed61d586b168e
           - representation: oci-image-config-digest
             image_id: sha256:b07ecc68cec24ccc49b51e0935b0a1676f777717d1db3e2ee8d7c571f25aa1eb
+  credential_isolation_policy:
+    format_version: "1"
+    claim_boundary: >-
+      mechanically observed Docker network, broker, destination-allowlist, and minimal
+      agent-projection evidence showing that raw provider credentials remained outside the
+      networked agent container; not provider-side, host-administrator, kernel-integrity,
+      or physical-hardware attestation
+    raw_provider_credential_location: external-broker-only
+    agent_network: fresh-docker-internal-network-only
+    agent_bridge_gateway: isolated-no-host-interface
+    agent_dns: embedded-broker-alias-with-loopback-only-upstream
+    agent_projection: broker-origin-and-opaque-session-only
+    destination_binding: exact-provider-scheme-host-port-path-allowlist
+    request_policy: fixed-upstream-no-connect-no-redirect-strip-agent-auth-and-proxy-headers
+    broker_identity: source-inventory-and-immutable-image
+    broker_source_paths:
+      - src/stinger/credential_broker_server.py
+    broker_source_inventory_sha256: de20acc5ac798d64d2fe1278daf4c409fad634e6f2112e20d0d083a644b48539
+    agent_image_final_rootfs_credential_scan_required: true
+    agent_image_credential_encoding_policy: raw-hex-base64-urlsafe-base64-percent
+    agent_image_config_home_policy: declared-agent-config-home-must-be-empty
+    agent_image_prohibited_credential_path_suffixes:
+      - /.aws/credentials
+      - /.azure/accesstokens.json
+      - /.azure/azureprofile.json
+      - /.codex/auth.json
+      - /.config/gcloud/application_default_credentials.json
+      - /.config/gh/hosts.yml
+      - /.config/github-copilot/apps.json
+      - /.config/github-copilot/hosts.json
+      - /.docker/config.json
+      - /.env
+      - /.git-credentials
+      - /.netrc
+      - /.npmrc
+      - /.pypirc
+      - /etc/claude-code/managed-settings.json
+      - /etc/claude/managed-settings.json
+      - /etc/codex/config.toml
+    docker_runtime_identity_required: true
+    per_invocation_receipt_required: true
+    provider_routes:
+      - provider: openai
+        agent_adapter: codex
+        agent_base_url_environment_name: null
+        agent_base_url_config_key: openai_base_url
+        agent_credential_environment_name: OPENAI_API_KEY
+        agent_base_url: http://stinger-credential-broker:8765/openai/v1
+        upstream_https_origin: https://api.openai.com:443
+        path_mappings:
+          - agent_path: /openai/v1/responses
+            upstream_path: /v1/responses
+            methods: [POST]
+          - agent_path: /openai/v1/responses/compact
+            upstream_path: /v1/responses/compact
+            methods: [POST]
+        forwarded_agent_headers: [accept, content-type, openai-beta, user-agent]
+        stripped_agent_headers:
+          - authorization
+          - cookie
+          - host
+          - proxy-authorization
+          - x-api-key
+        inbound_lease_header: authorization
+        inbound_lease_scheme: bearer
+        injected_auth_header: authorization
+        injected_auth_scheme: bearer
+      - provider: anthropic
+        agent_adapter: claude-code
+        agent_base_url_environment_name: ANTHROPIC_BASE_URL
+        agent_base_url_config_key: null
+        agent_credential_environment_name: ANTHROPIC_API_KEY
+        agent_base_url: http://stinger-credential-broker:8765/anthropic
+        upstream_https_origin: https://api.anthropic.com:443
+        path_mappings:
+          - agent_path: /anthropic/v1/messages
+            upstream_path: /v1/messages
+            methods: [POST]
+          - agent_path: /anthropic/v1/messages/count_tokens
+            upstream_path: /v1/messages/count_tokens
+            methods: [POST]
+        forwarded_agent_headers:
+          - accept
+          - anthropic-beta
+          - anthropic-version
+          - content-type
+          - user-agent
+        stripped_agent_headers:
+          - authorization
+          - cookie
+          - host
+          - proxy-authorization
+          - x-api-key
+        inbound_lease_header: x-api-key
+        inbound_lease_scheme: raw
+        injected_auth_header: x-api-key
+        injected_auth_scheme: raw
   pilot_selection_policy:
     format_version: "1"
     population: complete-candidate-to-sealed-identity-set

@@ -13,12 +13,20 @@ from stinger.benchmark.comparison import (
     build_paired_comparison,
     verify_paired_comparison,
 )
+from stinger.benchmark.credential_broker import (
+    CredentialBrokerConfiguration,
+    credential_identity_payloads,
+    provider_route,
+)
 from stinger.benchmark.protocol import (
     BenchmarkRunMetadata,
     BenchmarkRuntimeProvenance,
     BenchmarkSplit,
+    CredentialIsolationRuntimeProvenance,
     ProviderId,
     canonical_agent_configuration_fingerprint,
+    canonical_credential_isolation_policy_sha256,
+    compiled_credential_isolation_policy,
 )
 from stinger.benchmark.verification_image import (
     APPROVED_LINUX_ARM64_VERIFICATION_IMAGE_ID,
@@ -34,6 +42,32 @@ DIGEST_A = f"sha256:{'a' * 64}"
 DIGEST_B = APPROVED_LINUX_ARM64_VERIFICATION_IMAGE_ID
 
 
+def credential_pins(provider: ProviderId) -> tuple[str, str, str, str, str]:
+    """Return exact synthetic credential-isolation identities for one provider route."""
+    policy = compiled_credential_isolation_policy()
+    adapter = {
+        ProviderId.OPENAI: "codex",
+        ProviderId.ANTHROPIC: "claude-code",
+    }[provider]
+    route = provider_route(adapter, provider)
+    _, configuration, destinations, projection = credential_identity_payloads(
+        route=route,
+        broker=CredentialBrokerConfiguration(
+            image="stinger-runner:test",
+            image_digest=DIGEST_B,
+        ),
+        api_key_env=route.agent_credential_environment_name,
+        source_inventory_sha256=policy.broker_source_inventory_sha256,
+    )
+    return (
+        canonical_credential_isolation_policy_sha256(policy),
+        configuration,
+        destinations,
+        projection,
+        policy.broker_source_inventory_sha256,
+    )
+
+
 def test_machine_reproduced_status_uses_protocol_2_claim_wording() -> None:
     assert ComparisonStatus.MACHINE_REPRODUCED.value == "machine_reproduced"
     assert "independently_reproduced" not in {status.value for status in ComparisonStatus}
@@ -47,6 +81,7 @@ def metadata(provider: ProviderId, seed: int) -> BenchmarkRunMetadata:
         ProviderId.ANTHROPIC: "claude-code",
         ProviderId.GOOGLE: "aider",
     }[provider]
+    policy, broker, destinations, projection, source = credential_pins(provider)
     fingerprint = canonical_agent_configuration_fingerprint(
         provider=provider,
         model_id=model_id,
@@ -55,6 +90,7 @@ def metadata(provider: ProviderId, seed: int) -> BenchmarkRunMetadata:
         reasoning_effort="high",
         inference_settings={"temperature": 0.0},
         agent_container_digest=DIGEST_A,
+        credential_broker_configuration_sha256=broker,
     )
     return BenchmarkRunMetadata(
         provider=provider,
@@ -68,6 +104,12 @@ def metadata(provider: ProviderId, seed: int) -> BenchmarkRunMetadata:
         verification_image_digest=DIGEST_B,
         run_seed=seed,
         agent_configuration_fingerprint=fingerprint,
+        credential_isolation_policy_sha256=policy,
+        credential_broker_configuration_sha256=broker,
+        credential_allowed_destination_inventory_sha256=destinations,
+        credential_agent_projection_inventory_sha256=projection,
+        credential_broker_source_inventory_sha256=source,
+        credential_broker_image_digest=DIGEST_B,
     )
 
 
@@ -79,6 +121,7 @@ def runtime(provider: ProviderId) -> BenchmarkRuntimeProvenance:
         ProviderId.ANTHROPIC: "claude",
         ProviderId.GOOGLE: "aider",
     }[provider]
+    policy, broker, destinations, projection, source = credential_pins(provider)
     return BenchmarkRuntimeProvenance(
         requested_provider=provider,
         requested_model_id=model_id,
@@ -96,6 +139,16 @@ def runtime(provider: ProviderId) -> BenchmarkRuntimeProvenance:
         docker_client_sha256="c" * 64,
         docker_runtime_fingerprint_sha256="d" * 64,
         docker_runtime_claim_boundary=DOCKER_RUNTIME_CLAIM_BOUNDARY,
+        credential_isolation=CredentialIsolationRuntimeProvenance(
+            policy_sha256=policy,
+            broker_configuration_sha256=broker,
+            allowed_destination_inventory_sha256=destinations,
+            agent_projection_inventory_sha256=projection,
+            broker_source_inventory_sha256=source,
+            broker_image_id=DIGEST_B,
+            docker_runtime_fingerprint_sha256="d" * 64,
+            verified=True,
+        ),
         verified=True,
     )
 

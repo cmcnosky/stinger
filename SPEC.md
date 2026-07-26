@@ -182,16 +182,67 @@ one, the adapter drives the agent as a host subprocess with its cwd set — proc
 isolation, not containment — and this is a documented weakening rather than a compliance gap
 to gloss over. It has been observed in practice: a live Codex run under that mode read
 `~/.codex/memories/MEMORY.md` and pulled notes about an unrelated project into the recorded
-transcript. A contained agent MUST receive its credential and its configured `options` by
-name (`docker run --env NAME`), never as `NAME=VALUE`, because the invocation is recorded
-verbatim in the reproducibility package and visible in the host process list.
+transcript. For ordinary development, a contained agent MAY receive a raw credential and
+configured `options` by name (`docker run --env NAME`), never as `NAME=VALUE`, because the
+invocation is recorded verbatim in the reproducibility package and visible in the host
+process list. This is a development transport, not Protocol 2 credential isolation: the
+networked agent can read every forwarded value.
 
-`agent.credential_mount` is the single permitted exception to "only the workdir is mounted",
-for CLIs that authenticate from a file rather than an environment variable. It MUST be
-mounted read-only, at a fixed container path, and it MUST be a directory holding only
-credentials — pointing it at a real agent home directory reintroduces exactly the
-contamination containment exists to prevent. Whether one was mounted is part of the config
-fingerprint (§4); where it lives is not, so `rerun.sh` still reproduces across machines.
+`agent.credential_mount` is an ordinary-development exception to "only the workdir is
+mounted" for CLIs that authenticate from a file rather than an environment variable. It
+MUST be mounted read-only at a fixed container path and MUST contain only credentials;
+pointing it at a real agent home directory reintroduces exactly the contamination containment
+exists to prevent. Whether one was mounted is part of the development config fingerprint;
+where it lives is not, so `rerun.sh` still reproduces across machines. Protocol 2 MUST reject
+`credential_mount`, direct raw-credential forwarding into the agent, and caller-supplied
+environment `options` on a brokered run.
+
+A credentialed Protocol 2 agent MUST instead use the signed external broker policy. The raw
+provider credential MUST enter only a separate broker container. The agent container MUST
+join only one fresh Docker-internal network and receive an opaque, per-invocation lease in
+the CLI's expected credential environment variable. The non-secret broker route MUST be
+projected only through the provider mapping: Codex uses the signed `openai_base_url` CLI
+override and MUST NOT receive `OPENAI_BASE_URL`; Claude Code uses the
+`ANTHROPIC_BASE_URL` environment variable. The agent MUST receive no credential files or
+extra mounts. The broker MAY join the internal network and its normal outbound Docker
+network, but it MUST accept only the exact signed provider, HTTPS origin, POST path mappings,
+request headers, and lease-auth scheme; it MUST strip agent authorization/proxy headers,
+reject arbitrary
+methods, paths, destinations, redirects, and reflected credentials, and inject the raw
+provider credential only into the fixed upstream request.
+
+The fresh agent bridge MUST be Docker-internal, IPv4-only, and created with isolated IPv4
+gateway mode. Its IPAM record MUST expose a subnet but no host-facing gateway. The agent
+MUST have IPv4 and IPv6 packet forwarding disabled and MUST inherit no image healthcheck.
+Docker's embedded DNS MAY resolve the broker's exact network alias, but the agent's only DNS
+upstream MUST be `127.0.0.1`, with a root-only search domain and bounded timeout/attempts, so
+arbitrary external name resolution cannot become a route around the broker.
+
+Before agent launch, the harness MUST bind and verify the canonical policy, exact broker
+configuration, allowed-destination inventory, minimal projection inventory, broker source
+inventory, immutable protocol-approved broker image, and Docker runtime identity. It MUST
+also materialize and export the pinned agent image's final root filesystem, reject declared
+volumes, extra credential/proxy environment values, and any credential exposure. Before
+creating the network it MUST scan the final agent argv and the workdir's paths, symlink
+targets, and regular-file contents. It MUST scan canonical agent-image runtime metadata and
+the exported final root filesystem under the same policy. Every scan MUST reject the raw
+credential, lower/uppercase hexadecimal, padded/unpadded standard Base64, padded/unpadded
+URL-safe Base64, and percent-encoded forms. The root-filesystem scan MUST also reject every
+case-insensitive credential-path suffix frozen in the signed protocol and require the
+declared/default Codex or Claude config home to be absent or an empty directory. It MUST bind
+the resulting metadata/rootfs inventory hash.
+
+After every invocation the harness MUST verify the exact agent/broker/network identities and
+attachment, command/environment/mount/network inventories, disabled healthcheck, isolated
+gateway, IPv6 and DNS settings, broker audit, absence of encoded credential evidence or a
+bypass path, and removal of the agent container, broker container, and fresh network. Missing
+or conflicting evidence, any rejected broker request, or unverified cleanup resolves to
+`error`.
+
+The closed Protocol 2 provider route set currently contains only `codex`/OpenAI and
+`claude-code`/Anthropic. Any unsupported adapter/provider pair MUST fail before agent start.
+Because the publication baseline requires three providers, a third provider cannot count
+until its own exact route is added to a newly signed protocol policy.
 
 ## 6. Detectors (`detectors/base.py`) — mechanical cheat detection
 
@@ -465,8 +516,13 @@ escrow tree, sealed corpus, marker file, or leakage policy.
 `stinger.yaml` (see `config.py`) declares: the adapter + agent config, corpus path,
 reps, output dir, judge on/off, and the CI regression threshold. Benchmark-capable runs
 add a separately versioned protocol, provider/model/CLI/settings pins, Stinger commit,
-agent and verifier image digests, and a fixed run seed. Those fields do not change the
-frozen rubric and are optional for ordinary development runs.
+agent and verifier image digests, a fixed run seed, and an external broker image plus its
+immutable digest for every credentialed agent. The host-side raw credential source remains
+the named `api_key_env`; the brokered agent receives only the corresponding opaque lease and
+the route's non-secret broker location. Codex binds that location through the signed
+`openai_base_url` CLI override, not `OPENAI_BASE_URL`; Claude Code binds it through
+`ANTHROPIC_BASE_URL`. Those fields do not change the frozen rubric and are optional for
+ordinary development runs.
 
 For Protocol 2 benchmark operations, a verifier digest declaration is not sufficient. The
 signed protocol MUST bind the exact canonical `docker/runner.Dockerfile` plus complete
@@ -615,6 +671,16 @@ execution plan, a fresh evidence-only pre-invocation nonce, a post-classificatio
 binding the transcript/replay/diffs/final-tree/result, and the run-level invocation
 aggregate. The nonce MUST NOT enter the prompt, detector context, classifier, or score.
 Missing, extra, duplicated, or cloned invocation evidence fails closed.
+
+Every credentialed Protocol 2 invocation MUST additionally emit a closed
+`credential-isolation.receipt.json` bound to that invocation ID and exact runtime provenance.
+It commits to the signed policy, broker configuration, allowed destinations, minimal agent
+projection, broker source and immutable image, Docker runtime, prelaunch agent-image
+credential scan, agent/broker/network identities, command/environment/mount/network
+inventories, isolated bridge/DNS/IPv6/healthcheck state, broker audit, request counts, and
+verified cleanup. Its exact hash is included in the invocation receipt and run aggregate;
+missing, extra, duplicated, drifted, bypass-indicating, or noncanonical credential evidence
+fails escrow verification.
 
 For `codex` and `claude-code`, the receipt MUST parse exactly one structured provider
 session identifier from the raw transcript and those identifiers MUST be unique across the

@@ -45,6 +45,10 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from stinger.adapters.base import AgentRun
 from stinger.adapters.cli_base import CliAgentAdapter
 from stinger.adapters.factory import AdapterError, build_adapter
+from stinger.benchmark.credential_broker import (
+    CredentialIsolationInvocationReceipt,
+    agent_environment_names,
+)
 from stinger.benchmark.git_checkout import (
     GitCheckoutError,
     verify_loaded_stinger_implementation,
@@ -52,6 +56,7 @@ from stinger.benchmark.git_checkout import (
 from stinger.benchmark.protocol import (
     BenchmarkRuntimeProvenance,
     canonical_local_provider_binding_issues,
+    compiled_credential_isolation_policy,
     publication_pin_issues,
 )
 from stinger.config import RunConfig
@@ -68,14 +73,16 @@ from stinger.scenario.loader import Scenario, ScenarioLoadError, discover_scenar
 
 REPLAY_FORMAT_VERSION: Final = "1"
 REPLAY_RECORD_NAME: Final = "classification.replay.json"
-INVOCATION_RECEIPT_FORMAT_VERSION: Final = "1"
+INVOCATION_RECEIPT_FORMAT_VERSION: Final = "2"
 INVOCATION_RECEIPT_NAME: Final = "invocation.receipt.json"
 INVOCATION_CHALLENGE_FORMAT_VERSION: Final = "1"
 INVOCATION_CHALLENGE_NAME: Final = "invocation.challenge.json"
-INVOCATION_AGGREGATE_FORMAT_VERSION: Final = "1"
+INVOCATION_AGGREGATE_FORMAT_VERSION: Final = "2"
 INVOCATION_AGGREGATE_NAME: Final = "invocation.aggregate.json"
-REPRO_EVIDENCE_FORMAT_VERSION: Final = "3"
+REPRO_EVIDENCE_FORMAT_VERSION: Final = "4"
 REPRO_EVIDENCE_FORMAT_FILE: Final = "repro.format.version"
+CREDENTIAL_ISOLATION_RECEIPT_FORMAT_VERSION: Final = "1"
+CREDENTIAL_ISOLATION_RECEIPT_NAME: Final = "credential-isolation.receipt.json"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PYTEST_TIME_RE = re.compile(r"(?<=\bin )\d+(?:\.\d+)?s\b")
@@ -250,6 +257,24 @@ class InvocationContext(BaseModel):
         return value
 
 
+class CredentialIsolationReceipt(BaseModel):
+    """Context-bound wrapper around host-observed broker evidence for one invocation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    format_version: str = CREDENTIAL_ISOLATION_RECEIPT_FORMAT_VERSION
+    invocation_id: str
+    runtime_provenance_sha256: str
+    evidence: CredentialIsolationInvocationReceipt
+
+    @field_validator("invocation_id", "runtime_provenance_sha256")
+    @classmethod
+    def _valid_context_digest(cls, value: str) -> str:
+        if _SHA256_RE.fullmatch(value) is None:
+            raise ValueError("credential-isolation context identities must be sha256 values")
+        return value
+
+
 class InvocationReceipt(BaseModel):
     """Primary per-process event binding one planned invocation to its exact evidence."""
 
@@ -273,6 +298,7 @@ class InvocationReceipt(BaseModel):
     after_diff_sha256: str
     final_worktree_sha256: str
     result_sha256: str
+    credential_isolation_receipt_sha256: str
     execution_evidence_sha256: str
 
     @field_validator(
@@ -289,6 +315,7 @@ class InvocationReceipt(BaseModel):
         "after_diff_sha256",
         "final_worktree_sha256",
         "result_sha256",
+        "credential_isolation_receipt_sha256",
         "execution_evidence_sha256",
     )
     @classmethod
@@ -380,11 +407,13 @@ class InvocationAggregate(BaseModel):
     report_sha256: str
     replay_record_aggregate_sha256: str
     invocation_receipt_aggregate_sha256: str
+    credential_isolation_receipt_aggregate_sha256: str
     receipt_count: int
     invocation_ids: tuple[str, ...]
     invocation_challenge_nonce_sha256s: tuple[str, ...]
     provider_response_id_sha256s: tuple[str, ...]
     execution_evidence_sha256s: tuple[str, ...]
+    credential_isolation_receipt_sha256s: tuple[str, ...]
 
     @field_validator(
         "run_plan_id",
@@ -393,6 +422,7 @@ class InvocationAggregate(BaseModel):
         "report_sha256",
         "replay_record_aggregate_sha256",
         "invocation_receipt_aggregate_sha256",
+        "credential_isolation_receipt_aggregate_sha256",
     )
     @classmethod
     def _valid_aggregate_digest(cls, value: str) -> str:
@@ -405,6 +435,7 @@ class InvocationAggregate(BaseModel):
         "invocation_challenge_nonce_sha256s",
         "provider_response_id_sha256s",
         "execution_evidence_sha256s",
+        "credential_isolation_receipt_sha256s",
     )
     @classmethod
     def _valid_aggregate_digest_sequence(cls, values: tuple[str, ...]) -> tuple[str, ...]:
@@ -418,6 +449,15 @@ class InvocationAggregate(BaseModel):
         if value < 1:
             raise ValueError("invocation aggregate must contain at least one receipt")
         return value
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedCredentialIsolationReceipt:
+    """One isolation receipt parsed and hashed from the same exact byte snapshot."""
+
+    receipt: CredentialIsolationReceipt
+    canonical_bytes: bytes
+    sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -599,6 +639,58 @@ def load_invocation_challenge(path: Path) -> InvocationChallenge:
     return challenge
 
 
+def write_credential_isolation_receipt(
+    artifacts_dir: Path,
+    *,
+    context: InvocationContext,
+    evidence: CredentialIsolationInvocationReceipt,
+) -> Path:
+    """Atomically bind host-observed broker evidence to one planned invocation."""
+    receipt = CredentialIsolationReceipt(
+        invocation_id=context.invocation_id,
+        runtime_provenance_sha256=context.runtime_provenance_sha256,
+        evidence=evidence,
+    )
+    target = artifacts_dir / CREDENTIAL_ISOLATION_RECEIPT_NAME
+    _atomic_create(
+        target,
+        _canonical_model_bytes(receipt),
+        label="credential-isolation invocation receipt",
+    )
+    return target
+
+
+def load_credential_isolation_receipt(path: Path) -> CredentialIsolationReceipt:
+    """Load one exact canonical external-broker isolation receipt."""
+    return load_credential_isolation_receipt_snapshot(path).receipt
+
+
+def load_credential_isolation_receipt_snapshot(
+    path: Path,
+) -> VerifiedCredentialIsolationReceipt:
+    """Parse and hash one isolation receipt from a single validated file read."""
+    encoded = _read_regular(path, "credential-isolation invocation receipt")
+    try:
+        receipt = CredentialIsolationReceipt.model_validate_json(encoded)
+    except ValidationError:
+        raise ClassificationReplayError(
+            "credential-isolation invocation receipt failed closed schema validation"
+        ) from None
+    if receipt.format_version != CREDENTIAL_ISOLATION_RECEIPT_FORMAT_VERSION:
+        raise ClassificationReplayError(
+            "credential-isolation invocation receipt format is unsupported"
+        )
+    if encoded != _canonical_model_bytes(receipt):
+        raise ClassificationReplayError(
+            "credential-isolation invocation receipt is not canonical deterministic JSON"
+        )
+    return VerifiedCredentialIsolationReceipt(
+        receipt=receipt,
+        canonical_bytes=encoded,
+        sha256=_sha256(encoded),
+    )
+
+
 def write_invocation_receipt(
     artifacts_dir: Path,
     *,
@@ -629,6 +721,14 @@ def write_invocation_receipt(
         raise OSError("invocation transcript changed before receipt construction")
     before_diff = _read_regular_for_write(artifacts_dir / "before.diff", "before diff")
     after_diff = _read_regular_for_write(artifacts_dir / "after.diff", "after diff")
+    isolation_snapshot = load_credential_isolation_receipt_snapshot(
+        artifacts_dir / CREDENTIAL_ISOLATION_RECEIPT_NAME
+    )
+    _verify_credential_isolation_receipt(
+        isolation_snapshot.receipt,
+        context=context,
+        runtime=None,
+    )
     provider_response_id_sha256 = _provider_response_id_sha256(
         context.agent_adapter,
         transcript,
@@ -648,6 +748,7 @@ def write_invocation_receipt(
         "after_diff_sha256": _sha256(after_diff),
         "final_worktree_sha256": repo_state_sha256(final_worktree),
         "result_sha256": scenario_result_sha256(result),
+        "credential_isolation_receipt_sha256": isolation_snapshot.sha256,
     }
     receipt = InvocationReceipt.model_validate(
         {
@@ -730,7 +831,9 @@ def build_invocation_aggregate(
 
     receipt_entries: list[dict[str, object]] = []
     replay_entries: list[dict[str, object]] = []
+    isolation_entries: list[dict[str, object]] = []
     receipts: list[InvocationReceipt] = []
+    isolation_receipts: list[CredentialIsolationReceipt] = []
     for result in report.results:
         row = (result.scenario_id, result.repetition)
         context = expected_by_row.get(row)
@@ -742,17 +845,23 @@ def build_invocation_aggregate(
         receipt_path = run_dir / INVOCATION_RECEIPT_NAME
         verified_receipt = load_invocation_receipt_snapshot(receipt_path)
         receipt = verified_receipt.receipt
+        isolation_snapshot = load_credential_isolation_receipt_snapshot(
+            run_dir / CREDENTIAL_ISOLATION_RECEIPT_NAME
+        )
         _verify_invocation_receipt(
             receipt,
             context=context,
             run_dir=run_dir,
             result=result,
+            runtime=runtime,
+            isolation_snapshot=isolation_snapshot,
         )
         replay_bytes = _read_regular(
             run_dir / REPLAY_RECORD_NAME,
             "classification replay record",
         )
         receipts.append(receipt)
+        isolation_receipts.append(isolation_snapshot.receipt)
         receipt_entries.append(
             {
                 "invocation_id": receipt.invocation_id,
@@ -765,8 +874,18 @@ def build_invocation_aggregate(
                 "replay_record_sha256": _sha256(replay_bytes),
             }
         )
+        isolation_entries.append(
+            {
+                "invocation_id": receipt.invocation_id,
+                "credential_isolation_receipt_sha256": isolation_snapshot.sha256,
+            }
+        )
 
-    _require_unique_invocations(receipts, agent_adapter=config.agent.adapter)
+    _require_unique_invocations(
+        receipts,
+        isolation_receipts=isolation_receipts,
+        agent_adapter=config.agent.adapter,
+    )
     first = receipts[0]
     return InvocationAggregate(
         run_plan_id=first.run_plan_id,
@@ -776,6 +895,9 @@ def build_invocation_aggregate(
         replay_record_aggregate_sha256=_sha256(_canonical_json({"replay_records": replay_entries})),
         invocation_receipt_aggregate_sha256=_sha256(
             _canonical_json({"invocation_receipts": receipt_entries})
+        ),
+        credential_isolation_receipt_aggregate_sha256=_sha256(
+            _canonical_json({"credential_isolation_receipts": isolation_entries})
         ),
         receipt_count=len(receipts),
         invocation_ids=tuple(receipt.invocation_id for receipt in receipts),
@@ -788,6 +910,9 @@ def build_invocation_aggregate(
             if receipt.provider_response_id_sha256 is not None
         ),
         execution_evidence_sha256s=tuple(receipt.execution_evidence_sha256 for receipt in receipts),
+        credential_isolation_receipt_sha256s=tuple(
+            receipt.credential_isolation_receipt_sha256 for receipt in receipts
+        ),
     )
 
 
@@ -1358,12 +1483,85 @@ def _ordered_scenario_ids(report: Report) -> tuple[str, ...]:
     return tuple(ordered)
 
 
+def _verify_credential_isolation_receipt(
+    receipt: CredentialIsolationReceipt,
+    *,
+    context: InvocationContext,
+    runtime: BenchmarkRuntimeProvenance | None,
+) -> None:
+    """Cross-bind one external broker receipt to its plan and observed runtime."""
+    if receipt.invocation_id != context.invocation_id:
+        raise ClassificationReplayError(
+            "credential-isolation receipt disagrees with invocation identity"
+        )
+    if receipt.runtime_provenance_sha256 != context.runtime_provenance_sha256:
+        raise ClassificationReplayError(
+            "credential-isolation receipt disagrees with runtime provenance"
+        )
+    if runtime is None:
+        return
+    isolation = runtime.credential_isolation
+    if isolation is None or not isolation.verified:
+        raise ClassificationReplayError(
+            "credential-isolation runtime provenance is missing or unverified"
+        )
+    evidence = receipt.evidence
+    expected = {
+        "policy_sha256": isolation.policy_sha256,
+        "broker_configuration_sha256": isolation.broker_configuration_sha256,
+        "allowed_destination_inventory_sha256": (isolation.allowed_destination_inventory_sha256),
+        "agent_projection_inventory_sha256": (isolation.agent_projection_inventory_sha256),
+        "broker_source_inventory_sha256": isolation.broker_source_inventory_sha256,
+        "broker_image_id": isolation.broker_image_id,
+        "docker_runtime_fingerprint_sha256": (isolation.docker_runtime_fingerprint_sha256),
+    }
+    actual = {
+        "policy_sha256": evidence.policy_sha256,
+        "broker_configuration_sha256": evidence.broker_configuration_sha256,
+        "allowed_destination_inventory_sha256": (evidence.allowed_destination_inventory_sha256),
+        "agent_projection_inventory_sha256": (evidence.agent_projection_inventory_sha256),
+        "broker_source_inventory_sha256": evidence.broker_source_inventory_sha256,
+        "broker_image_id": evidence.broker_image_id,
+        "docker_runtime_fingerprint_sha256": evidence.docker_runtime_fingerprint_sha256,
+    }
+    if actual != expected:
+        raise ClassificationReplayError(
+            "credential-isolation receipt disagrees with exact broker runtime identity"
+        )
+    if evidence.docker_client_sha256 != runtime.docker_client_sha256:
+        raise ClassificationReplayError(
+            "credential-isolation receipt disagrees with Docker client identity"
+        )
+    if evidence.broker_image_repo_digests != isolation.broker_image_repo_digests:
+        raise ClassificationReplayError(
+            "credential-isolation receipt disagrees with broker image repository identities"
+        )
+    routes = tuple(
+        route
+        for route in compiled_credential_isolation_policy().provider_routes
+        if route.provider is runtime.requested_provider
+        and route.agent_adapter == context.agent_adapter
+    )
+    if len(routes) != 1:
+        raise ClassificationReplayError(
+            "credential-isolation receipt has no protocol-approved provider route"
+        )
+    route = routes[0]
+    expected_environment_names = agent_environment_names(route)
+    if evidence.agent_environment_names != expected_environment_names:
+        raise ClassificationReplayError(
+            "credential-isolation receipt agent projection is not minimal"
+        )
+
+
 def _verify_invocation_receipt(
     receipt: InvocationReceipt,
     *,
     context: InvocationContext,
     run_dir: Path,
     result: ScenarioResult,
+    runtime: BenchmarkRuntimeProvenance,
+    isolation_snapshot: VerifiedCredentialIsolationReceipt,
 ) -> None:
     """Rebuild one receipt from exact files and the deterministic plan."""
     transcript = _read_regular(run_dir / "transcript.txt", "invocation transcript")
@@ -1377,6 +1575,11 @@ def _verify_invocation_receipt(
     )
     before_diff = _read_regular(run_dir / "before.diff", "before diff")
     after_diff = _read_regular(run_dir / "after.diff", "after diff")
+    _verify_credential_isolation_receipt(
+        isolation_snapshot.receipt,
+        context=context,
+        runtime=runtime,
+    )
     try:
         transcript_text = transcript.decode("utf-8")
     except UnicodeDecodeError:
@@ -1399,6 +1602,7 @@ def _verify_invocation_receipt(
         "after_diff_sha256": _sha256(after_diff),
         "final_worktree_sha256": repo_state_sha256(capture(run_dir / "workdir")),
         "result_sha256": scenario_result_sha256(result),
+        "credential_isolation_receipt_sha256": isolation_snapshot.sha256,
     }
     expected = InvocationReceipt.model_validate(
         {
@@ -1418,6 +1622,7 @@ def _verify_invocation_receipt(
 def _require_unique_invocations(
     receipts: Sequence[InvocationReceipt],
     *,
+    isolation_receipts: Sequence[CredentialIsolationReceipt] | None = None,
     agent_adapter: str,
 ) -> None:
     """Reject duplicate plan events, provider sessions, or cloned execution evidence."""
@@ -1440,6 +1645,30 @@ def _require_unique_invocations(
         raise ClassificationReplayError(
             "canonical benchmark adapter transcript lacks a provider response identity"
         )
+    if isolation_receipts is None:
+        return
+    if len(isolation_receipts) != len(receipts):
+        raise ClassificationReplayError(
+            "benchmark invocation isolation receipt coverage is incomplete"
+        )
+    unique_isolation_fields = {
+        "broker lease": [item.evidence.broker_lease_sha256 for item in isolation_receipts],
+        "agent container": [item.evidence.agent_container_id_sha256 for item in isolation_receipts],
+        "broker container": [
+            item.evidence.broker_container_id_sha256 for item in isolation_receipts
+        ],
+        "isolated network id": [
+            item.evidence.internal_network_id_sha256 for item in isolation_receipts
+        ],
+        "isolated network name": [
+            item.evidence.internal_network_name_sha256 for item in isolation_receipts
+        ],
+    }
+    for label, values in unique_isolation_fields.items():
+        if len(set(values)) != len(values):
+            raise ClassificationReplayError(
+                f"benchmark invocation {label} identities are not unique"
+            )
 
 
 def _require_challenge_context(
@@ -1598,6 +1827,8 @@ def _sha256(content: bytes) -> str:
 
 
 __all__ = [
+    "CREDENTIAL_ISOLATION_RECEIPT_FORMAT_VERSION",
+    "CREDENTIAL_ISOLATION_RECEIPT_NAME",
     "INVOCATION_AGGREGATE_FORMAT_VERSION",
     "INVOCATION_AGGREGATE_NAME",
     "INVOCATION_CHALLENGE_FORMAT_VERSION",
@@ -1611,17 +1842,21 @@ __all__ = [
     "AgentRunObservation",
     "ClassificationReplayError",
     "ClassificationReplayRecord",
+    "CredentialIsolationReceipt",
     "InvocationAggregate",
     "InvocationChallenge",
     "InvocationContext",
     "InvocationReceipt",
     "ReplayExecObservation",
+    "VerifiedCredentialIsolationReceipt",
     "VerifiedInvocationAggregate",
     "VerifiedInvocationReceipt",
     "benchmark_runtime_provenance_sha256",
     "build_invocation_aggregate",
     "build_invocation_plan",
     "load_classification_replay_record",
+    "load_credential_isolation_receipt",
+    "load_credential_isolation_receipt_snapshot",
     "load_invocation_aggregate",
     "load_invocation_aggregate_snapshot",
     "load_invocation_challenge",
@@ -1633,6 +1868,7 @@ __all__ = [
     "verify_invocation_aggregate_snapshot",
     "verify_report_classifications_from_escrow",
     "write_classification_replay_record",
+    "write_credential_isolation_receipt",
     "write_invocation_aggregate",
     "write_invocation_challenge",
     "write_invocation_receipt",

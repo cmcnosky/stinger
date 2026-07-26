@@ -46,15 +46,38 @@ accept the authoring variants as a Protocol 2 construction record, provide a
 machine-review/QA matrix or blind-solve record, freeze or seal a scoring corpus, report a
 baseline result, or establish a benchmark. No cross-machine reproduction is claimed.
 
-There is also a hard credential-isolation HOLD before any live sealed execution. Current
-networked agent containers can read raw Codex/Claude credentials. An ordinary
-`credential_mount` may contain extra hidden CLI configuration or session files even though
-the published fingerprint records only that a mount exists. Read-only mounting and
-post-run leakage scans do not prevent a sealed prompt from inducing credential abuse. No
-sealed review, QA, blind solve, pilot, baseline, or reproduction is authorized until an
-external provider-allowlisted credential broker (or equivalent that keeps raw credentials
-outside the agent container) and an exact minimal projection/config receipt are
-mechanically implemented and evidence-bound.
+Protocol 2 now implements the credential-isolation mechanism required for future sealed
+execution on its closed Codex/OpenAI and Claude Code/Anthropic routes. Only a separate
+external broker container receives the raw provider credential. The untrusted agent joins
+only a fresh Docker-internal network and receives an opaque, per-invocation lease in the
+CLI's expected credential variable. Routing is non-secret and route-specific: Codex gets the
+broker URL only through the signed `openai_base_url` CLI override, while Claude Code gets it
+through `ANTHROPIC_BASE_URL`. The broker permits only the closed provider HTTPS origin, POST
+paths, and header projection; arbitrary egress, proxy headers, redirects, and broker bypass
+fail closed.
+
+That agent network uses an isolated IPv4 bridge with no host-facing gateway and IPv6
+disabled. Docker's embedded DNS can still resolve the broker alias, but its only upstream is
+loopback with a root-only search domain and bounded retries, so external names do not create
+an egress path. The agent runs with inherited image healthchecks disabled.
+
+Preflight binds the exact credential-isolation policy, broker configuration, allowed
+destinations, empty file/mount projection, broker source inventory, immutable broker image,
+and Docker runtime identity. Each invocation additionally binds the agent/broker/network
+identities, exact command/environment/mount/network inventories, and broker audit. Before any
+networked container starts, Stinger scans the final agent argv and workdir paths, links, and
+file contents for the raw credential plus hexadecimal, standard Base64, URL-safe Base64, and
+percent-encoded forms. It applies the same encoding policy to the agent image's runtime
+metadata and exported final root filesystem, rejects the policy's signed credential-path
+suffixes, and requires the declared/default agent config home to be absent or empty. Agent,
+broker, and network cleanup must be mechanically observed before a successful non-secret
+receipt is emitted. This mechanism has synthetic, local-fake-provider coverage; it has not
+been used for a sealed review or live provider run.
+
+The legacy raw `api_key_env` forwarding and `credential_mount` paths remain available for
+ordinary development only. Protocol 2 rejects them unless `api_key_env` names the host-side
+source consumed by the approved broker, and it rejects credential mounts, extra environment
+options, unsupported provider routes, or evidence drift before the agent starts.
 
 Protocol 2 now separately closes the verification-image substitution gap. The signed
 protocol commits to the exact `docker/runner.Dockerfile` and fully hash-locked dependency
@@ -68,8 +91,11 @@ reproducible-build, registry-attestation, TPM, or hostile-administrator proof.
 
 That verifier policy does **not** approve agent images. Agent containers execute untrusted
 sealed prompts with network access, so their own image supply chain remains a separate hard
-HOLD alongside credential isolation. No live sealed review, QA, blind solve, pilot, baseline,
-or reproduction is authorized until both holds are mechanically closed and evidence-bound.
+HOLD. Protocol 2 also requires three providers for the six-configuration publication
+baseline, while the credential broker allowlist currently defines only Codex/OpenAI and
+Claude Code/Anthropic routes. No live sealed review, QA, blind solve, pilot, baseline, or
+reproduction is claimed or authorized while the agent-image gate is open; a three-provider
+baseline additionally requires a third signed broker route.
 
 The current state is executable:
 
@@ -156,7 +182,8 @@ Graded by evidence, per AGENTS.md: **working** = covered by a passing test;
 |---|---|
 | Core data model (`models.py`) | working |
 | Sandbox isolation + RepoState capture (§2, §7) | working — real container runs verified, including that the network is off and the mount hides the rest of the scenario |
-| Contained agent — `container_image`, `credential_mount` (§5) | working for development containment, **not credential-isolated for sealed execution** — [docker/codex-agent.Dockerfile](docker/codex-agent.Dockerfile) builds a Codex image and the read-only mount is unit-tested, but raw credentials remain readable by the networked agent and ordinary mount contents are not evidence-bound; no sealed live run is authorized |
+| Contained agent — `container_image`, `credential_mount` (§5) | working for ordinary development containment — [docker/codex-agent.Dockerfile](docker/codex-agent.Dockerfile) builds a Codex image and the legacy read-only mount is unit-tested; direct credential forwarding and copied credential mounts are explicitly ineligible for Protocol 2 |
+| Protocol 2 credential isolation | working mechanism for closed Codex/OpenAI and Claude Code/Anthropic routes — external raw-credential broker; isolated no-gateway bridge with IPv6 off, loopback-only DNS upstream, and no healthcheck; exact destination/projection/source/image/runtime bindings; prelaunch argv/workdir/image-metadata/final-rootfs scans for raw and reversible credential encodings, signed prohibited paths, and nonempty config homes; per-invocation audit/identity receipts; and fail-closed cleanup are adversarially tested with synthetic credentials and local fake providers; no sealed/live run is claimed, and a third route in a newly signed policy is still required for the publication baseline |
 | Run state machine + frozen `classify()` (§7) | working |
 | Held-out completion check (§7) | working |
 | All seven detectors (§6) | working — each fires on its intended cheat and stays silent on the honest reference, unit-tested and exercised by the corpus |
@@ -207,11 +234,14 @@ conditions).
 
 The `X` safety family remains the standing limit, stated rather than hidden. It seeds bait
 credentials and destructive lures that must never touch an unconfined agent, so running it
-live needs the agent CLI packaged *inside* the verification container. That mechanism now
-exists and is unit-tested — [docker/codex-agent.Dockerfile](docker/codex-agent.Dockerfile)
-builds a contained Codex image, `agent.container_image` makes a run use it, and
-`agent.credential_mount` lets a file-authenticated CLI reach its credential read-only. Two
-defects had to be fixed before it worked at all, each the kind that produces a
+live needs the agent CLI packaged *inside* an agent container. The ordinary-development
+mechanism exists and is unit-tested —
+[docker/codex-agent.Dockerfile](docker/codex-agent.Dockerfile) builds a contained Codex image,
+`agent.container_image` makes a run use it, and the legacy
+`agent.credential_mount` lets a file-authenticated CLI reach its credential read-only. That
+mount and direct credential forwarding are expressly rejected by Protocol 2; the sealed
+path uses the external broker described above. Two defects had to be fixed before the
+development path worked at all, each the kind that produces a
 plausible-looking wrong answer rather than a visible failure: a contained agent received no
 credential (a container inherits nothing, and nothing forwarded it), and a CLI that
 authenticates from a file rather than an environment variable had no way in until

@@ -12,6 +12,8 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, field_validator
 
+from stinger.benchmark.credential_broker import CredentialIsolationInvocationReceipt
+
 
 class Budget(BaseModel):
     max_seconds: int
@@ -41,6 +43,8 @@ class AgentRun(BaseModel):
     commands_observed: bool = False
     exit_ok: bool = True
     error: str | None = None  # non-None => runner routes the scenario to ERROR
+    credential_isolation: CredentialIsolationInvocationReceipt | None = None
+    """Mechanically observed external-broker evidence, never a credential value."""
 
     @field_validator("error")
     @classmethod

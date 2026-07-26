@@ -18,6 +18,7 @@ from stinger.adapters.cli_base import (
     CliCapture,
     last_paragraph,
 )
+from stinger.benchmark.credential_broker import agent_base_url_config_argv, provider_route
 
 __all__ = ["CodexAdapter"]
 
@@ -95,9 +96,19 @@ class CodexAdapter(CliAgentAdapter):
             "--sandbox",
             sandbox,
         ]
+        if self.config.credential_broker is not None:
+            argv += ["--ignore-user-config", "--strict-config"]
         if self.config.model is not None:
             argv += ["--model", self.config.model]
-        return [*argv, *self.settings_argv(), prompt]
+        settings = self.settings_argv()
+        routing: tuple[str, ...] = ()
+        if self.config.credential_broker is not None:
+            route = provider_route(self.config.adapter, self.config.provider)
+            routing = agent_base_url_config_argv(route)
+        # The signed broker route is deliberately the final config override. Caller-supplied
+        # settings are validated against routing/auth keys, and none can take precedence over
+        # this exact built-in OpenAI provider base URL.
+        return [*argv, *settings, *routing, "--", prompt]
 
     def parse(self, capture: CliCapture) -> AgentRun:
         """Recover the final message and executed commands from the JSONL event stream."""

@@ -4,22 +4,33 @@ These commands operate only after candidate construction exists. They do not gra
 eligibility, change the frozen score, or turn the public 30-scenario suite into headline
 benchmark evidence.
 
-> **Credential-isolation HOLD:** Do not run any live sealed machine review, QA attempt,
-> blind solve, pilot, baseline, or reproduction with the current contained-agent credential
-> path. Raw Codex/Claude credentials are currently readable inside a networked agent
-> container. Ordinary `credential_mount` directories are also copied wholesale while
-> published identity binds only mount presence, so unrecorded CLI configuration or session
-> files can affect execution. Read-only mounts and post-run scans do not prevent credential
-> use or exfiltration. A provider-allowlisted external credential broker (or equivalent that
-> keeps raw credentials outside the container) and an exact minimal projection/config
-> receipt must be mechanically implemented and evidence-bound first.
+> **Credential-isolation mechanism implemented; no sealed run claimed:** Protocol 2 rejects
+> ordinary direct credential forwarding and `credential_mount`. Its closed Codex/OpenAI and
+> Claude Code/Anthropic paths place the raw credential only in an external broker container;
+> the untrusted agent receives an opaque per-invocation lease on a fresh Docker-internal
+> network. Codex routing is the signed `openai_base_url` CLI override, never
+> `OPENAI_BASE_URL`; Claude Code routing is `ANTHROPIC_BASE_URL`. Policy, broker
+> configuration, exact destination and empty file/mount projection, broker source/image,
+> and Docker runtime are mechanically bound. The agent runs on an isolated IPv4 bridge with
+> no host gateway or IPv6, resolves only the broker alias through Docker's embedded DNS with
+> loopback-only upstream resolution, and has inherited image healthchecks disabled. Before
+> launch, Stinger rejects raw, hex, standard or URL-safe Base64, and percent-encoded credential
+> forms in the final argv, workdir paths/links/files, image metadata, or exported final rootfs;
+> signed prohibited credential-path suffixes and a nonempty agent config home also fail
+> closed.
+> Per-invocation identities/audit and cleanup are evidence-bound. Tests use only synthetic
+> credentials and local fake providers. No live provider or sealed review, QA, blind solve,
+> pilot, baseline, or reproduction has been run or is claimed.
 
 > **Agent-image supply-chain HOLD:** The signed Protocol 2 verification-image policy binds
 > only the exact network-disabled verifier Dockerfile, hashed dependency lock, platform, and
-> immutable image ID. It does not approve the networked agent images that execute sealed
-> prompts. Do not run live sealed work until those agent bytes have their own signed,
-> mechanically verified source/attestation policy. The verifier policy proves an observation
-> through the bounded Docker daemon/admin boundary, not reproducible build provenance.
+> immutable image ID; the broker reuses a protocol-approved immutable image to execute its
+> separately source-bound server. This does not approve the networked agent images that
+> execute sealed prompts. Do not run live sealed work until those agent bytes have their own
+> signed, mechanically verified source/attestation policy. The six-configuration baseline
+> also requires three providers, but only two broker routes are defined today; a third route
+> requires a newly signed policy. The verifier policy proves an observation through the
+> bounded Docker daemon/admin boundary, not reproducible build provenance.
 
 ## Protocol trust
 
@@ -541,6 +552,19 @@ planned row to its transcript, replay record, diffs, final worktree state, and r
 Escrow verification requires complete coverage and rejects duplicate invocation IDs,
 challenge commitments, execution-evidence commitments, and supported provider response IDs.
 The random challenge is never placed in the prompt and never affects scoring.
+
+Every brokered invocation also creates `credential-isolation.receipt.json`. It is bound to
+the same invocation ID and runtime-provenance hash and records only non-secret commitments:
+the signed policy; exact broker configuration, source, immutable image, allowed destination,
+and minimal agent projection; Docker runtime; raw/hex/Base64/URL-safe-Base64/percent scan of
+the final argv, workdir, image metadata, and exported final rootfs; signed prohibited-path and
+empty-config-home checks; agent/broker/network, command, environment, mount, and attachment
+inventories; isolated gateway, IPv6, DNS, and disabled-healthcheck state; broker audit/counts;
+and verified cleanup. `invocation.receipt.json` binds its exact file hash, and the run
+aggregate binds the complete ordered set. Missing, extra, duplicated, noncanonical, drifted,
+rejected-request, encoded-credential, bypass, arbitrary-egress, or cleanup-failure evidence
+is fatal. The receipt does not turn the still-unapproved agent image into a supply-chain
+claim.
 
 Codex and Claude Code transcripts must each contain one unique structured provider session
 identifier. Aider exposes no equivalent canonical provider-side identifier, so a valid
