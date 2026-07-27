@@ -16,13 +16,13 @@ import subprocess
 import tarfile
 import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import quote_from_bytes
+from urllib.parse import quote_from_bytes, unquote_to_bytes
 from uuid import uuid4
 
 import pytest
@@ -47,6 +47,12 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 DOCKER_TEST_IMAGE = "stinger-runner:1"
 REQUIRE_REAL_DOCKER_TESTS_ENV = "STINGER_REQUIRE_REAL_DOCKER_TESTS"
 RAW_CREDENTIAL = "synthetic/raw+provider=credential%value-0123456789~~~???"
+CASE_SENSITIVE_PERCENT_CREDENTIAL = "synthetic/raw+provider=Credential%value"
+JSON_ESCAPED_CREDENTIALS = (
+    'synthetic"quoted-credential',
+    "synthetic\\backslash-credential",
+    "synthetic-\N{LATIN SMALL LETTER E WITH ACUTE}-credential",
+)
 BROKER_LEASE = "synthetic-opaque-broker-lease-abcdefghijklmnopqrstuvwxyz"
 APPROVED_AGENT_PATH = "/openai/v1/responses"
 APPROVED_UPSTREAM_PATH = "/v1/responses"
@@ -224,6 +230,75 @@ class _LocalBroker:
             connection.close()
 
 
+@dataclass(frozen=True, slots=True)
+class _SilentTCPUpstream:
+    """Plain loopback listener that records TLS bytes and observes peer cancellation."""
+
+    port: int
+    accepted: threading.Event
+    bytes_received: threading.Event
+    peer_closed: threading.Event
+    received: bytearray
+
+
+@contextmanager
+def _silent_tcp_upstream() -> Iterator[_SilentTCPUpstream]:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(0.1)
+    stop = threading.Event()
+    accepted = threading.Event()
+    bytes_received = threading.Event()
+    peer_closed = threading.Event()
+    received = bytearray()
+
+    def serve() -> None:
+        connection: socket.socket | None = None
+        try:
+            while not stop.is_set():
+                try:
+                    connection, _address = listener.accept()
+                    break
+                except TimeoutError:
+                    continue
+            if connection is None:
+                return
+            accepted.set()
+            connection.settimeout(0.05)
+            while not stop.is_set():
+                try:
+                    chunk = connection.recv(64 * 1024)
+                except TimeoutError:
+                    continue
+                except OSError:
+                    return
+                if not chunk:
+                    peer_closed.set()
+                    return
+                received.extend(chunk)
+                bytes_received.set()
+        finally:
+            if connection is not None:
+                connection.close()
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    try:
+        yield _SilentTCPUpstream(
+            port=listener.getsockname()[1],
+            accepted=accepted,
+            bytes_received=bytes_received,
+            peer_closed=peer_closed,
+            received=received,
+        )
+    finally:
+        stop.set()
+        listener.close()
+        worker.join(timeout=2)
+
+
 @contextmanager
 def _running_local_broker(
     tmp_path: Path,
@@ -235,6 +310,7 @@ def _running_local_broker(
     client_timeout_seconds: float | None = None,
     absolute_timeout_seconds: float | None = None,
     provider_name: str = "openai",
+    upstream_origin: str | None = None,
 ) -> Iterator[_LocalBroker]:
     """Run the real broker handler against a loopback-only fake provider."""
 
@@ -258,7 +334,7 @@ def _running_local_broker(
     config_path = root / "config.json"
     audit_path = root / "audit.jsonl"
     config = _test_configuration(
-        f"http://127.0.0.1:{provider.server_address[1]}",
+        upstream_origin or f"http://127.0.0.1:{provider.server_address[1]}",
         provider=provider_name,
     )
     _write_configuration(config_path, config)
@@ -536,7 +612,106 @@ def _encoded_secret(kind: str, raw: bytes) -> bytes:
         return quote_from_bytes(raw).encode("ascii")
     if kind == "lower-path-percent":
         return quote_from_bytes(raw).lower().encode("ascii")
+    if kind in {"mixed-percent", "fully-mixed-percent"}:
+        parts: list[bytes] = []
+        for index, value in enumerate(raw):
+            if kind == "mixed-percent" and index % 3 == 1:
+                parts.append(bytes((value,)))
+                continue
+            format_specifier = "02x" if index % 2 == 0 else "02X"
+            parts.append(f"%{format(value, format_specifier)}".encode("ascii"))
+        return b"".join(parts)
     raise AssertionError(f"unsupported encoding fixture: {kind}")
+
+
+@pytest.mark.parametrize(
+    "matcher",
+    (
+        broker_controller._contains_percent_encoded_credential,
+        broker_server._contains_percent_encoded_credential,
+    ),
+    ids=("controller", "broker"),
+)
+def test_mixed_percent_matcher_explores_ambiguous_literal_boundaries(
+    matcher: Callable[[bytes, bytes], bool],
+) -> None:
+    """Context and credential ``%HH`` bytes cannot force a greedy false negative."""
+    boundary_raw = b"abCredential-boundary-0123456789"
+    boundary_reflection = (
+        b"%" + boundary_raw[:2] + _encoded_secret("fully-mixed-percent", boundary_raw[2:])
+    )
+    assert boundary_raw not in boundary_reflection
+    assert matcher(boundary_reflection, boundary_raw)
+
+    literal_triplet_raw = b"synthetic%2Fcredential-0123456789"
+    triplet_offset = literal_triplet_raw.index(b"%2F")
+    literal_triplet_reflection = (
+        _encoded_secret("fully-mixed-percent", literal_triplet_raw[:triplet_offset])
+        + b"%2F"
+        + _encoded_secret("fully-mixed-percent", literal_triplet_raw[triplet_offset + 3 :])
+    )
+    assert literal_triplet_raw not in literal_triplet_reflection
+    assert matcher(literal_triplet_reflection, literal_triplet_raw)
+
+
+@pytest.mark.parametrize(
+    "matcher",
+    (
+        broker_controller._contains_percent_encoded_credential,
+        broker_server._contains_percent_encoded_credential,
+    ),
+    ids=("controller", "broker"),
+)
+def test_mixed_percent_matcher_repeated_prefix_is_bounded(
+    matcher: Callable[[bytes, bytes], bool],
+) -> None:
+    """The maximum credential/response extrapolation stays below the deadline."""
+    raw = b"a" * (broker_server.MAX_RAW_CREDENTIAL_BYTES - 1) + b"b"
+    repeated_prefix = b"a" * (256 * 1024)
+    started = time.monotonic()
+    assert not matcher(repeated_prefix, raw)
+    elapsed = time.monotonic() - started
+    maximum_response_extrapolation = elapsed * (
+        broker_server.MAX_RESPONSE_BYTES / len(repeated_prefix)
+    )
+    assert maximum_response_extrapolation < broker_server.CONNECTION_DEADLINE_SECONDS
+
+
+def test_broker_percent_matcher_polls_absolute_deadline() -> None:
+    """Long reflection scans cooperatively stop at the source-pinned watchdog."""
+    polls = 0
+
+    def deadline_expired() -> bool:
+        nonlocal polls
+        polls += 1
+        return polls == 3
+
+    with pytest.raises(broker_server._CredentialScanCancelled):
+        broker_server._contains_percent_encoded_credential(
+            b"a" * (64 * 1024),
+            b"a" * (broker_server.MAX_RAW_CREDENTIAL_BYTES - 1) + b"b",
+            deadline_expired=deadline_expired,
+        )
+    assert polls == 3
+
+
+@pytest.mark.parametrize(
+    ("size", "accepted"),
+    ((15, False), (16, True), (16 * 1024, True), (16 * 1024 + 1, False)),
+)
+def test_raw_credential_byte_bounds_are_identical_at_controller_and_broker(
+    monkeypatch: pytest.MonkeyPatch,
+    size: int,
+    accepted: bool,
+) -> None:
+    """Both trusted processes enforce the source-pinned UTF-8 credential bounds."""
+    raw_credential = "x" * size
+    assert broker_server._raw_credential_is_valid(raw_credential) is accepted
+    if accepted:
+        _controller_session(monkeypatch, raw_credential=raw_credential)
+    else:
+        with pytest.raises(broker_controller.CredentialBrokerError, match="canonical secret"):
+            _controller_session(monkeypatch, raw_credential=raw_credential)
 
 
 @pytest.mark.parametrize(
@@ -553,6 +728,8 @@ def _encoded_secret(kind: str, raw: bytes) -> bytes:
         "lower-percent",
         "path-percent",
         "lower-path-percent",
+        "mixed-percent",
+        "fully-mixed-percent",
     ),
 )
 def test_reflected_raw_or_reversibly_encoded_credential_is_rejected(
@@ -560,9 +737,15 @@ def test_reflected_raw_or_reversibly_encoded_credential_is_rejected(
     encoding: str,
 ) -> None:
     """Provider responses cannot turn the broker into a credential read primitive."""
-    reflected = _encoded_secret(encoding, RAW_CREDENTIAL.encode("utf-8"))
+    raw_credential = (
+        CASE_SENSITIVE_PERCENT_CREDENTIAL
+        if encoding in {"mixed-percent", "fully-mixed-percent"}
+        else RAW_CREDENTIAL
+    )
+    reflected = _encoded_secret(encoding, raw_credential.encode("utf-8"))
     with _running_local_broker(
         tmp_path,
+        raw_credential=raw_credential,
         response_body=b'{"reflection":"' + reflected + b'"}\n',
     ) as broker:
         status, _, body = broker.request()
@@ -573,11 +756,22 @@ def test_reflected_raw_or_reversibly_encoded_credential_is_rejected(
         assert event["reason"] == "upstream reflected provider credential"
 
 
-def test_reflected_credential_in_upstream_header_is_rejected(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "encoding",
+    ("base64", "mixed-percent", "fully-mixed-percent"),
+)
+def test_reflected_credential_in_upstream_header_is_rejected(
+    tmp_path: Path,
+    encoding: str,
+) -> None:
     """Response-header reflection is held to the same non-disclosure rule as the body."""
-    reflected = base64.b64encode(RAW_CREDENTIAL.encode()).decode("ascii")
+    reflected = _encoded_secret(
+        encoding,
+        CASE_SENSITIVE_PERCENT_CREDENTIAL.encode("utf-8"),
+    ).decode("ascii")
     with _running_local_broker(
         tmp_path,
+        raw_credential=CASE_SENSITIVE_PERCENT_CREDENTIAL,
         response_headers=(("X-Provider-Debug", reflected),),
     ) as broker:
         status, headers, body = broker.request()
@@ -585,6 +779,28 @@ def test_reflected_credential_in_upstream_header_is_rejected(tmp_path: Path) -> 
         assert reflected.encode() not in body
         assert all(reflected not in value for _, value in headers)
         assert _audit_events(broker.audit_path)[-1]["decision"] == "rejected"
+
+
+@pytest.mark.parametrize("raw_credential", JSON_ESCAPED_CREDENTIALS)
+def test_reflected_structured_header_credential_is_rejected_before_json_escaping(
+    tmp_path: Path,
+    raw_credential: str,
+) -> None:
+    """Parsed header values are scanned semantically before JSON escaping hides bytes."""
+    serialized = broker_server._canonical_bytes((("X-Provider-Debug", raw_credential),))
+    assert raw_credential.encode("utf-8") not in serialized
+    with _running_local_broker(
+        tmp_path,
+        raw_credential=raw_credential,
+        response_headers=(("X-Provider-Debug", raw_credential),),
+    ) as broker:
+        status, headers, body = broker.request()
+        assert status == 502
+        assert raw_credential.encode("utf-8") not in body
+        assert all(raw_credential not in value for _, value in headers)
+        event = _audit_events(broker.audit_path)[-1]
+        assert event["decision"] == "rejected"
+        assert event["reason"] == "upstream reflected provider credential"
 
 
 def test_duplicate_upstream_content_length_is_not_forwarded(tmp_path: Path) -> None:
@@ -989,6 +1205,82 @@ def test_deadline_before_connect_completion_never_sends_the_credentialed_request
         )
 
 
+@pytest.mark.parametrize("cancellation", ("deadline", "shutdown"))
+def test_tls_handshake_cancellation_drains_without_sending_credentialed_http(
+    tmp_path: Path,
+    cancellation: str,
+) -> None:
+    """A stalled TLS handshake is interruptible by both deadline and shutdown paths."""
+    absolute_timeout_seconds = 0.25 if cancellation == "deadline" else 5.0
+    with (
+        _silent_tcp_upstream() as upstream,
+        _running_local_broker(
+            tmp_path,
+            client_timeout_seconds=1,
+            absolute_timeout_seconds=absolute_timeout_seconds,
+            upstream_origin=f"https://127.0.0.1:{upstream.port}",
+        ) as broker,
+    ):
+        client_done = threading.Event()
+
+        def request() -> None:
+            connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            connection.settimeout(2)
+            try:
+                connection.connect(("127.0.0.1", broker.port))
+                connection.sendall(_request_bytes())
+                with suppress(OSError):
+                    while connection.recv(64 * 1024):
+                        pass
+            finally:
+                connection.close()
+                client_done.set()
+
+        client = threading.Thread(target=request)
+        started = time.monotonic()
+        client.start()
+        assert upstream.accepted.wait(timeout=1)
+        assert upstream.bytes_received.wait(timeout=1)
+        if cancellation == "shutdown":
+            broker.handler_type.cancel_active_upstreams()
+
+        assert upstream.peer_closed.wait(timeout=1)
+        assert client_done.wait(timeout=1)
+        client.join(timeout=1)
+        assert not client.is_alive()
+        drain_deadline = time.monotonic() + 0.75
+        while broker.server.connection_counts() != (1, 0, 0):
+            assert time.monotonic() < drain_deadline
+            time.sleep(0.01)
+
+        observed_tls_bytes = bytes(upstream.received)
+        assert observed_tls_bytes
+        assert RAW_CREDENTIAL.encode("utf-8") not in observed_tls_bytes
+        assert b"POST " not in observed_tls_bytes
+        assert b"authorization" not in observed_tls_bytes.lower()
+        events = _audit_events(broker.audit_path)
+        assert not any(event["decision"] == "allowed" for event in events)
+        if cancellation == "deadline":
+            assert time.monotonic() - started < 1
+            assert any(
+                (
+                    event["decision"] == "rejected"
+                    and event["reason"] == "absolute connection deadline exceeded"
+                )
+                or (
+                    event["decision"] == "upstream-error"
+                    and event["reason"] == "fixed upstream request failed"
+                )
+                for event in events
+            )
+        else:
+            assert any(
+                event["decision"] == "upstream-error"
+                and event["reason"] == "fixed upstream request failed"
+                for event in events
+            )
+
+
 def test_cancellation_after_connect_cannot_auto_reopen_and_send_credential(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1106,8 +1398,10 @@ def _runtime_identity() -> DockerRuntimeIdentity:
 
 def _controller_session(
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    raw_credential: str = RAW_CREDENTIAL,
 ) -> broker_controller.CredentialBrokerSession:
-    monkeypatch.setenv("OPENAI_API_KEY", RAW_CREDENTIAL)
+    monkeypatch.setenv("OPENAI_API_KEY", raw_credential)
     digest = "sha256:" + "9" * 64
     config = AgentConfig(
         adapter="codex",
@@ -1130,6 +1424,65 @@ def _controller_session(
     session._broker_image_environment = {}
     session._resolved_upstream_address_inventory_sha256 = "f" * 64
     return session
+
+
+@pytest.mark.parametrize("encoding", ("mixed-percent", "fully-mixed-percent"))
+def test_controller_rejects_noncanonical_percent_credential_in_agent_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    encoding: str,
+) -> None:
+    """Mixed escape case and escaped unreserved bytes cannot enter agent argv."""
+    session = _controller_session(
+        monkeypatch,
+        raw_credential=CASE_SENSITIVE_PERCENT_CREDENTIAL,
+    )
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    encoded = _encoded_secret(
+        encoding,
+        CASE_SENSITIVE_PERCENT_CREDENTIAL.encode("utf-8"),
+    ).decode("ascii")
+    assert unquote_to_bytes(encoded) == CASE_SENSITIVE_PERCENT_CREDENTIAL.encode("utf-8")
+
+    with pytest.raises(broker_controller.CredentialBrokerError, match="credential"):
+        session.verify_agent_inputs(
+            workdir=workdir,
+            expected_command=("synthetic-agent", encoded),
+        )
+
+
+@pytest.mark.parametrize("raw_credential", JSON_ESCAPED_CREDENTIALS)
+def test_controller_scans_semantic_image_metadata_before_json_escaping(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_credential: str,
+) -> None:
+    """Docker metadata strings cannot hide raw credentials behind JSON escapes."""
+    session = _controller_session(monkeypatch, raw_credential=raw_credential)
+    metadata = [
+        {
+            "Config": {
+                "Cmd": ["run"],
+                "Entrypoint": ["synthetic-agent"],
+                "Env": [f"SYNTHETIC_STATE={raw_credential}"],
+            }
+        }
+    ]
+    serialized = json.dumps(metadata, sort_keys=True)
+    assert raw_credential.encode("utf-8") not in serialized.encode("utf-8")
+    monkeypatch.setattr(
+        broker_controller,
+        "run_docker",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=["docker"],
+            returncode=0,
+            stdout=serialized,
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(broker_controller.CredentialBrokerError, match="runtime metadata"):
+        session._scan_agent_image_metadata("sha256:" + "9" * 64)
 
 
 def test_controller_resolves_pinned_source_from_installed_package_layout(
@@ -1248,6 +1601,8 @@ def _write_tar(path: Path, members: Sequence[tuple[str, bytes]]) -> None:
         "lower-percent",
         "path-percent",
         "lower-path-percent",
+        "mixed-percent",
+        "fully-mixed-percent",
     ),
 )
 def test_controller_rejects_encoded_secret_in_agent_image_rootfs(
@@ -1256,9 +1611,14 @@ def test_controller_rejects_encoded_secret_in_agent_image_rootfs(
     encoding: str,
 ) -> None:
     """A reversible representation baked into an ordinary image file is still exposure."""
-    session = _controller_session(monkeypatch)
+    raw_credential = (
+        CASE_SENSITIVE_PERCENT_CREDENTIAL
+        if encoding in {"mixed-percent", "fully-mixed-percent"}
+        else RAW_CREDENTIAL
+    )
+    session = _controller_session(monkeypatch, raw_credential=raw_credential)
     archive = tmp_path / f"{encoding}.tar"
-    encoded = _encoded_secret(encoding, RAW_CREDENTIAL.encode("utf-8"))
+    encoded = _encoded_secret(encoding, raw_credential.encode("utf-8"))
     _write_tar(archive, (("opt/application/data.bin", b"prefix-" + encoded + b"-suffix"),))
     with pytest.raises(broker_controller.CredentialBrokerError, match="credential"):
         session._scan_rootfs_archive(archive)
@@ -1308,7 +1668,10 @@ def test_controller_detects_encoded_secret_across_stream_chunk_boundary(
 ) -> None:
     """Streaming image and workdir scans retain enough overlap for the longest encoding."""
     session = _controller_session(monkeypatch)
-    encoded = _encoded_secret("upper-hex", RAW_CREDENTIAL.encode("utf-8"))
+    encoded = _encoded_secret(
+        "fully-mixed-percent",
+        RAW_CREDENTIAL.encode("utf-8"),
+    )
     split_prefix = b"x" * (1024 * 1024 - len(encoded) // 2)
 
     archive = tmp_path / "boundary.tar"
@@ -1344,6 +1707,8 @@ def test_controller_detects_encoded_secret_across_stream_chunk_boundary(
         "urlsafe-base64",
         "percent",
         "path-percent",
+        "mixed-percent",
+        "fully-mixed-percent",
     ),
 )
 def test_controller_rejects_encoded_secret_in_agent_evidence(
@@ -1353,13 +1718,18 @@ def test_controller_rejects_encoded_secret_in_agent_evidence(
     encoding: str,
 ) -> None:
     """No reversible secret representation may survive in any agent evidence surface."""
-    session = _controller_session(monkeypatch)
+    raw_credential = (
+        CASE_SENSITIVE_PERCENT_CREDENTIAL
+        if encoding in {"mixed-percent", "fully-mixed-percent"}
+        else RAW_CREDENTIAL
+    )
+    session = _controller_session(monkeypatch, raw_credential=raw_credential)
     workdir = tmp_path / "work"
     workdir.mkdir()
     transcript = "synthetic transcript"
     audit = b'{"decision":"allowed"}\n'
     configuration = b'{"format_version":"1"}\n'
-    encoded = _encoded_secret(encoding, RAW_CREDENTIAL.encode("utf-8"))
+    encoded = _encoded_secret(encoding, raw_credential.encode("utf-8"))
     if location == "transcript":
         transcript = encoded.decode("ascii")
     elif location == "workdir":

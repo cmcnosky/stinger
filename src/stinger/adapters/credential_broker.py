@@ -23,9 +23,9 @@ import tempfile
 import time
 from base64 import b64encode, urlsafe_b64encode
 from collections.abc import Mapping
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, BinaryIO
-from urllib.parse import quote_from_bytes
 from uuid import uuid4
 
 import stinger.credential_broker_server as credential_broker_server_module
@@ -115,12 +115,7 @@ class CredentialBrokerSession:
             raise CredentialBrokerError(
                 f"required host credential variable {config.api_key_env!r} is not set"
             ) from exc
-        if (
-            len(raw_credential.encode("utf-8")) < 16
-            or len(raw_credential.encode("utf-8")) > 16 * 1024
-            or raw_credential != raw_credential.strip()
-            or "\x00" in raw_credential
-        ):
+        if not credential_broker_server_module._raw_credential_is_valid(raw_credential):
             raise CredentialBrokerError("host provider credential is not a canonical secret value")
 
         self._config = config
@@ -196,15 +191,16 @@ class CredentialBrokerSession:
         """Reject provider-credential exposure before any networked container exists."""
         if self._started or self._finished or not expected_command:
             raise CredentialBrokerError("credential-isolation input preflight is unavailable")
-        variants = _credential_variants(self._raw_credential.encode("utf-8"))
+        raw_credential = self._raw_credential.encode("utf-8")
+        variants = _credential_variants(raw_credential)
         if any(
-            _contains_credential_variant(argument.encode("utf-8"), variants)
+            _contains_credential_variant(argument.encode("utf-8"), raw_credential, variants)
             for argument in expected_command
         ):
             raise CredentialBrokerError(
                 "provider credential or a reversible encoding appeared in the agent command"
             )
-        self._reject_credential_in_workdir(workdir, variants)
+        self._reject_credential_in_workdir(workdir, raw_credential, variants)
 
     def start(self) -> CredentialBrokerSession:
         """Create and mechanically verify the broker topology before agent launch."""
@@ -1131,20 +1127,24 @@ class CredentialBrokerSession:
         workdir: Path,
         audit: bytes,
     ) -> None:
-        variants = _credential_variants(self._raw_credential.encode("utf-8"))
+        raw_credential = self._raw_credential.encode("utf-8")
+        variants = _credential_variants(raw_credential)
         if (
-            _contains_credential_variant(transcript.encode("utf-8"), variants)
-            or _contains_credential_variant(audit, variants)
-            or _contains_credential_variant(self._require_configuration_bytes(), variants)
+            _contains_credential_variant(transcript.encode("utf-8"), raw_credential, variants)
+            or _contains_credential_variant(audit, raw_credential, variants)
+            or _contains_credential_variant(
+                self._require_configuration_bytes(), raw_credential, variants
+            )
         ):
             raise CredentialBrokerError(
                 "provider credential or a reversible encoding appeared in agent evidence"
             )
-        self._reject_credential_in_workdir(workdir, variants)
+        self._reject_credential_in_workdir(workdir, raw_credential, variants)
 
     def _reject_credential_in_workdir(
         self,
         workdir: Path,
+        raw_credential: bytes,
         variants: tuple[bytes, ...],
     ) -> None:
         try:
@@ -1155,7 +1155,7 @@ class CredentialBrokerSession:
             ) from exc
         for path in sorted(root.rglob("*")):
             relative = str(path.relative_to(root)).encode("utf-8", errors="surrogateescape")
-            if _contains_credential_variant(relative, variants):
+            if _contains_credential_variant(relative, raw_credential, variants):
                 raise CredentialBrokerError(
                     "provider credential or a reversible encoding appeared in a workdir path"
                 )
@@ -1166,7 +1166,7 @@ class CredentialBrokerSession:
                     raise CredentialBrokerError(
                         "agent workdir link could not be scanned for credential exposure"
                     ) from exc
-                if _contains_credential_variant(target, variants):
+                if _contains_credential_variant(target, raw_credential, variants):
                     raise CredentialBrokerError(
                         "provider credential or a reversible encoding appeared in a workdir link"
                     )
@@ -1175,7 +1175,7 @@ class CredentialBrokerSession:
                 continue
             try:
                 with path.open("rb") as stream:
-                    if _stream_contains_credential_variant(stream, variants):
+                    if _stream_contains_credential_variant(stream, raw_credential, variants):
                         raise CredentialBrokerError(
                             "provider credential or a reversible encoding appeared in the "
                             "agent workdir"
@@ -1283,8 +1283,11 @@ class CredentialBrokerSession:
         if not isinstance(config, dict):
             raise CredentialBrokerError("agent image runtime metadata is invalid")
         encoded = canonical_json_bytes(config)
-        variants = _credential_variants(self._raw_credential.encode("utf-8"))
-        if _contains_credential_variant(encoded, variants):
+        raw_credential = self._raw_credential.encode("utf-8")
+        variants = _credential_variants(raw_credential)
+        if _contains_credential_variant(
+            encoded, raw_credential, variants
+        ) or _structured_contains_credential_variant(config, raw_credential, variants):
             raise CredentialBrokerError(
                 "provider credential or a reversible encoding is readable from agent image "
                 "runtime metadata"
@@ -1404,12 +1407,19 @@ class CredentialBrokerSession:
             raise CredentialBrokerError("agent image rootfs archive is missing") from exc
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise CredentialBrokerError("agent image rootfs archive is not a regular file")
-        variants = _credential_variants(self._raw_credential.encode("utf-8"))
-        overlap_size = max(len(value) for value in variants) - 1
+        raw_credential = self._raw_credential.encode("utf-8")
+        variants = _credential_variants(raw_credential)
+        overlap_size = (
+            max(
+                max(len(value) for value in variants),
+                len(raw_credential) * 3,
+            )
+            - 1
+        )
         config_home_prefixes = self._agent_config_home_prefixes()
         try:
             with archive_path.open("rb") as encoded_archive:
-                if _stream_contains_credential_variant(encoded_archive, variants):
+                if _stream_contains_credential_variant(encoded_archive, raw_credential, variants):
                     raise CredentialBrokerError(
                         "provider credential or a reversible encoding is readable from the "
                         "agent image archive"
@@ -1454,7 +1464,7 @@ class CredentialBrokerSession:
                     while chunk := stream.read(1024 * 1024):
                         digest.update(chunk)
                         combined = overlap + chunk
-                        if _contains_credential_variant(combined, variants):
+                        if _contains_credential_variant(combined, raw_credential, variants):
                             raise CredentialBrokerError(
                                 "raw provider credential is readable from the agent image"
                             )
@@ -1462,7 +1472,7 @@ class CredentialBrokerSession:
                     entry["sha256"] = digest.hexdigest()
                 elif member.issym() or member.islnk():
                     target = member.linkname.encode("utf-8", errors="surrogateescape")
-                    if _contains_credential_variant(target, variants):
+                    if _contains_credential_variant(target, raw_credential, variants):
                         raise CredentialBrokerError(
                             "raw provider credential is readable from an agent image link"
                         )
@@ -1844,29 +1854,94 @@ def _credential_variants(raw: bytes) -> tuple[bytes, ...]:
         b64encode(raw).rstrip(b"="),
         urlsafe_b64encode(raw),
         urlsafe_b64encode(raw).rstrip(b"="),
-        quote_from_bytes(raw).encode("ascii"),
-        quote_from_bytes(raw).lower().encode("ascii"),
-        quote_from_bytes(raw, safe="").encode("ascii"),
-        quote_from_bytes(raw, safe="").lower().encode("ascii"),
     }
     return tuple(
         sorted((value for value in variants if value), key=lambda value: (len(value), value))
     )
 
 
-def _contains_credential_variant(value: bytes, variants: tuple[bytes, ...]) -> bool:
-    return any(candidate in value for candidate in variants)
+def _hex_nibble(value: int) -> int | None:
+    if ord("0") <= value <= ord("9"):
+        return value - ord("0")
+    if ord("A") <= value <= ord("F"):
+        return value - ord("A") + 10
+    if ord("a") <= value <= ord("f"):
+        return value - ord("a") + 10
+    return None
+
+
+@lru_cache(maxsize=16)
+def _credential_byte_masks(raw: bytes) -> tuple[tuple[int, ...], int]:
+    masks = [0] * 256
+    for index, value in enumerate(raw):
+        masks[value] |= 1 << index
+    terminal = 0 if not raw else 1 << (len(raw) - 1)
+    return tuple(masks), terminal
+
+
+def _contains_percent_encoded_credential(value: bytes, raw: bytes) -> bool:
+    """Match every mixed literal/``%HH`` spelling with a bounded bit automaton."""
+    if not raw:
+        return False
+    masks, terminal = _credential_byte_masks(raw)
+    pending = [0, 0, 0, 0]
+    for offset, literal in enumerate(value):
+        active = pending[offset & 3]
+        pending[offset & 3] = 0
+        literal_state = ((active << 1) | 1) & masks[literal]
+        if literal_state & terminal:
+            return True
+        pending[(offset + 1) & 3] |= literal_state
+        if literal == ord("%") and offset + 2 < len(value):
+            high = _hex_nibble(value[offset + 1])
+            low = _hex_nibble(value[offset + 2])
+            if high is not None and low is not None:
+                decoded_state = ((active << 1) | 1) & masks[(high << 4) | low]
+                if decoded_state & terminal:
+                    return True
+                pending[(offset + 3) & 3] |= decoded_state
+    return False
+
+
+def _contains_credential_variant(
+    value: bytes,
+    raw: bytes,
+    variants: tuple[bytes, ...],
+) -> bool:
+    return any(candidate in value for candidate in variants) or (
+        _contains_percent_encoded_credential(value, raw)
+    )
+
+
+def _structured_contains_credential_variant(
+    value: object,
+    raw: bytes,
+    variants: tuple[bytes, ...],
+) -> bool:
+    """Scan semantic JSON values before serialization can escape credential bytes."""
+    if isinstance(value, str):
+        return _contains_credential_variant(value.encode("utf-8"), raw, variants)
+    if isinstance(value, Mapping):
+        return any(
+            _structured_contains_credential_variant(key, raw, variants)
+            or _structured_contains_credential_variant(item, raw, variants)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_structured_contains_credential_variant(item, raw, variants) for item in value)
+    return False
 
 
 def _stream_contains_credential_variant(
     stream: BinaryIO,
+    raw: bytes,
     variants: tuple[bytes, ...],
 ) -> bool:
-    overlap_size = max(len(value) for value in variants) - 1
+    overlap_size = max(max(len(value) for value in variants), len(raw) * 3) - 1
     overlap = b""
     while chunk := stream.read(1024 * 1024):
         combined = overlap + chunk
-        if _contains_credential_variant(combined, variants):
+        if _contains_credential_variant(combined, raw, variants):
             return True
         overlap = combined[-overlap_size:]
     return False

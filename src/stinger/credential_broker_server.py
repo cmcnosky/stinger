@@ -22,12 +22,14 @@ import sys
 import threading
 import time
 from base64 import b64encode, urlsafe_b64encode
+from collections.abc import Callable
 from contextlib import suppress
+from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, ClassVar, cast
-from urllib.parse import quote_from_bytes, urlsplit
+from urllib.parse import urlsplit
 
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
@@ -35,6 +37,8 @@ CLIENT_SOCKET_TIMEOUT_SECONDS = 30
 CONNECTION_DEADLINE_SECONDS = 600
 MAX_CONCURRENT_CONNECTIONS = 32
 UPSTREAM_SOCKET_TIMEOUT_SECONDS = 120
+MIN_RAW_CREDENTIAL_BYTES = 16
+MAX_RAW_CREDENTIAL_BYTES = 16 * 1024
 TEST_ONLY_ARGUMENT = "--test-only-allow-http"
 EXPECTED_CONFIG_KEYS = frozenset(
     {
@@ -133,6 +137,10 @@ PRODUCTION_ROUTE_CONFIGS: dict[str, dict[str, object]] = {
 
 class BrokerConfigurationError(Exception):
     """Raised before listening when the exact broker configuration is invalid."""
+
+
+class _CredentialScanCancelled(Exception):
+    """Raised when the absolute connection deadline interrupts credential scanning."""
 
 
 class _CancelableUpstream:
@@ -301,6 +309,68 @@ def _canonical_bytes(value: object) -> bytes:
 
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _raw_credential_is_valid(raw: str) -> bool:
+    try:
+        encoded = raw.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return (
+        MIN_RAW_CREDENTIAL_BYTES <= len(encoded) <= MAX_RAW_CREDENTIAL_BYTES
+        and raw == raw.strip()
+        and "\x00" not in raw
+    )
+
+
+def _hex_nibble(value: int) -> int | None:
+    if ord("0") <= value <= ord("9"):
+        return value - ord("0")
+    if ord("A") <= value <= ord("F"):
+        return value - ord("A") + 10
+    if ord("a") <= value <= ord("f"):
+        return value - ord("a") + 10
+    return None
+
+
+@lru_cache(maxsize=16)
+def _credential_byte_masks(raw: bytes) -> tuple[tuple[int, ...], int]:
+    masks = [0] * 256
+    for index, value in enumerate(raw):
+        masks[value] |= 1 << index
+    terminal = 0 if not raw else 1 << (len(raw) - 1)
+    return tuple(masks), terminal
+
+
+def _contains_percent_encoded_credential(
+    value: bytes,
+    raw: bytes,
+    *,
+    deadline_expired: Callable[[], bool] | None = None,
+) -> bool:
+    """Match every mixed literal/``%HH`` spelling with a bounded bit automaton."""
+    if not raw:
+        return False
+    masks, terminal = _credential_byte_masks(raw)
+    pending = [0, 0, 0, 0]
+    for offset, literal in enumerate(value):
+        if deadline_expired is not None and (offset & 4095) == 0 and deadline_expired():
+            raise _CredentialScanCancelled
+        active = pending[offset & 3]
+        pending[offset & 3] = 0
+        literal_state = ((active << 1) | 1) & masks[literal]
+        if literal_state & terminal:
+            return True
+        pending[(offset + 1) & 3] |= literal_state
+        if literal == ord("%") and offset + 2 < len(value):
+            high = _hex_nibble(value[offset + 1])
+            low = _hex_nibble(value[offset + 2])
+            if high is not None and low is not None:
+                decoded_state = ((active << 1) | 1) & masks[(high << 4) | low]
+                if decoded_state & terminal:
+                    return True
+                pending[(offset + 3) & 3] |= decoded_state
+    return False
 
 
 def _load_configuration_with_identity(
@@ -633,7 +703,19 @@ class CredentialBrokerHandler(BaseHTTPRequestHandler):
             self._reply(502, b'{"error":"credential broker upstream rejected"}\n')
             return
         serialized_headers = _canonical_bytes(headers)
-        if self._contains_credential(response) or self._contains_credential(serialized_headers):
+        try:
+            reflected_credential = (
+                self._contains_credential(response)
+                or self._contains_credential(serialized_headers)
+                or any(
+                    self._contains_credential_text(name) or self._contains_credential_text(value)
+                    for name, value in headers
+                )
+            )
+        except _CredentialScanCancelled:
+            self.close_connection = True
+            return
+        if reflected_credential:
             self._audit(
                 "rejected",
                 reason="upstream reflected provider credential",
@@ -933,12 +1015,24 @@ class CredentialBrokerHandler(BaseHTTPRequestHandler):
             b64encode(raw).rstrip(b"="),
             urlsafe_b64encode(raw),
             urlsafe_b64encode(raw).rstrip(b"="),
-            quote_from_bytes(raw).encode("ascii"),
-            quote_from_bytes(raw).lower().encode("ascii"),
-            quote_from_bytes(raw, safe="").encode("ascii"),
-            quote_from_bytes(raw, safe="").lower().encode("ascii"),
         }
-        return any(candidate and candidate in value for candidate in variants)
+        return any(candidate and candidate in value for candidate in variants) or (
+            _contains_percent_encoded_credential(
+                value,
+                raw,
+                deadline_expired=self._deadline_has_expired,
+            )
+        )
+
+    def _contains_credential_text(self, value: str) -> bool:
+        """Scan a parsed header before JSON or wire serialization can escape it."""
+        if self.raw_credential in value or self._contains_credential(value.encode("utf-8")):
+            return True
+        try:
+            wire_bytes = value.encode("latin-1")
+        except UnicodeEncodeError:
+            return False
+        return self._contains_credential(wire_bytes)
 
     @classmethod
     def _next_request_id(cls) -> int:
@@ -1006,9 +1100,7 @@ def main() -> int:
         print(f"credential broker refused to start: {exc}", file=sys.stderr)
         return 65
     if (
-        not raw
-        or raw != raw.strip()
-        or "\x00" in raw
+        not _raw_credential_is_valid(raw)
         or not lease
         or lease != lease.strip()
         or "\x00" in lease

@@ -1675,6 +1675,18 @@ def _require_unique_invocations(
             raise ClassificationReplayError(
                 f"benchmark invocation {label} identities are not unique"
             )
+    container_ids = [
+        value
+        for item in isolation_receipts
+        for value in (
+            item.evidence.agent_container_id_sha256,
+            item.evidence.broker_container_id_sha256,
+        )
+    ]
+    if len(set(container_ids)) != len(container_ids):
+        raise ClassificationReplayError(
+            "agent and broker container identities are not globally unique"
+        )
     network_ids = [
         value
         for item in isolation_receipts

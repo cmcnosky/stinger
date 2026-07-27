@@ -47,7 +47,7 @@ protocol:
     broker_identity: source-inventory-and-immutable-image
     broker_source_paths:
       - src/stinger/credential_broker_server.py
-    broker_source_inventory_sha256: a0ae7d621590cdd5c1260eec8810bf87b7fe42cc74ceb8ce02f0eeeffe2be3d8
+    broker_source_inventory_sha256: dab1645b21242f3a77a64bb27fdb1a856a4c9b949bd5a0787f444fcda35a080a
     agent_image_final_rootfs_credential_scan_required: true
     agent_image_credential_encoding_policy: raw-hex-base64-urlsafe-base64-percent
     agent_image_config_home_policy: declared-agent-config-home-must-be-empty

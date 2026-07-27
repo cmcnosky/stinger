@@ -235,10 +235,16 @@ creating the network it MUST scan the final agent argv and the workdir's paths, 
 targets, and regular-file contents. It MUST scan canonical agent-image runtime metadata and
 the exported final root filesystem under the same policy. Every scan MUST reject the raw
 credential, lower/uppercase hexadecimal, padded/unpadded standard Base64, padded/unpadded
-URL-safe Base64, and percent-encoded forms. The root-filesystem scan MUST also reject every
-case-insensitive credential-path suffix frozen in the signed protocol and require the
+URL-safe Base64, and every percent-encoded form, including mixed literal/escaped bytes,
+mixed-case hex digits, and escaped unreserved bytes. The root-filesystem scan MUST also reject
+every case-insensitive credential-path suffix frozen in the signed protocol and require the
 declared/default Codex or Claude config home to be absent or an empty directory. It MUST bind
-the resulting metadata/rootfs inventory hash.
+the resulting metadata/rootfs inventory hash. Parsed upstream headers and structured image
+metadata MUST be scanned in their semantic string form before serialization, as well as in
+their evidence bytes, so JSON or wire escaping cannot hide a credential. Broker reflection
+scanning MUST accept only a canonical 16-through-16,384-byte UTF-8 raw credential, use bounded
+work under that credential limit and the signed response limit, and MUST
+cooperatively stop when the absolute connection deadline expires.
 
 After every invocation the harness MUST verify the exact agent/broker/network identities and
 attachment, command/environment/mount/network inventories, disabled healthcheck, isolated
@@ -691,6 +697,12 @@ inventories, isolated bridge/DNS/IPv6/healthcheck state, broker audit, request c
 verified cleanup. Its exact hash is included in the invocation receipt and run aggregate;
 missing, extra, duplicated, drifted, bypass-indicating, or noncanonical credential evidence
 fails escrow verification.
+
+Across the complete construction workflow, not merely inside one run aggregate, every
+broker lease, agent or broker container identity, and internal or outbound network ID/name
+MUST be globally unique across roles, invocations, workflow stages, and scenarios. A receipt
+that identifies the agent and credential-bearing broker as the same container, or any
+cross-role reuse of those identities, is conflicting evidence and MUST fail closed.
 
 For `codex` and `claude-code`, the receipt MUST parse exactly one structured provider
 session identifier from the raw transcript and those identifiers MUST be unique across the

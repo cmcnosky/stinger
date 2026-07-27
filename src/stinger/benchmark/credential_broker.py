@@ -172,6 +172,8 @@ class CredentialIsolationInvocationReceipt(BaseModel):
     def _closed_projection(self) -> CredentialIsolationInvocationReceipt:
         if self.agent_read_only_mounts:
             raise ValueError("credential-isolated agents cannot receive extra read-only mounts")
+        if self.agent_container_id_sha256 == self.broker_container_id_sha256:
+            raise ValueError("agent and broker container identities must be distinct")
         if (
             self.internal_network_id_sha256 == self.outbound_network_id_sha256
             or self.internal_network_name_sha256 == self.outbound_network_name_sha256

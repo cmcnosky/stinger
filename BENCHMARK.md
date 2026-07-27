@@ -69,10 +69,17 @@ reconnect, and retain detached response sockets so deadline or shutdown cancella
 Before any networked container starts, Stinger scans the final agent argv and workdir paths,
 links, and file contents. It then scans canonical agent-image runtime metadata and the
 exported final root filesystem. All four surfaces reject the raw credential plus lower/upper
-hexadecimal, padded/unpadded standard and URL-safe Base64, and percent-encoded forms. Image
+hexadecimal, padded/unpadded standard and URL-safe Base64, and every mixed-case, partially or
+fully percent-encoded form, including escaped unreserved bytes. Image
 volumes, the protocol's signed prohibited credential-path suffixes, extra credential/routing
 environment values, or a nonempty declared/default Codex or Claude config home also fail
 closed. The scan inventory hash is evidence, not approval of the agent image's supply chain.
+Parsed provider headers and structured image metadata are scanned semantically before JSON or
+wire serialization as well as after encoding, so escaping cannot mask the raw credential. A
+bounded bit-parallel matcher explores literal and `%HH` interpretations without backtracking
+and polls the absolute connection deadline during long provider-response scans. Controller
+and broker both fail closed outside the source-pinned 16-through-16,384-byte UTF-8 raw-secret
+policy.
 
 After each agent invocation Stinger verifies the exact agent container, broker container,
 both fresh networks and their membership, command/environment/mount/attachment inventories,
@@ -235,6 +242,9 @@ cleanup. The ordinary
 direct environment and credential-mount paths cannot produce this evidence and are rejected
 in Protocol 2. Missing, mismatched, duplicated, rejected-request, bypass, egress, encoded
 credential, or cleanup-failure evidence resolves to a non-scoring error.
+Broker leases, agent/broker container identities, and internal/outbound network IDs and names
+are flattened and required to be globally unique across every QA, review, blind-solve,
+scenario, and run role; cross-role reuse is conflicting evidence, not a fresh invocation.
 
 Codex and Claude Code runs require one unique structured session identifier parsed from
 each raw transcript. Aider has no equivalent canonical provider-side field, so its

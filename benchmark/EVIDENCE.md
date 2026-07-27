@@ -16,10 +16,17 @@ benchmark evidence.
 > loopback-only upstream resolution, and has inherited image healthchecks disabled. The broker
 > reaches its fixed provider only through a fresh user-defined IPv4 NAT bridge containing no
 > unrelated container. Before
-> launch, Stinger rejects raw, hex, standard or URL-safe Base64, and percent-encoded credential
-> forms in the final argv, workdir paths/links/files, image metadata, or exported final rootfs;
+> launch, Stinger rejects raw, hex, standard or URL-safe Base64, and mixed-case, partially or
+> fully percent-encoded credential forms in the final argv, workdir paths/links/files, image
+> metadata, or exported final rootfs;
 > signed prohibited credential-path suffixes and a nonempty agent config home also fail
 > closed.
+> Parsed response headers and image metadata are scanned semantically before serialization so
+> JSON or wire escaping cannot hide the credential from the detector.
+> Provider-response reflection scanning uses a bounded bit-parallel matcher for every literal
+> or `%HH` interpretation and cooperatively stops at the absolute connection deadline. Both
+> trusted processes reject raw credentials outside the source-pinned 16-through-16,384-byte
+> UTF-8 policy.
 > Exact loaded configuration bytes, effective destination/test-mode readiness, bounded
 > connection lifetime/concurrency, per-invocation identities/audit, and cleanup of both
 > networks are evidence-bound. Tests use only synthetic
@@ -571,6 +578,9 @@ aggregate binds the complete ordered set. Missing, extra, duplicated, noncanonic
 rejected-request, encoded-credential, bypass, arbitrary-egress, or cleanup-failure evidence
 is fatal. The receipt does not turn the still-unapproved agent image into a supply-chain
 claim.
+The construction verifier also flattens broker leases, agent/broker container identities,
+and both network ID/name roles across all QA, review, blind-solve, run, and scenario bundles;
+any within- or cross-role reuse is fatal even when the individual receipt hashes differ.
 
 Codex and Claude Code transcripts must each contain one unique structured provider session
 identifier. Aider exposes no equivalent canonical provider-side identifier, so a valid

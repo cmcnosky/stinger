@@ -123,8 +123,10 @@ from stinger.benchmark.protocol import (
     publication_pin_issues,
 )
 from stinger.benchmark.replay import (
+    CREDENTIAL_ISOLATION_RECEIPT_NAME,
     INVOCATION_AGGREGATE_NAME,
     ClassificationReplayError,
+    load_credential_isolation_receipt_snapshot,
     verify_invocation_aggregate_snapshot,
 )
 from stinger.benchmark.signing import (
@@ -1133,6 +1135,17 @@ class VerifiedRunBundleInput:
 
 
 @dataclass(frozen=True, slots=True)
+class _CredentialIsolationExecutionIdentity:
+    """Receipt-bound identities that must be fresh for every brokered invocation."""
+
+    receipt_sha256s: tuple[str, ...]
+    broker_lease_sha256s: tuple[str, ...]
+    container_id_sha256s: tuple[str, ...]
+    network_id_sha256s: tuple[str, ...]
+    network_name_sha256s: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _RunExecutionIdentity:
     """Uniqueness evidence retained while composing QA and blind runs."""
 
@@ -1141,6 +1154,15 @@ class _RunExecutionIdentity:
     provider_response_id_sha256s: frozenset[str]
     execution_evidence_sha256s: frozenset[str]
     workflow_signature_sha256: str
+    credential_isolation: _CredentialIsolationExecutionIdentity
+
+
+@dataclass(frozen=True, slots=True)
+class _MachineReviewBuild:
+    """Review records plus exact credential identities retained for global checks."""
+
+    records: tuple[MachineReviewRecord, ...]
+    credential_isolation_identities: tuple[_CredentialIsolationExecutionIdentity, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1837,6 +1859,10 @@ def _build_corpus_construction_from_snapshot(
         str,
         tuple[VerifiedMachineWorkflowAttestation, ...],
     ] = {}
+    review_credential_isolation_identities: dict[
+        str,
+        tuple[_CredentialIsolationExecutionIdentity, ...],
+    ] = {}
     artifact_inventory: list[dict[str, Any]] = []
     for index, scenario in enumerate(sorted(loaded, key=lambda item: item.id)):
         item = inputs_by_path[scenario.directory.resolve()]
@@ -1846,6 +1872,7 @@ def _build_corpus_construction_from_snapshot(
                 inventory,
                 execution_identities,
                 workflow_authorizations,
+                review_isolation_identities,
             ) = _build_base_scenario_record(
                 scenario,
                 item,
@@ -1875,6 +1902,7 @@ def _build_corpus_construction_from_snapshot(
         base_records[record.scenario_id] = record
         qa_execution_identities[record.scenario_id] = execution_identities
         qa_workflow_authorizations[record.scenario_id] = workflow_authorizations
+        review_credential_isolation_identities[record.scenario_id] = review_isolation_identities
         artifact_inventory.append(inventory)
 
     selected_blind_ids = _selected_blind_solve_ids(
@@ -1882,6 +1910,8 @@ def _build_corpus_construction_from_snapshot(
         corpus_hash_value=derived_corpus_hash,
     )
     final_records: list[CorpusScenarioRecord] = []
+    all_run_execution_identities: list[_RunExecutionIdentity] = []
+    all_review_isolation_identities: list[_CredentialIsolationExecutionIdentity] = []
     for index, scenario in enumerate(sorted(loaded, key=lambda item: item.id)):
         item = inputs_by_path[scenario.directory.resolve()]
         base = base_records[scenario.id]
@@ -1933,12 +1963,11 @@ def _build_corpus_construction_from_snapshot(
                     | frozenset(review_trust_policies)
                 ),
             )
-            _require_unique_run_executions(
-                (
-                    *qa_execution_identities[scenario.id],
-                    *blind_execution_identities,
-                )
+            scenario_execution_identities = (
+                *qa_execution_identities[scenario.id],
+                *blind_execution_identities,
             )
+            _require_unique_run_executions(scenario_execution_identities)
         except CorpusConstructionError:
             raise
         except (EvidenceBundleError, OSError, ValidationError, ValueError):
@@ -1951,9 +1980,16 @@ def _build_corpus_construction_from_snapshot(
             }
         )
         final_records.append(record)
+        all_run_execution_identities.extend(scenario_execution_identities)
+        all_review_isolation_identities.extend(review_credential_isolation_identities[scenario.id])
         artifact_inventory[index]["blind_agent_solves_sha256"] = _canonical_payload_sha256(
             [solve.model_dump(mode="json") for solve in blind_solves]
         )
+
+    _require_unique_construction_execution_identities(
+        tuple(all_run_execution_identities),
+        tuple(all_review_isolation_identities),
+    )
 
     try:
         resolution_sandbox.verify_runtime_unchanged()
@@ -3385,6 +3421,7 @@ def _build_base_scenario_record(
     dict[str, Any],
     tuple[_RunExecutionIdentity, ...],
     tuple[VerifiedMachineWorkflowAttestation, ...],
+    tuple[_CredentialIsolationExecutionIdentity, ...],
 ]:
     """Derive one scenario record excluding review and blind-solve evidence."""
     if (
@@ -3561,7 +3598,7 @@ def _build_base_scenario_record(
             ),
             forbidden_trust_policy_sha256s=(lifecycle_role_constraints.trust_policy_sha256s),
         )
-        reviews = _build_machine_reviews(
+        review_build = _build_machine_reviews(
             base_record,
             item.machine_reviews,
             repository=repository,
@@ -3577,6 +3614,7 @@ def _build_base_scenario_record(
             ),
             expected_stinger_commit=promotion.stinger_commit,
         )
+    reviews = review_build.records
     record = base_record.model_copy(update={"machine_reviews": reviews})
     return (
         record,
@@ -3597,6 +3635,7 @@ def _build_base_scenario_record(
         },
         qa_execution_identities,
         qa_workflow_authorizations,
+        review_build.credential_isolation_identities,
     )
 
 
@@ -4439,6 +4478,23 @@ def _require_unique_run_executions(
         seen_provider_responses.update(identity.provider_response_id_sha256s)
         seen_execution_evidence.update(identity.execution_evidence_sha256s)
         seen_signatures.add(identity.workflow_signature_sha256)
+    _require_unique_credential_isolation_identities(
+        tuple(identity.credential_isolation for identity in identities)
+    )
+
+
+def _require_unique_construction_execution_identities(
+    run_identities: tuple[_RunExecutionIdentity, ...],
+    review_identities: tuple[_CredentialIsolationExecutionIdentity, ...],
+) -> None:
+    """Reject identity reuse across QA, blind, review, and scenario boundaries."""
+    _require_unique_run_executions(run_identities)
+    _require_unique_credential_isolation_identities(
+        (
+            *(identity.credential_isolation for identity in run_identities),
+            *review_identities,
+        )
+    )
 
 
 def _build_machine_reviews(
@@ -4451,7 +4507,7 @@ def _build_machine_reviews(
     forbidden_signing_key_fingerprints: frozenset[str],
     forbidden_trust_policy_sha256s: frozenset[str],
     expected_stinger_commit: str,
-) -> tuple[MachineReviewRecord, ...]:
+) -> _MachineReviewBuild:
     """Derive reviews only from signed, transcript-bearing runner invocations."""
     try:
         observed_broker_source_inventory_sha256 = broker_source_inventory_sha256(repository)
@@ -4485,6 +4541,7 @@ def _build_machine_reviews(
     invocation_ids: list[str] = []
     provider_response_ids: list[str] = []
     credential_isolation_receipt_hashes: list[str] = []
+    credential_isolation_identities: list[_CredentialIsolationExecutionIdentity] = []
     for package in packages:
         configuration, configuration_bytes = _load_canonical_model(
             package.configuration_receipt,
@@ -4696,6 +4753,11 @@ def _build_machine_reviews(
         invocation_ids.append(runtime.invocation_id_sha256)
         provider_response_ids.append(runtime.provider_response_id)
         credential_isolation_receipt_hashes.append(credential_isolation_sha256)
+        credential_isolation_identities.append(
+            _credential_isolation_execution_identity(
+                ((credential_isolation_sha256, credential_isolation),)
+            )
+        )
         records.append(
             MachineReviewRecord(
                 review_id=configuration.review_id,
@@ -4714,6 +4776,7 @@ def _build_machine_reviews(
                 output=output,
             )
         )
+    _require_unique_credential_isolation_identities(tuple(credential_isolation_identities))
     if (
         len(semantic_reviewer_identities) != len(set(semantic_reviewer_identities))
         or len(runner_identities) != len(set(runner_identities))
@@ -4727,7 +4790,75 @@ def _build_machine_reviews(
         raise CorpusConstructionError(
             "machine reviews reuse one semantic configuration or runner authority"
         )
-    return tuple(sorted(records, key=lambda value: value.review_id))
+    return _MachineReviewBuild(
+        records=tuple(sorted(records, key=lambda value: value.review_id)),
+        credential_isolation_identities=tuple(credential_isolation_identities),
+    )
+
+
+def _credential_isolation_execution_identity(
+    receipts: tuple[tuple[str, CredentialIsolationInvocationReceipt], ...],
+) -> _CredentialIsolationExecutionIdentity:
+    """Retain exact receipt and runtime identities after typed verification."""
+    return _CredentialIsolationExecutionIdentity(
+        receipt_sha256s=tuple(receipt_sha256 for receipt_sha256, _ in receipts),
+        broker_lease_sha256s=tuple(receipt.broker_lease_sha256 for _, receipt in receipts),
+        container_id_sha256s=tuple(
+            value
+            for _, receipt in receipts
+            for value in (
+                receipt.agent_container_id_sha256,
+                receipt.broker_container_id_sha256,
+            )
+        ),
+        network_id_sha256s=tuple(
+            value
+            for _, receipt in receipts
+            for value in (
+                receipt.internal_network_id_sha256,
+                receipt.outbound_network_id_sha256,
+            )
+        ),
+        network_name_sha256s=tuple(
+            value
+            for _, receipt in receipts
+            for value in (
+                receipt.internal_network_name_sha256,
+                receipt.outbound_network_name_sha256,
+            )
+        ),
+    )
+
+
+def _require_unique_credential_isolation_identities(
+    identities: tuple[_CredentialIsolationExecutionIdentity, ...],
+) -> None:
+    """Reject credential-isolation identity reuse across every execution role."""
+    fields = (
+        (
+            "receipt",
+            tuple(value for identity in identities for value in identity.receipt_sha256s),
+        ),
+        (
+            "broker lease",
+            tuple(value for identity in identities for value in identity.broker_lease_sha256s),
+        ),
+        (
+            "agent or broker container",
+            tuple(value for identity in identities for value in identity.container_id_sha256s),
+        ),
+        (
+            "internal or outbound network id",
+            tuple(value for identity in identities for value in identity.network_id_sha256s),
+        ),
+        (
+            "internal or outbound network name",
+            tuple(value for identity in identities for value in identity.network_name_sha256s),
+        ),
+    )
+    for label, values in fields:
+        if len(set(values)) != len(values):
+            raise CorpusConstructionError(f"credentialed executions reuse one {label} identity")
 
 
 def _build_blind_solves(
@@ -5065,6 +5196,16 @@ def _verify_run_bundle(
                 run.escrow_bundle,
                 Path(temporary_name) / "rerunnable-evidence",
             )
+            isolation_snapshots = tuple(
+                load_credential_isolation_receipt_snapshot(
+                    package
+                    / "runs"
+                    / result.scenario_id
+                    / str(result.repetition)
+                    / CREDENTIAL_ISOLATION_RECEIPT_NAME
+                )
+                for result in report.results
+            )
             verified_aggregate = verify_invocation_aggregate_snapshot(
                 package,
                 config=receipt.config,
@@ -5159,6 +5300,8 @@ def _verify_run_bundle(
         or aggregate.runtime_provenance_sha256 != _canonical_model_sha256(runtime)
         or aggregate.report_sha256 != _canonical_model_sha256(report)
         or aggregate.receipt_count != len(report.results)
+        or tuple(snapshot.sha256 for snapshot in isolation_snapshots)
+        != aggregate.credential_isolation_receipt_sha256s
         or len(aggregate.invocation_ids) != len(set(aggregate.invocation_ids))
         or len(aggregate.invocation_challenge_nonce_sha256s)
         != len(set(aggregate.invocation_challenge_nonce_sha256s))
@@ -5199,6 +5342,11 @@ def _verify_run_bundle(
             provider_response_id_sha256s=frozenset(aggregate.provider_response_id_sha256s),
             execution_evidence_sha256s=frozenset(aggregate.execution_evidence_sha256s),
             workflow_signature_sha256=workflow_authorization.signature_sha256,
+            credential_isolation=_credential_isolation_execution_identity(
+                tuple(
+                    (snapshot.sha256, snapshot.receipt.evidence) for snapshot in isolation_snapshots
+                )
+            ),
         ),
         workflow_authorization=workflow_authorization,
     )

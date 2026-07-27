@@ -212,7 +212,7 @@ def _credential_isolation_receipt(
     agent_projection_inventory_sha256 = "d" * 64
     source_inventory_sha256 = "e" * 64
     broker_image_id = "sha256:" + "f" * 64
-    environment_names = ("OPENAI_API_KEY",)
+    environment_names: tuple[str, ...] = ("OPENAI_API_KEY",)
     if agent is not None and repository is not None:
         assert agent.credential_broker is not None
         assert agent.api_key_env is not None
@@ -241,17 +241,23 @@ def _credential_isolation_receipt(
         broker_image_id=broker_image_id,
         docker_client_sha256=runtime.client_sha256,
         docker_runtime_fingerprint_sha256=runtime.fingerprint_sha256,
-        agent_container_id_sha256="3" * 64,
-        broker_container_id_sha256="4" * 64,
+        agent_container_id_sha256=hashlib.sha256(
+            f"{seed}:agent-container".encode("ascii")
+        ).hexdigest(),
+        broker_container_id_sha256=hashlib.sha256(
+            f"{seed}:broker-container".encode("ascii")
+        ).hexdigest(),
         internal_network_id_sha256=seed * 64,
-        internal_network_name_sha256="1" * 64,
+        internal_network_name_sha256=hashlib.sha256(
+            f"{seed}:internal-name".encode("ascii")
+        ).hexdigest(),
         outbound_network_id_sha256=hashlib.sha256(
             f"{seed}:outbound-id".encode("ascii")
         ).hexdigest(),
         outbound_network_name_sha256=hashlib.sha256(
             f"{seed}:outbound-name".encode("ascii")
         ).hexdigest(),
-        broker_lease_sha256="5" * 64,
+        broker_lease_sha256=hashlib.sha256(f"{seed}:broker-lease".encode("ascii")).hexdigest(),
         agent_command_inventory_sha256="0" * 64,
         agent_environment_inventory_sha256="6" * 64,
         agent_mount_inventory_sha256="7" * 64,
@@ -1199,6 +1205,22 @@ def construction_fixture(
             provider_response_id_sha256s=frozenset({_sha256(f"provider:{spec.token}".encode())}),
             execution_evidence_sha256s=frozenset({_sha256(f"execution:{spec.token}".encode())}),
             workflow_signature_sha256=authorization.signature_sha256,
+            credential_isolation=construction_module._CredentialIsolationExecutionIdentity(
+                receipt_sha256s=(_sha256(f"receipt:{spec.token}".encode()),),
+                broker_lease_sha256s=(_sha256(f"lease:{spec.token}".encode()),),
+                container_id_sha256s=(
+                    _sha256(f"agent-container:{spec.token}".encode()),
+                    _sha256(f"broker-container:{spec.token}".encode()),
+                ),
+                network_id_sha256s=(
+                    _sha256(f"internal-network-id:{spec.token}".encode()),
+                    _sha256(f"outbound-network-id:{spec.token}".encode()),
+                ),
+                network_name_sha256s=(
+                    _sha256(f"internal-network-name:{spec.token}".encode()),
+                    _sha256(f"outbound-network-name:{spec.token}".encode()),
+                ),
+            ),
         )
         return construction_module._VerifiedRunEvidence(
             artifact_receipt=receipt,
@@ -1214,7 +1236,7 @@ def construction_fixture(
         scenario: CorpusScenarioRecord,
         packages: tuple[MachineReviewPackageInput, ...],
         **_: object,
-    ) -> tuple[MachineReviewRecord, ...]:
+    ) -> construction_module._MachineReviewBuild:
         del packages
         qa_ids = tuple(sorted(attempt.attempt_id for attempt in scenario.agent_qa_attempts))
         output = MachineReviewOutput(
@@ -1224,32 +1246,35 @@ def construction_fixture(
             decision=MachineReviewDecision.ACCEPT,
         )
         input_sha256 = machine_review_input_manifest_sha256(scenario)
-        return tuple(
-            MachineReviewRecord(
-                review_id=f"review-{index}",
-                provider=provider,
-                model_id=f"{provider.value}-review-model",
-                reviewer_configuration_fingerprint=_sha256(
-                    f"review-config:{scenario.scenario_id}:{index}".encode()
-                ),
-                runtime_receipt_sha256=_sha256(
-                    f"review-runtime:{scenario.scenario_id}:{index}".encode()
-                ),
-                runtime_signer_identity=f"review-runner-{index}@example.test",
-                runtime_signing_key_fingerprint=(f"SHA256:{('A' if index == 0 else 'B') * 43}"),
-                runtime_allowed_signers_sha256=_sha256(
-                    f"review-trust:{scenario.scenario_id}:{index}".encode()
-                ),
-                runtime_signature_sha256=_sha256(
-                    f"review-signature:{scenario.scenario_id}:{index}".encode()
-                ),
-                prompt_sha256=MACHINE_REVIEW_PROMPT_SHA256,
-                input_manifest_sha256=input_sha256,
-                output_schema_sha256=MACHINE_REVIEW_OUTPUT_SCHEMA_SHA256,
-                output_sha256=_model_sha256(output),
-                output=output,
-            )
-            for index, provider in enumerate((ProviderId.OPENAI, ProviderId.ANTHROPIC))
+        return construction_module._MachineReviewBuild(
+            records=tuple(
+                MachineReviewRecord(
+                    review_id=f"review-{index}",
+                    provider=provider,
+                    model_id=f"{provider.value}-review-model",
+                    reviewer_configuration_fingerprint=_sha256(
+                        f"review-config:{scenario.scenario_id}:{index}".encode()
+                    ),
+                    runtime_receipt_sha256=_sha256(
+                        f"review-runtime:{scenario.scenario_id}:{index}".encode()
+                    ),
+                    runtime_signer_identity=f"review-runner-{index}@example.test",
+                    runtime_signing_key_fingerprint=(f"SHA256:{('A' if index == 0 else 'B') * 43}"),
+                    runtime_allowed_signers_sha256=_sha256(
+                        f"review-trust:{scenario.scenario_id}:{index}".encode()
+                    ),
+                    runtime_signature_sha256=_sha256(
+                        f"review-signature:{scenario.scenario_id}:{index}".encode()
+                    ),
+                    prompt_sha256=MACHINE_REVIEW_PROMPT_SHA256,
+                    input_manifest_sha256=input_sha256,
+                    output_schema_sha256=MACHINE_REVIEW_OUTPUT_SCHEMA_SHA256,
+                    output_sha256=_model_sha256(output),
+                    output=output,
+                )
+                for index, provider in enumerate((ProviderId.OPENAI, ProviderId.ANTHROPIC))
+            ),
+            credential_isolation_identities=(),
         )
 
     def materialize_review_workspace(*args: object, **kwargs: object) -> None:
@@ -1420,7 +1445,7 @@ def construction_fixture(
             blind_agent_solves=(),
         )
         static_inputs.append(static)
-        base, _, _, _ = construction_module._build_base_scenario_record(
+        base, _, _, _, _ = construction_module._build_base_scenario_record(
             scenario,
             static,
             repository=repository,
@@ -2006,6 +2031,198 @@ def test_credential_isolation_receipt_requires_distinct_network_identities(
 
     with pytest.raises(ValidationError, match="network identities must be distinct"):
         CredentialIsolationInvocationReceipt.model_validate(payload)
+
+
+def test_credential_isolation_receipt_requires_distinct_container_identities() -> None:
+    """One container identity cannot represent both agent and external broker."""
+    runtime = DockerRuntimeIdentity(
+        client_path="/usr/bin/docker",
+        client_sha256="1" * 64,
+        client_version="1.0",
+        context_name="default",
+        context_endpoint="unix:///synthetic/docker.sock",
+        context_endpoint_sha256="2" * 64,
+        server_platform="linux",
+        server_version="1.0",
+        server_api_version="1.0",
+        server_os="linux",
+        server_arch="amd64",
+    )
+    payload = _credential_isolation_receipt(runtime).model_dump(mode="json")
+    payload["broker_container_id_sha256"] = payload["agent_container_id_sha256"]
+
+    with pytest.raises(ValidationError, match="container identities must be distinct"):
+        CredentialIsolationInvocationReceipt.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("first_field", "second_field"),
+    (
+        ("internal_network_id_sha256", "internal_network_id_sha256"),
+        ("outbound_network_id_sha256", "outbound_network_id_sha256"),
+        ("internal_network_id_sha256", "outbound_network_id_sha256"),
+        ("outbound_network_id_sha256", "internal_network_id_sha256"),
+        ("internal_network_name_sha256", "internal_network_name_sha256"),
+        ("outbound_network_name_sha256", "outbound_network_name_sha256"),
+        ("internal_network_name_sha256", "outbound_network_name_sha256"),
+        ("outbound_network_name_sha256", "internal_network_name_sha256"),
+    ),
+)
+def test_machine_review_aggregation_rejects_reused_network_identity(
+    first_field: str,
+    second_field: str,
+) -> None:
+    """Validated reviews cannot reuse network identities across roles or invocations."""
+    runtime = DockerRuntimeIdentity(
+        client_path="/usr/bin/docker",
+        client_sha256="1" * 64,
+        client_version="1.0",
+        context_name="default",
+        context_endpoint="unix:///synthetic/docker.sock",
+        context_endpoint_sha256="2" * 64,
+        server_platform="linux",
+        server_version="1.0",
+        server_api_version="1.0",
+        server_os="linux",
+        server_arch="amd64",
+    )
+    first = _credential_isolation_receipt(runtime, seed="a")
+    second_payload = _credential_isolation_receipt(runtime, seed="b").model_dump(mode="json")
+    second_payload[second_field] = getattr(first, first_field)
+    second = CredentialIsolationInvocationReceipt.model_validate(second_payload)
+    identities = (
+        construction_module._credential_isolation_execution_identity((("a" * 64, first),)),
+        construction_module._credential_isolation_execution_identity((("b" * 64, second),)),
+    )
+
+    with pytest.raises(CorpusConstructionError, match="reuse one .* network .* identity"):
+        construction_module._require_unique_credential_isolation_identities(identities)
+
+
+def test_machine_review_aggregation_accepts_fresh_network_identities() -> None:
+    """Distinct validated internal and outbound networks satisfy the review aggregate."""
+    runtime = DockerRuntimeIdentity(
+        client_path="/usr/bin/docker",
+        client_sha256="1" * 64,
+        client_version="1.0",
+        context_name="default",
+        context_endpoint="unix:///synthetic/docker.sock",
+        context_endpoint_sha256="2" * 64,
+        server_platform="linux",
+        server_version="1.0",
+        server_api_version="1.0",
+        server_os="linux",
+        server_arch="amd64",
+    )
+    identities = tuple(
+        construction_module._credential_isolation_execution_identity(
+            ((seed * 64, _credential_isolation_receipt(runtime, seed=seed)),)
+        )
+        for seed in ("a", "b")
+    )
+
+    construction_module._require_unique_credential_isolation_identities(identities)
+
+
+@pytest.mark.parametrize(
+    ("first_field", "second_field"),
+    (
+        ("broker_lease_sha256", "broker_lease_sha256"),
+        ("agent_container_id_sha256", "broker_container_id_sha256"),
+        ("internal_network_id_sha256", "outbound_network_id_sha256"),
+        ("internal_network_name_sha256", "outbound_network_name_sha256"),
+    ),
+)
+def test_run_execution_aggregation_rejects_cross_bundle_credential_identity_reuse(
+    first_field: str,
+    second_field: str,
+) -> None:
+    """Different signed bundle receipts cannot hide reused broker runtime identities."""
+    runtime = DockerRuntimeIdentity(
+        client_path="/usr/bin/docker",
+        client_sha256="1" * 64,
+        client_version="1.0",
+        context_name="default",
+        context_endpoint="unix:///synthetic/docker.sock",
+        context_endpoint_sha256="2" * 64,
+        server_platform="linux",
+        server_version="1.0",
+        server_api_version="1.0",
+        server_os="linux",
+        server_arch="amd64",
+    )
+    first = _credential_isolation_receipt(runtime, seed="a")
+    second_payload = _credential_isolation_receipt(runtime, seed="b").model_dump(mode="json")
+    second_payload[second_field] = getattr(first, first_field)
+    second = CredentialIsolationInvocationReceipt.model_validate(second_payload)
+
+    def run_identity(
+        token: str,
+        receipt_sha256: str,
+        receipt: CredentialIsolationInvocationReceipt,
+    ) -> construction_module._RunExecutionIdentity:
+        return construction_module._RunExecutionIdentity(
+            invocation_ids=frozenset({_sha256(f"invocation:{token}".encode())}),
+            challenge_nonce_sha256s=frozenset({_sha256(f"challenge:{token}".encode())}),
+            provider_response_id_sha256s=frozenset({_sha256(f"provider:{token}".encode())}),
+            execution_evidence_sha256s=frozenset({_sha256(f"execution:{token}".encode())}),
+            workflow_signature_sha256=_sha256(f"signature:{token}".encode()),
+            credential_isolation=construction_module._credential_isolation_execution_identity(
+                ((receipt_sha256, receipt),)
+            ),
+        )
+
+    identities = (
+        run_identity("qa-scenario-one", "a" * 64, first),
+        run_identity("blind-scenario-two", "b" * 64, second),
+    )
+    assert (
+        identities[0].credential_isolation.receipt_sha256s
+        != identities[1].credential_isolation.receipt_sha256s
+    )
+
+    with pytest.raises(CorpusConstructionError, match="credentialed executions reuse one"):
+        construction_module._require_unique_run_executions(identities)
+
+
+def test_construction_aggregation_rejects_review_run_cross_scenario_reuse() -> None:
+    """The top-level gate compares review identities with QA/blind identities globally."""
+    runtime = DockerRuntimeIdentity(
+        client_path="/usr/bin/docker",
+        client_sha256="1" * 64,
+        client_version="1.0",
+        context_name="default",
+        context_endpoint="unix:///synthetic/docker.sock",
+        context_endpoint_sha256="2" * 64,
+        server_platform="linux",
+        server_version="1.0",
+        server_api_version="1.0",
+        server_os="linux",
+        server_arch="amd64",
+    )
+    review_receipt = _credential_isolation_receipt(runtime, seed="a")
+    run_payload = _credential_isolation_receipt(runtime, seed="b").model_dump(mode="json")
+    run_payload["broker_container_id_sha256"] = review_receipt.agent_container_id_sha256
+    run_receipt = CredentialIsolationInvocationReceipt.model_validate(run_payload)
+    review_identity = construction_module._credential_isolation_execution_identity(
+        (("a" * 64, review_receipt),)
+    )
+    run_identity = construction_module._RunExecutionIdentity(
+        invocation_ids=frozenset({_sha256(b"invocation:qa-scenario-two")}),
+        challenge_nonce_sha256s=frozenset({_sha256(b"challenge:qa-scenario-two")}),
+        provider_response_id_sha256s=frozenset({_sha256(b"provider:qa-scenario-two")}),
+        execution_evidence_sha256s=frozenset({_sha256(b"execution:qa-scenario-two")}),
+        workflow_signature_sha256=_sha256(b"signature:qa-scenario-two"),
+        credential_isolation=construction_module._credential_isolation_execution_identity(
+            (("b" * 64, run_receipt),)
+        ),
+    )
+
+    with pytest.raises(CorpusConstructionError, match="agent or broker container"):
+        construction_module._require_unique_construction_execution_identities(
+            (run_identity,),
+            (review_identity,),
+        )
 
 
 def test_review_image_global_configuration_fails_closed(

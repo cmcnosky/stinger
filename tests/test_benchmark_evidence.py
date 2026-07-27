@@ -808,11 +808,13 @@ class TestClassificationReplayEvidence:
                 agent_adapter="aider",
             )
 
-    def test_invocation_uniqueness_rejects_cross_role_network_reuse(
+    @pytest.mark.parametrize("reuse_kind", ("network", "container"))
+    def test_invocation_uniqueness_rejects_cross_role_runtime_identity_reuse(
         self,
         evidence_inputs: dict[str, Path],
+        reuse_kind: str,
     ) -> None:
-        """One invocation cannot reuse another invocation's agent network as egress."""
+        """One invocation cannot relabel another agent's network or container."""
         report = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
         (result,) = report.results
         run_dir = evidence_inputs["evidence"] / "runs" / result.scenario_id / str(result.repetition)
@@ -833,17 +835,31 @@ class TestClassificationReplayEvidence:
                 "provider_response_id_sha256": digest("second-provider-response"),
             }
         )
-        second_evidence = isolation.evidence.model_copy(
-            update={
-                "broker_lease_sha256": digest("second-lease"),
-                "agent_container_id_sha256": digest("second-agent-container"),
-                "broker_container_id_sha256": digest("second-broker-container"),
-                "internal_network_id_sha256": digest("second-internal-id"),
-                "internal_network_name_sha256": digest("second-internal-name"),
-                "outbound_network_id_sha256": (isolation.evidence.internal_network_id_sha256),
-                "outbound_network_name_sha256": (isolation.evidence.internal_network_name_sha256),
-            }
-        )
+        second_evidence_update = {
+            "broker_lease_sha256": digest("second-lease"),
+            "agent_container_id_sha256": digest("second-agent-container"),
+            "broker_container_id_sha256": digest("second-broker-container"),
+            "internal_network_id_sha256": digest("second-internal-id"),
+            "internal_network_name_sha256": digest("second-internal-name"),
+            "outbound_network_id_sha256": digest("second-outbound-id"),
+            "outbound_network_name_sha256": digest("second-outbound-name"),
+        }
+        if reuse_kind == "network":
+            second_evidence_update.update(
+                {
+                    "outbound_network_id_sha256": (isolation.evidence.internal_network_id_sha256),
+                    "outbound_network_name_sha256": (
+                        isolation.evidence.internal_network_name_sha256
+                    ),
+                }
+            )
+            expected_error = "network identities are not globally unique"
+        else:
+            second_evidence_update["broker_container_id_sha256"] = (
+                isolation.evidence.agent_container_id_sha256
+            )
+            expected_error = "container identities are not globally unique"
+        second_evidence = isolation.evidence.model_copy(update=second_evidence_update)
         second_isolation = isolation.model_copy(
             update={
                 "invocation_id": second_receipt.invocation_id,
@@ -853,7 +869,7 @@ class TestClassificationReplayEvidence:
 
         with pytest.raises(
             replay_module.ClassificationReplayError,
-            match="network identities are not globally unique",
+            match=expected_error,
         ):
             replay_module._require_unique_invocations(
                 (receipt, second_receipt),
