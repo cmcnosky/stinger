@@ -1,5 +1,15 @@
 #!/bin/sh
-# Seed a writable CODEX_HOME from the read-only credential mount, then exec the agent.
+# Ordinary-development helper: seed writable CODEX_HOME from a read-only credential mount,
+# then exec the agent.
+#
+# Protocol 2 rejects `credential_mount`; its external broker keeps the raw credential outside
+# this container and projects only an opaque lease plus the signed `openai_base_url` CLI
+# override, never `OPENAI_BASE_URL`. On that sealed path `/credentials` is absent and this
+# script goes directly to `exec "$@"`. Before launch, Protocol 2 has already required the
+# declared/default agent config home to be absent or empty and scanned final argv, workdir,
+# image metadata, and exported final rootfs for raw and encoded credential forms plus signed
+# prohibited paths. This helper is not evidence that a copied credential is isolated from a
+# networked agent.
 #
 # The Codex CLI writes into CODEX_HOME on startup — PATH aliases, an app-server client — so
 # pointing CODEX_HOME straight at the mount fails with "Read-only file system (os error 30)"

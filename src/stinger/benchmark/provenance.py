@@ -11,6 +11,12 @@ from uuid import uuid4
 from stinger.adapters.base import AgentAdapter
 from stinger.adapters.cli_base import AdapterSettingsError, CliAgentAdapter
 from stinger.adapters.shell import ShellAdapterError
+from stinger.benchmark.credential_broker import (
+    BROKER_SERVER_SOURCE,
+    broker_source_inventory_sha256,
+    credential_identity_payloads,
+    provider_route,
+)
 from stinger.benchmark.git_checkout import (
     DirtyGitCheckoutError,
     GitCheckoutError,
@@ -19,12 +25,15 @@ from stinger.benchmark.git_checkout import (
 )
 from stinger.benchmark.protocol import (
     BenchmarkRuntimeProvenance,
+    CredentialIsolationRuntimeProvenance,
     canonical_local_provider_binding_issues,
+    compiled_credential_isolation_policy,
     publication_pin_issues,
 )
 from stinger.benchmark.verification_image import (
     VerificationImagePolicyError,
     compiled_verification_image_policy,
+    verification_image_id_is_approved,
     verify_approved_verification_image,
 )
 from stinger.config import RunConfig
@@ -178,6 +187,85 @@ def verify_runtime_provenance(
             runtime=docker_runtime,
         )
 
+    credential_isolation: CredentialIsolationRuntimeProvenance | None = None
+    broker_image_id: str | None = None
+    broker_repo_digests: tuple[str, ...] = ()
+    broker = config.agent.credential_broker
+    if broker is None:
+        issues.append("credential_broker_configuration_missing")
+    elif docker_runtime is None:
+        issues.append("credential_broker_docker_runtime_unavailable")
+    else:
+        isolation_issues: list[str] = []
+        policy = compiled_credential_isolation_policy()
+        observed_broker_source_sha256: str | None = None
+        try:
+            observed_broker_source_sha256 = broker_source_inventory_sha256(checkout)
+        except ValueError:
+            isolation_issues.append("credential_broker_source_unobservable")
+        else:
+            if policy.broker_source_paths != (BROKER_SERVER_SOURCE,):
+                isolation_issues.append("credential_broker_source_paths_unapproved")
+            if observed_broker_source_sha256 != policy.broker_source_inventory_sha256:
+                isolation_issues.append("credential_broker_source_not_protocol_approved")
+
+        broker_image_id, broker_repo_digests = _docker_image_identity(
+            broker.image,
+            "credential_broker_image_unobservable",
+            isolation_issues,
+            runtime=docker_runtime,
+        )
+        if not _image_identity_matches(
+            broker.image_digest,
+            broker_image_id,
+            broker_repo_digests,
+        ):
+            isolation_issues.append("credential_broker_image_identity_mismatch")
+        if broker_image_id is None or not verification_image_id_is_approved(
+            compiled_verification_image_policy(),
+            broker_image_id,
+        ):
+            isolation_issues.append("credential_broker_image_not_protocol_approved")
+
+        identities: tuple[str, str, str, str] | None = None
+        if observed_broker_source_sha256 is not None and config.agent.api_key_env is not None:
+            try:
+                route = provider_route(config.agent.adapter, config.agent.provider)
+                identities = credential_identity_payloads(
+                    route=route,
+                    broker=broker,
+                    api_key_env=config.agent.api_key_env,
+                    source_inventory_sha256=observed_broker_source_sha256,
+                )
+            except ValueError:
+                isolation_issues.append("credential_broker_configuration_unresolved")
+        else:
+            isolation_issues.append("credential_broker_configuration_unresolved")
+        if (
+            identities is not None
+            and broker_image_id is not None
+            and observed_broker_source_sha256 is not None
+        ):
+            (
+                policy_sha256,
+                broker_configuration_sha256,
+                allowed_destination_inventory_sha256,
+                agent_projection_inventory_sha256,
+            ) = identities
+            credential_isolation = CredentialIsolationRuntimeProvenance(
+                policy_sha256=policy_sha256,
+                broker_configuration_sha256=broker_configuration_sha256,
+                allowed_destination_inventory_sha256=(allowed_destination_inventory_sha256),
+                agent_projection_inventory_sha256=agent_projection_inventory_sha256,
+                broker_source_inventory_sha256=observed_broker_source_sha256,
+                broker_image_id=broker_image_id,
+                broker_image_repo_digests=broker_repo_digests,
+                docker_runtime_fingerprint_sha256=docker_runtime.fingerprint_sha256,
+                verified=not isolation_issues,
+                verification_issues=tuple(dict.fromkeys(isolation_issues)),
+            )
+        issues.extend(isolation_issues)
+
     invocation: tuple[str, ...] = ()
     version_invocation: tuple[str, ...] = ()
     environment_names: tuple[str, ...] = ()
@@ -260,6 +348,7 @@ def verify_runtime_provenance(
         resolved_environment_names=environment_names,
         reasoning_effort=config.agent.reasoning_effort,
         inference_settings=config.agent.inference_settings,
+        credential_isolation=credential_isolation,
         verified=True,
     )
     issues.extend(publication_pin_issues(metadata, candidate))
@@ -292,7 +381,15 @@ def verify_runtime_provenance(
     if isinstance(adapter, CliAgentAdapter) and agent_image_id is not None:
         # Execute the immutable bytes that were inspected above. Keeping the mutable tag in
         # the adapter would permit a tag swap between preflight and the first model call.
-        adapter.config = adapter.config.model_copy(update={"container_image": agent_image_id})
+        pinned_broker = adapter.config.credential_broker
+        if pinned_broker is not None and broker_image_id is not None:
+            pinned_broker = pinned_broker.model_copy(update={"image": broker_image_id})
+        adapter.config = adapter.config.model_copy(
+            update={
+                "container_image": agent_image_id,
+                "credential_broker": pinned_broker,
+            }
+        )
     return candidate
 
 
@@ -311,6 +408,15 @@ def _docker_image_identity(
     except DockerRuntimeError:
         issues.append(issue)
         return None, ()
+
+
+def _image_identity_matches(
+    declared: str,
+    image_id: str | None,
+    repo_digests: tuple[str, ...],
+) -> bool:
+    """Return whether Docker's observed identity matches an immutable declaration."""
+    return image_id == declared or any(item.rpartition("@")[2] == declared for item in repo_digests)
 
 
 def _command_output(

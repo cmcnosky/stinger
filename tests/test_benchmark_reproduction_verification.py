@@ -13,6 +13,7 @@ import pytest
 
 from stinger import BENCHMARK_PROTOCOL_VERSION
 from stinger.benchmark.comparison import build_paired_comparison
+from stinger.benchmark.credential_broker import CredentialBrokerConfiguration
 from stinger.benchmark.evidence import (
     BUNDLE_FORMAT_VERSION,
     BUNDLE_MANIFEST,
@@ -32,7 +33,12 @@ from stinger.benchmark.gates import (
     reproduction_discrepancy_ledger_sha256,
     reproduction_modal_outcomes_sha256,
 )
-from stinger.benchmark.protocol import BenchmarkRuntimeProvenance, BenchmarkSplit, ProviderId
+from stinger.benchmark.protocol import (
+    BenchmarkRuntimeProvenance,
+    BenchmarkSplit,
+    CredentialIsolationRuntimeProvenance,
+    ProviderId,
+)
 from stinger.benchmark.reproduction import (
     CLASSIFICATION_FIELDS,
     EXCLUDED_RUN_FIELDS,
@@ -149,8 +155,13 @@ def _run_config(root: Path) -> RunConfig:
             cli_version="1.0.0",
             reasoning_effort="high",
             inference_settings={"temperature": 0.0},
+            api_key_env="OPENAI_API_KEY",
             container_image="synthetic-agent:1",
             container_image_digest=_AGENT_DIGEST,
+            credential_broker=CredentialBrokerConfiguration(
+                image="synthetic-runner:1",
+                image_digest=_VERIFICATION_DIGEST,
+            ),
         ),
         corpus=root / "sealed-corpus",
         output_dir=root / "output",
@@ -168,6 +179,16 @@ def _runtime(config: RunConfig) -> BenchmarkRuntimeProvenance:
     """Mirror every publication pin with mechanically observed synthetic provenance."""
     metadata = config.benchmark_metadata()
     assert metadata is not None
+    credential_identities = config._credential_isolation_identities()
+    assert credential_identities is not None
+    (
+        credential_policy_sha256,
+        broker_configuration_sha256,
+        allowed_destination_inventory_sha256,
+        agent_projection_inventory_sha256,
+        broker_source_inventory_sha256,
+    ) = credential_identities
+    assert metadata.credential_broker_image_digest is not None
     return BenchmarkRuntimeProvenance(
         requested_provider=metadata.provider,
         requested_model_id=metadata.model_id,
@@ -185,6 +206,17 @@ def _runtime(config: RunConfig) -> BenchmarkRuntimeProvenance:
         docker_client_sha256="d" * 64,
         docker_runtime_fingerprint_sha256="e" * 64,
         docker_runtime_claim_boundary=DOCKER_RUNTIME_CLAIM_BOUNDARY,
+        resolved_environment_names=("OPENAI_API_KEY",),
+        credential_isolation=CredentialIsolationRuntimeProvenance(
+            policy_sha256=credential_policy_sha256,
+            broker_configuration_sha256=broker_configuration_sha256,
+            allowed_destination_inventory_sha256=allowed_destination_inventory_sha256,
+            agent_projection_inventory_sha256=agent_projection_inventory_sha256,
+            broker_source_inventory_sha256=broker_source_inventory_sha256,
+            broker_image_id=metadata.credential_broker_image_digest,
+            docker_runtime_fingerprint_sha256="e" * 64,
+            verified=True,
+        ),
         verified=True,
     )
 

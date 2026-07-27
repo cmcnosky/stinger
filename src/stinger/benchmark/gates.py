@@ -44,8 +44,10 @@ from stinger.benchmark.protocol import (
     SCENARIOS_PER_FAMILY,
     TOTAL_SCENARIOS,
     BenchmarkSplit,
+    CredentialIsolationPolicy,
     ProviderId,
     canonical_local_provider_binding_issues,
+    compiled_credential_isolation_policy,
     publication_pin_issues,
 )
 from stinger.benchmark.signing import (
@@ -440,6 +442,7 @@ class PublicationIssueCode(StrEnum):
     BASELINE_PROTOCOL_NOT_FROZEN = "baseline_protocol_not_frozen"
     RUN_PROTOCOL_VERSION_MISMATCH = "run_protocol_version_mismatch"
     RUN_PUBLICATION_PIN_INCOMPLETE = "run_publication_pin_incomplete"
+    RUN_CREDENTIAL_ISOLATION_FAILED = "run_credential_isolation_failed"
     RUN_MISSING_FAMILY = "run_missing_family"
     RUN_MARKED_PARTIAL = "run_marked_partial"
     RUN_SCENARIO_SET_MISMATCH = "run_scenario_set_mismatch"
@@ -507,6 +510,7 @@ class BenchmarkProtocolManifest(_FrozenModel):
     benchmark_protocol_version: str
     rubric_version: str
     verification_image_policy: VerificationImagePolicy
+    credential_isolation_policy: CredentialIsolationPolicy
     pilot_selection_policy: PilotSelectionPolicy
     families: tuple[Family, ...]
     total_scenarios: int
@@ -571,6 +575,7 @@ def compiled_benchmark_protocol() -> BenchmarkProtocolManifest:
         benchmark_protocol_version=BENCHMARK_PROTOCOL_VERSION,
         rubric_version=RUBRIC_VERSION,
         verification_image_policy=compiled_verification_image_policy(),
+        credential_isolation_policy=compiled_credential_isolation_policy(),
         pilot_selection_policy=PilotSelectionPolicy(
             format_version=PILOT_SELECTION_POLICY_FORMAT_VERSION,
             population="complete-candidate-to-sealed-identity-set",
@@ -3343,11 +3348,12 @@ def _evaluate_configuration(
         report.benchmark_metadata,
         report.benchmark_runtime_provenance,
     ):
-        collector.add(
-            PublicationIssueCode.RUN_PUBLICATION_PIN_INCOMPLETE,
-            pin_issue,
-            subject,
+        issue_code = (
+            PublicationIssueCode.RUN_CREDENTIAL_ISOLATION_FAILED
+            if pin_issue.startswith("credential_")
+            else PublicationIssueCode.RUN_PUBLICATION_PIN_INCOMPLETE
         )
+        collector.add(issue_code, pin_issue, subject)
     if (
         report.benchmark_metadata is None
         or report.benchmark_metadata.run_seed != protocol.baseline_run_seed

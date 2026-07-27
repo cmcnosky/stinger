@@ -17,15 +17,30 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
+from stinger.benchmark.credential_broker import (
+    CredentialBrokerConfiguration,
+    credential_identity_payloads,
+    provider_route,
+)
 from stinger.benchmark.protocol import (
     BenchmarkRunMetadata,
     ProviderId,
     canonical_agent_configuration_fingerprint,
+    compiled_credential_isolation_policy,
 )
 from stinger.harness.sandbox import DEFAULT_IMAGE, Isolation
 from stinger.models import Family
@@ -82,6 +97,8 @@ class AgentConfig(BaseModel):
     # this harness had an uncontained agent read its own memory file and pull notes about an
     # unrelated project into the recorded evidence.
     credential_mount: Path | None = None
+    credential_broker: CredentialBrokerConfiguration | None = None
+    """External broker required for every credentialed Protocol 2 agent container."""
 
     @field_validator("credential_mount")
     @classmethod
@@ -108,6 +125,40 @@ class AgentConfig(BaseModel):
     def _immutable_agent_image(cls, value: str | None) -> str | None:
         """Validate an agent image pin through the benchmark provenance contract."""
         return BenchmarkRunMetadata(agent_container_digest=value).agent_container_digest
+
+    @model_validator(mode="after")
+    def _closed_broker_projection(self) -> AgentConfig:
+        """Reject every raw-credential or routing bypass beside a broker selection."""
+        if self.credential_broker is None:
+            return self
+        if self.container_image is None or self.container_image_digest is None:
+            raise ValueError("credential broker requires an immutable contained agent image")
+        if self.credential_mount is not None:
+            raise ValueError("credential broker forbids credential_mount")
+        if self.options:
+            raise ValueError(
+                "credential broker forbids caller-supplied environment options because the "
+                "configuration looks secret-bearing or can bypass the broker"
+            )
+        if self.api_key_env is None:
+            raise ValueError("credential broker requires one explicit provider credential env")
+        expected_environment: dict[tuple[str, ProviderId | None], str] = {
+            ("codex", ProviderId.OPENAI): "OPENAI_API_KEY",
+            ("claude-code", ProviderId.ANTHROPIC): "ANTHROPIC_API_KEY",
+        }
+        expected = expected_environment.get((self.adapter, self.provider))
+        if expected is None or self.api_key_env != expected:
+            raise ValueError(
+                "credential broker supports only codex/OpenAI OPENAI_API_KEY and "
+                "claude-code/Anthropic ANTHROPIC_API_KEY"
+            )
+        forbidden_setting = re.compile(
+            r"(?:base[_-]?url|endpoint|proxy|provider|api[_-]?key|auth|credential|token)",
+            re.IGNORECASE,
+        )
+        if any(forbidden_setting.search(name) for name in self.inference_settings):
+            raise ValueError("credential broker forbids routing or credential inference settings")
+        return self
 
 
 class JudgeConfig(BaseModel):
@@ -255,6 +306,7 @@ class RunConfig(BaseModel):
                 "cli_version",
                 "reasoning_effort",
                 "container_image_digest",
+                "credential_broker",
             ):
                 if agent_payload[field] is None:
                     agent_payload.pop(field)
@@ -268,6 +320,7 @@ class RunConfig(BaseModel):
 
     def agent_configuration_fingerprint(self) -> str:
         """Return the seed/corpus/order-independent identity used by the release matrix."""
+        credential_identities = self._credential_isolation_identities()
         return canonical_agent_configuration_fingerprint(
             provider=self.agent.provider,
             model_id=self.agent.model,
@@ -276,6 +329,44 @@ class RunConfig(BaseModel):
             reasoning_effort=self.agent.reasoning_effort,
             inference_settings=self.agent.inference_settings,
             agent_container_digest=self.agent.container_image_digest,
+            credential_broker_configuration_sha256=(
+                None if credential_identities is None else credential_identities[1]
+            ),
+        )
+
+    def _credential_isolation_identities(
+        self,
+    ) -> tuple[str, str, str, str, str] | None:
+        """Derive non-secret policy, broker, destination, projection, and source hashes."""
+        broker = self.agent.credential_broker
+        api_key_env = self.agent.api_key_env
+        if broker is None or api_key_env is None:
+            return None
+        # Configuration identity binds the source hash signed into Protocol 2. Runtime
+        # provenance and the broker controller independently observe the actual checkout
+        # bytes before any sealed agent launch; metadata construction must also work from an
+        # installed wheel where repository source is intentionally absent.
+        source_inventory_sha256 = (
+            compiled_credential_isolation_policy().broker_source_inventory_sha256
+        )
+        route = provider_route(self.agent.adapter, self.agent.provider)
+        (
+            policy_sha256,
+            broker_configuration_sha256,
+            allowed_destination_inventory_sha256,
+            agent_projection_inventory_sha256,
+        ) = credential_identity_payloads(
+            route=route,
+            broker=broker,
+            api_key_env=api_key_env,
+            source_inventory_sha256=source_inventory_sha256,
+        )
+        return (
+            policy_sha256,
+            broker_configuration_sha256,
+            allowed_destination_inventory_sha256,
+            agent_projection_inventory_sha256,
+            source_inventory_sha256,
         )
 
     def benchmark_metadata(self) -> BenchmarkRunMetadata | None:
@@ -289,6 +380,7 @@ class RunConfig(BaseModel):
         """
         if self.benchmark_protocol_version is None:
             return None
+        credential_identities = self._credential_isolation_identities()
         return BenchmarkRunMetadata(
             benchmark_protocol_version=self.benchmark_protocol_version,
             provider=self.agent.provider,
@@ -302,6 +394,26 @@ class RunConfig(BaseModel):
             verification_image_digest=self.verification_image_digest,
             run_seed=self.run_seed,
             agent_configuration_fingerprint=self.agent_configuration_fingerprint(),
+            credential_isolation_policy_sha256=(
+                None if credential_identities is None else credential_identities[0]
+            ),
+            credential_broker_configuration_sha256=(
+                None if credential_identities is None else credential_identities[1]
+            ),
+            credential_allowed_destination_inventory_sha256=(
+                None if credential_identities is None else credential_identities[2]
+            ),
+            credential_agent_projection_inventory_sha256=(
+                None if credential_identities is None else credential_identities[3]
+            ),
+            credential_broker_source_inventory_sha256=(
+                None if credential_identities is None else credential_identities[4]
+            ),
+            credential_broker_image_digest=(
+                None
+                if self.agent.credential_broker is None
+                else self.agent.credential_broker.image_digest
+            ),
         )
 
     def resolved_json(self) -> str:

@@ -2,9 +2,10 @@
 #
 # Distinct from runner.Dockerfile, and the distinction is the whole point:
 #
-#   runner.Dockerfile     verification commands. No network, no credentials, no agent.
-#   codex-agent.Dockerfile the agent itself. Network on (it must reach its model API),
-#                          credential forwarded in, nothing mounted but the workdir.
+#   runner.Dockerfile      verification commands. No network, no credentials, no agent.
+#   codex-agent.Dockerfile the agent itself. Networked in ordinary development; Protocol 2
+#                          gives it only a broker-internal network, opaque lease, signed
+#                          `openai_base_url` CLI override, and the workdir.
 #
 # Without an image like this, `AgentConfig.container_image` is unset and the adapter drives
 # the agent as a host subprocess with its cwd set. That is process-level isolation, not
@@ -26,18 +27,32 @@
 #       container_image: stinger-codex-agent:1
 #       api_key_env: OPENAI_API_KEY
 #
-# The credential is forwarded by NAME (see harness/sandbox.py docker_argv), so it never
-# enters the recorded argv or the reproducibility package. Nothing is baked into this image:
-# an image layer carrying a credential would leak it to everyone who can pull the image.
+# That example is the ordinary-development path: the raw credential is forwarded by NAME
+# (see harness/sandbox.py), so it avoids recorded argv but remains readable by the agent.
+# Protocol 2 rejects direct forwarding and credential mounts. Its external broker alone gets
+# the raw value; this container receives the signed `openai_base_url` CLI override and an
+# opaque lease on a fresh isolated IPv4 Docker bridge, never `OPENAI_BASE_URL`. That bridge
+# has no host gateway or IPv6. Docker's embedded DNS resolves the broker alias while upstream
+# DNS is pinned to loopback/root search with bounded retries; inherited image healthchecks are
+# disabled. Nothing is baked into this image: before the broker or network starts, sealed
+# preflight scans the final argv and workdir paths/links/files, canonical image runtime
+# metadata, and exported final rootfs for raw, hex, standard or URL-safe Base64, and
+# percent-encoded credential forms. Signed prohibited credential paths fail closed too.
+#
+# This Dockerfile is not an approved Protocol 2 agent-image supply chain. Its immutable image
+# ID can be observed and its final filesystem scanned, but no signed source/attestation
+# allowlist yet establishes how those executable bytes were produced. That separate gate is
+# a release HOLD, and no sealed/live execution is claimed here.
 
 # Node is copied from the official image rather than installed by a piped shell script. The
 # corpus this harness ships has a scenario for `curl … | sh` precisely because it is a supply
 # chain a reader cannot audit, and building the tool that measures that with the thing it
 # measures would be indefensible.
 #
-# Bases are pinned by tag, not digest — deliberately: a digest freezes security patches too.
-# The version pins that matter to comparability are the explicit ones (CODEX_VERSION, the
-# pytest pin), which travel in the config fingerprint's image name.
+# Bases are pinned by tag, not digest, for this ordinary-development image. Protocol 2 records
+# an immutable observed agent image ID but still requires a separate signed source/attestation
+# policy before these bytes may execute a sealed prompt. CODEX_VERSION and pytest remain
+# explicit so development runs do not silently float those tools.
 FROM node:22-bookworm-slim AS node
 
 FROM python:3.12-slim-bookworm
@@ -76,9 +91,11 @@ RUN npm install -g --no-fund --no-audit "@openai/codex@${CODEX_VERSION}" \
 # land somewhere world-writable. CODEX_HOME is set explicitly, and deliberately NOT under
 # $HOME: left to default it becomes /tmp/.codex, and the CLI then refuses to create its helper
 # binaries beneath a temporary directory and warns on every single run — noise in every
-# transcript this harness keeps as evidence. /opt/codex-home is also the path a config
-# overrides when mounting a credential directory, which makes that override visible rather
-# than magic.
+# transcript this harness keeps as evidence. /opt/codex-home is also the path an
+# ordinary-development config uses when copying a credential directory. The Protocol 2
+# broker path mounts no credential directory and requires this declared config home to be
+# absent or empty in the final image. The directory created below is therefore intentionally
+# empty; any child or credential-bearing path makes sealed preflight fail closed.
 ENV CODEX_HOME=/opt/codex-home \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONHASHSEED=0
@@ -89,8 +106,11 @@ ENV CODEX_HOME=/opt/codex-home \
 # in every transcript this harness records as evidence.
 RUN mkdir -p "${CODEX_HOME}" && chmod 1777 "${CODEX_HOME}"
 
-# Copies the read-only credential mount into the writable CODEX_HOME before exec'ing the
-# agent. See the script for why the mount cannot simply be CODEX_HOME itself.
+# Ordinary-development helper: copies a read-only credential mount into writable CODEX_HOME
+# before exec'ing the agent. Protocol 2 rejects that mount, so the same entrypoint simply
+# execs with the broker lease and signed `openai_base_url` CLI projection. `/credentials` is
+# absent and CODEX_HOME was mechanically verified empty before sealed launch. See the script
+# for the legacy mount detail.
 COPY docker/codex-agent-entrypoint.sh /usr/local/bin/codex-agent-entrypoint
 RUN chmod 0755 /usr/local/bin/codex-agent-entrypoint
 

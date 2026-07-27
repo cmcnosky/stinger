@@ -29,8 +29,10 @@ jobs:
         run: pip install -e ".[dev]"
       - name: Build the verification image
         # Runners have Docker, so the container-isolation tests run here for real rather
-        # than skipping. The export recipe is deliberately deterministic: the signed
-        # Protocol 2 policy rejects any image ID other than the one frozen for amd64.
+        # than skipping. The loaded verifier image also supplies the pinned Python runtime
+        # for the synthetic provider/broker/agent topology; no mutable helper image is
+        # pulled into the daemon. The export recipe is deliberately deterministic: the
+        # signed Protocol 2 policy rejects any image ID other than the one frozen for amd64.
         run: |
           docker buildx build --no-cache --provenance=false \
             --build-arg SOURCE_DATE_EPOCH=0 \
@@ -57,6 +59,8 @@ jobs:
           PY
       - name: Gate
         run: ./scripts/check.sh
+        env:
+          STINGER_REQUIRE_REAL_DOCKER_TESTS: "1"
 
   installed:
     name: the installed package works
@@ -81,6 +85,60 @@ jobs:
         run: |
           cd "$(mktemp -d)"
           python -c "import stinger; print(stinger.__version__, stinger.RUBRIC_VERSION, stinger.BENCHMARK_PROTOCOL_VERSION)"
+          python - <<'PY'
+          import os
+
+          from stinger.adapters.credential_broker import CredentialBrokerSession
+          from stinger import BENCHMARK_PROTOCOL_VERSION
+          from stinger.benchmark.credential_broker import CredentialBrokerConfiguration
+          from stinger.benchmark.protocol import (
+              ProviderId,
+              compiled_credential_isolation_policy,
+          )
+          from stinger.config import AgentConfig, RunConfig
+          from stinger.docker_runtime import DockerRuntimeIdentity
+
+          digest = "sha256:" + "1" * 64
+          config = RunConfig(
+              agent=AgentConfig(
+                  adapter="codex",
+                  model="synthetic-model",
+                  provider=ProviderId.OPENAI,
+                  api_key_env="OPENAI_API_KEY",
+                  container_image=digest,
+                  container_image_digest=digest,
+                  credential_broker=CredentialBrokerConfiguration(
+                      image=digest,
+                      image_digest=digest,
+                  ),
+              ),
+              benchmark_protocol_version=BENCHMARK_PROTOCOL_VERSION,
+          )
+          assert len(config.agent_configuration_fingerprint()) == 64
+          assert config.benchmark_metadata() is not None
+          os.environ["OPENAI_API_KEY"] = "synthetic-installed-package-credential"
+          session = CredentialBrokerSession(
+              config.agent,
+              runtime=DockerRuntimeIdentity(
+                  client_path="/usr/bin/docker",
+                  client_sha256="2" * 64,
+                  client_version="synthetic",
+                  context_name="default",
+                  context_endpoint="unix:///synthetic/docker.sock",
+                  context_endpoint_sha256="3" * 64,
+                  server_platform="linux",
+                  server_version="synthetic",
+                  server_api_version="synthetic",
+                  server_os="linux",
+                  server_arch="amd64",
+              ),
+          )
+          assert session._resolved_broker_source().is_file()
+          assert session._observed_broker_source_inventory_sha256() == (
+              compiled_credential_isolation_policy().broker_source_inventory_sha256
+          )
+          print("installed broker metadata and source: verified")
+          PY
           # Check the template FILES shipped, not that the module imports — templates load
           # lazily inside _render, so a wheel missing its package data imports cleanly and
           # fails only at report time, which is exactly the gap this job exists to catch.

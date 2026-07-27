@@ -58,6 +58,16 @@ from stinger.benchmark.candidate_receipt import (
     _verify_canaries,
 )
 from stinger.benchmark.corpus_promotion import SEALED_VALIDATION_CONTRACT
+from stinger.benchmark.credential_broker import (
+    CredentialBrokerConfiguration,
+    CredentialIsolationInvocationReceipt,
+    agent_environment_names,
+    broker_source_inventory_sha256,
+    canonical_json_bytes,
+    credential_identity_payloads,
+    provider_route,
+    sha256_bytes,
+)
 from stinger.benchmark.evidence import (
     EvidenceBundleError,
     EvidenceRole,
@@ -107,12 +117,16 @@ from stinger.benchmark.protocol import (
     BenchmarkRuntimeProvenance,
     BenchmarkSplit,
     ProviderId,
+    canonical_credential_isolation_policy_sha256,
     canonical_local_provider_binding_issues,
+    compiled_credential_isolation_policy,
     publication_pin_issues,
 )
 from stinger.benchmark.replay import (
+    CREDENTIAL_ISOLATION_RECEIPT_NAME,
     INVOCATION_AGGREGATE_NAME,
     ClassificationReplayError,
+    load_credential_isolation_receipt_snapshot,
     verify_invocation_aggregate_snapshot,
 )
 from stinger.benchmark.signing import (
@@ -163,17 +177,11 @@ CORPUS_CONSTRUCTION_SIGNATURE_NAMESPACE = "stinger-benchmark-corpus-construction
 MACHINE_REVIEW_RUNTIME_SIGNATURE_NAMESPACE = "stinger-benchmark-machine-review-runtime"
 """Domain separator for a machine runner's exact review invocation receipt."""
 
-MACHINE_REVIEW_RUNTIME_FORMAT_VERSION: Literal["6"] = "6"
-"""Version of the signed, transcript-bearing machine-review runtime contract."""
+MACHINE_REVIEW_RUNTIME_FORMAT_VERSION: Literal["7"] = "7"
+"""Version of the credential-isolated, signed machine-review runtime contract."""
 
-MACHINE_REVIEW_CONFIGURATION_FORMAT_VERSION: Literal["4"] = "4"
-"""Reviewer configuration format that includes the canonical executable adapter."""
-
-CODEX_CREDENTIAL_PROJECTION_POLICY = "codex-auth-json-only-v1"
-"""Codex reviews receive one copied ``auth.json`` and no other caller state."""
-
-CLAUDE_CREDENTIAL_PROJECTION_POLICY = "claude-explicit-auth-env-only-v1"
-"""Claude reviews receive one explicitly named auth variable and no config directory."""
+MACHINE_REVIEW_CONFIGURATION_FORMAT_VERSION: Literal["5"] = "5"
+"""Reviewer configuration format that binds the external credential broker."""
 
 RESOLUTION_EXECUTION_FORMAT_VERSION: Literal["4"] = "4"
 """Resolution receipt format with normalized semantic and mechanism identities."""
@@ -190,6 +198,9 @@ MACHINE_REVIEW_INPUT_FILENAME = "machine-review-input.json"
 
 MACHINE_REVIEW_EVIDENCE_MANIFEST_FILENAME = "machine-review-evidence-manifest.json"
 """Canonical inventory describing every model-visible review evidence byte."""
+
+CREDENTIAL_ISOLATION_RECEIPT_FILENAME = "credential-isolation.json"
+"""Canonical broker evidence retained beside every signed machine-review runtime."""
 
 AGENT_RUN_WORKFLOW_CLAIM_BOUNDARY = (
     "signed local workflow and operating-system-environment evidence binding a verified "
@@ -504,7 +515,7 @@ class ResolutionExecutionReceipt(_ClosedModel):
 class MachineReviewerConfigurationReceipt(_ClosedModel):
     """Closed, exact reviewer configuration whose bytes define its fingerprint."""
 
-    format_version: Literal["4"]
+    format_version: Literal["5"]
     claim_boundary: str
     review_id: str
     provider: ProviderId
@@ -518,8 +529,13 @@ class MachineReviewerConfigurationReceipt(_ClosedModel):
     docker_runtime_claim_boundary: str
     docker_client_sha256: str
     docker_runtime_fingerprint_sha256: str
-    credential_projection_policy: str
-    credential_projection_inventory_sha256: str
+    credential_isolation_policy_sha256: str
+    broker_configuration_sha256: str
+    allowed_destination_inventory_sha256: str
+    agent_projection_inventory_sha256: str
+    broker_source_inventory_sha256: str
+    broker_image_id: str
+    broker_runtime_identity_sha256: str
 
     @field_validator("review_id", "model_id", "agent_adapter", "reasoning_effort")
     @classmethod
@@ -545,7 +561,12 @@ class MachineReviewerConfigurationReceipt(_ClosedModel):
         "agent_container_digest",
         "docker_client_sha256",
         "docker_runtime_fingerprint_sha256",
-        "credential_projection_inventory_sha256",
+        "credential_isolation_policy_sha256",
+        "broker_configuration_sha256",
+        "allowed_destination_inventory_sha256",
+        "agent_projection_inventory_sha256",
+        "broker_source_inventory_sha256",
+        "broker_runtime_identity_sha256",
     )
     @classmethod
     def _runtime_hash(cls, value: str) -> str:
@@ -558,14 +579,25 @@ class MachineReviewerConfigurationReceipt(_ClosedModel):
             raise ValueError("reviewer Docker-runtime claim boundary is fixed")
         return value
 
+    @field_validator("broker_image_id")
+    @classmethod
+    def _broker_image(cls, value: str) -> str:
+        if (
+            not value.startswith("sha256:")
+            or _SHA256_PATTERN.fullmatch(value.removeprefix("sha256:")) is None
+        ):
+            raise ValueError("reviewer broker image identity must be an immutable sha256 id")
+        return value
+
     @model_validator(mode="after")
-    def _credential_policy_matches_adapter(self) -> MachineReviewerConfigurationReceipt:
-        expected = {
-            "codex": CODEX_CREDENTIAL_PROJECTION_POLICY,
-            "claude-code": CLAUDE_CREDENTIAL_PROJECTION_POLICY,
-        }.get(self.agent_adapter)
-        if expected is None or self.credential_projection_policy != expected:
-            raise ValueError("reviewer credential projection policy does not match adapter")
+    def _credential_isolation_protocol(self) -> MachineReviewerConfigurationReceipt:
+        expected_policy = canonical_credential_isolation_policy_sha256(
+            compiled_credential_isolation_policy()
+        )
+        if self.credential_isolation_policy_sha256 != expected_policy:
+            raise ValueError("reviewer credential-isolation policy is not Protocol 2")
+        if self.broker_runtime_identity_sha256 != self.docker_runtime_fingerprint_sha256:
+            raise ValueError("reviewer broker and agent Docker runtime identities differ")
         return self
 
 
@@ -728,7 +760,7 @@ class MachineReviewInputReceipt(_ClosedModel):
 class MachineReviewRuntimeReceipt(_ClosedModel):
     """Signed runner observation binding invocation, transcript, and parsed output."""
 
-    format_version: Literal["6"]
+    format_version: Literal["7"]
     claim_boundary: str
     review_id: str
     runner_identity: str
@@ -747,8 +779,14 @@ class MachineReviewRuntimeReceipt(_ClosedModel):
     docker_runtime_claim_boundary: str
     docker_client_sha256: str
     docker_runtime_fingerprint_sha256: str
-    credential_projection_policy: str
-    credential_projection_inventory_sha256: str
+    credential_isolation_policy_sha256: str
+    broker_configuration_sha256: str
+    allowed_destination_inventory_sha256: str
+    agent_projection_inventory_sha256: str
+    broker_source_inventory_sha256: str
+    broker_image_id: str
+    broker_runtime_identity_sha256: str
+    credential_isolation_receipt_sha256: str
     provider_response_id: str
     parsed_final_message_sha256: str
     invocation_id_sha256: str
@@ -789,7 +827,13 @@ class MachineReviewRuntimeReceipt(_ClosedModel):
         "agent_container_digest",
         "docker_client_sha256",
         "docker_runtime_fingerprint_sha256",
-        "credential_projection_inventory_sha256",
+        "credential_isolation_policy_sha256",
+        "broker_configuration_sha256",
+        "allowed_destination_inventory_sha256",
+        "agent_projection_inventory_sha256",
+        "broker_source_inventory_sha256",
+        "broker_runtime_identity_sha256",
+        "credential_isolation_receipt_sha256",
         "parsed_final_message_sha256",
         "invocation_id_sha256",
     )
@@ -811,14 +855,25 @@ class MachineReviewRuntimeReceipt(_ClosedModel):
             raise ValueError("machine-review invocation must contain canonical arguments")
         return value
 
+    @field_validator("broker_image_id")
+    @classmethod
+    def _broker_image(cls, value: str) -> str:
+        if (
+            not value.startswith("sha256:")
+            or _SHA256_PATTERN.fullmatch(value.removeprefix("sha256:")) is None
+        ):
+            raise ValueError("runtime broker image identity must be an immutable sha256 id")
+        return value
+
     @model_validator(mode="after")
-    def _credential_policy_matches_adapter(self) -> MachineReviewRuntimeReceipt:
-        expected = {
-            "codex": CODEX_CREDENTIAL_PROJECTION_POLICY,
-            "claude-code": CLAUDE_CREDENTIAL_PROJECTION_POLICY,
-        }.get(self.agent_adapter)
-        if expected is None or self.credential_projection_policy != expected:
-            raise ValueError("runtime credential projection policy does not match adapter")
+    def _credential_isolation_protocol(self) -> MachineReviewRuntimeReceipt:
+        expected_policy = canonical_credential_isolation_policy_sha256(
+            compiled_credential_isolation_policy()
+        )
+        if self.credential_isolation_policy_sha256 != expected_policy:
+            raise ValueError("runtime credential-isolation policy is not Protocol 2")
+        if self.broker_runtime_identity_sha256 != self.docker_runtime_fingerprint_sha256:
+            raise ValueError("runtime broker and agent Docker runtime identities differ")
         return self
 
 
@@ -1080,6 +1135,17 @@ class VerifiedRunBundleInput:
 
 
 @dataclass(frozen=True, slots=True)
+class _CredentialIsolationExecutionIdentity:
+    """Receipt-bound identities that must be fresh for every brokered invocation."""
+
+    receipt_sha256s: tuple[str, ...]
+    broker_lease_sha256s: tuple[str, ...]
+    container_id_sha256s: tuple[str, ...]
+    network_id_sha256s: tuple[str, ...]
+    network_name_sha256s: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _RunExecutionIdentity:
     """Uniqueness evidence retained while composing QA and blind runs."""
 
@@ -1088,6 +1154,15 @@ class _RunExecutionIdentity:
     provider_response_id_sha256s: frozenset[str]
     execution_evidence_sha256s: frozenset[str]
     workflow_signature_sha256: str
+    credential_isolation: _CredentialIsolationExecutionIdentity
+
+
+@dataclass(frozen=True, slots=True)
+class _MachineReviewBuild:
+    """Review records plus exact credential identities retained for global checks."""
+
+    records: tuple[MachineReviewRecord, ...]
+    credential_isolation_identities: tuple[_CredentialIsolationExecutionIdentity, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1119,6 +1194,7 @@ class MachineReviewPackageInput:
     configuration_receipt: Path
     input_receipt: Path
     review_workspace: Path
+    credential_isolation_receipt: Path
     runtime_receipt: Path
     transcript: Path
     output: Path
@@ -1247,6 +1323,7 @@ class ConstructionMachineReviewManifest(_ClosedModel):
     configuration_receipt: str
     input_receipt: str
     review_workspace: str
+    credential_isolation_receipt: str
     runtime_receipt: str
     transcript: str
     output: str
@@ -1258,6 +1335,7 @@ class ConstructionMachineReviewManifest(_ClosedModel):
         "configuration_receipt",
         "input_receipt",
         "review_workspace",
+        "credential_isolation_receipt",
         "runtime_receipt",
         "transcript",
         "output",
@@ -1781,6 +1859,10 @@ def _build_corpus_construction_from_snapshot(
         str,
         tuple[VerifiedMachineWorkflowAttestation, ...],
     ] = {}
+    review_credential_isolation_identities: dict[
+        str,
+        tuple[_CredentialIsolationExecutionIdentity, ...],
+    ] = {}
     artifact_inventory: list[dict[str, Any]] = []
     for index, scenario in enumerate(sorted(loaded, key=lambda item: item.id)):
         item = inputs_by_path[scenario.directory.resolve()]
@@ -1790,9 +1872,11 @@ def _build_corpus_construction_from_snapshot(
                 inventory,
                 execution_identities,
                 workflow_authorizations,
+                review_isolation_identities,
             ) = _build_base_scenario_record(
                 scenario,
                 item,
+                repository=repository,
                 corpus_version=corpus_version,
                 corpus_hash_value=derived_corpus_hash,
                 promotion=promotion,
@@ -1818,6 +1902,7 @@ def _build_corpus_construction_from_snapshot(
         base_records[record.scenario_id] = record
         qa_execution_identities[record.scenario_id] = execution_identities
         qa_workflow_authorizations[record.scenario_id] = workflow_authorizations
+        review_credential_isolation_identities[record.scenario_id] = review_isolation_identities
         artifact_inventory.append(inventory)
 
     selected_blind_ids = _selected_blind_solve_ids(
@@ -1825,6 +1910,8 @@ def _build_corpus_construction_from_snapshot(
         corpus_hash_value=derived_corpus_hash,
     )
     final_records: list[CorpusScenarioRecord] = []
+    all_run_execution_identities: list[_RunExecutionIdentity] = []
+    all_review_isolation_identities: list[_CredentialIsolationExecutionIdentity] = []
     for index, scenario in enumerate(sorted(loaded, key=lambda item: item.id)):
         item = inputs_by_path[scenario.directory.resolve()]
         base = base_records[scenario.id]
@@ -1876,12 +1963,11 @@ def _build_corpus_construction_from_snapshot(
                     | frozenset(review_trust_policies)
                 ),
             )
-            _require_unique_run_executions(
-                (
-                    *qa_execution_identities[scenario.id],
-                    *blind_execution_identities,
-                )
+            scenario_execution_identities = (
+                *qa_execution_identities[scenario.id],
+                *blind_execution_identities,
             )
+            _require_unique_run_executions(scenario_execution_identities)
         except CorpusConstructionError:
             raise
         except (EvidenceBundleError, OSError, ValidationError, ValueError):
@@ -1894,9 +1980,16 @@ def _build_corpus_construction_from_snapshot(
             }
         )
         final_records.append(record)
+        all_run_execution_identities.extend(scenario_execution_identities)
+        all_review_isolation_identities.extend(review_credential_isolation_identities[scenario.id])
         artifact_inventory[index]["blind_agent_solves_sha256"] = _canonical_payload_sha256(
             [solve.model_dump(mode="json") for solve in blind_solves]
         )
+
+    _require_unique_construction_execution_identities(
+        tuple(all_run_execution_identities),
+        tuple(all_review_isolation_identities),
+    )
 
     try:
         resolution_sandbox.verify_runtime_unchanged()
@@ -2149,18 +2242,6 @@ class _ObservedReviewRuntime:
     cli_binary_sha256: str
     cli_version: str
     docker_runtime: DockerRuntimeIdentity
-
-
-@dataclass(frozen=True, slots=True)
-class _ReviewCredentialProjection:
-    """Private auth-only projection plus a non-secret structural commitment."""
-
-    mount: Path | None
-    policy: str
-    inventory_sha256: str
-    secret_values: tuple[bytes, ...]
-    environment_name: str | None
-    credential_bytes: bytes | None
 
 
 def _canonical_review_segment(value: str, *, label: str) -> str:
@@ -2510,6 +2591,88 @@ def _verify_machine_review_workspace(
     return snapshot
 
 
+def _require_review_credential_isolation_configuration(agent: AgentConfig) -> None:
+    """Reject every machine-review configuration that can expose raw credentials."""
+    if agent.options:
+        raise CorpusConstructionError(
+            "machine-review workflow forbids caller-supplied environment options"
+        )
+    if agent.credential_mount is not None:
+        raise CorpusConstructionError("machine-review workflow forbids raw credential mounts")
+    if getattr(agent, "credential_broker", None) is None:
+        raise CorpusConstructionError(
+            "machine-review workflow requires the external credential broker"
+        )
+    if agent.api_key_env is None:
+        raise CorpusConstructionError(
+            "machine-review credential broker lacks its host-only credential source"
+        )
+    try:
+        route = provider_route(agent.adapter, agent.provider)
+    except ValueError:
+        raise CorpusConstructionError(
+            "machine-review credential broker lacks a Protocol 2 provider route"
+        ) from None
+    if agent.api_key_env != route.agent_credential_environment_name:
+        raise CorpusConstructionError(
+            "machine-review credential source does not match its provider route"
+        )
+
+
+def _verified_review_credential_isolation(
+    run: AgentRun,
+    *,
+    agent: AgentConfig,
+    repository: Path,
+    docker_runtime: DockerRuntimeIdentity,
+) -> CredentialIsolationInvocationReceipt:
+    """Require protocol-approved broker evidence from this exact agent invocation."""
+    isolation = run.credential_isolation
+    credential_isolation_policy = compiled_credential_isolation_policy()
+    expected_policy_sha256 = canonical_credential_isolation_policy_sha256(
+        credential_isolation_policy
+    )
+    broker = agent.credential_broker
+    if broker is None or agent.api_key_env is None:
+        raise CorpusConstructionError(
+            "machine-review credential isolation lacks its broker configuration"
+        )
+    try:
+        route = provider_route(agent.adapter, agent.provider)
+        source_inventory_sha256 = broker_source_inventory_sha256(repository)
+        expected_bindings = credential_identity_payloads(
+            route=route,
+            broker=broker,
+            api_key_env=agent.api_key_env,
+            source_inventory_sha256=source_inventory_sha256,
+        )
+    except (OSError, ValueError):
+        raise CorpusConstructionError(
+            "machine-review credential-isolation configuration is not reproducible"
+        ) from None
+    if (
+        isolation is None
+        or isolation.policy_sha256 != expected_policy_sha256
+        or (
+            isolation.policy_sha256,
+            isolation.broker_configuration_sha256,
+            isolation.allowed_destination_inventory_sha256,
+            isolation.agent_projection_inventory_sha256,
+        )
+        != expected_bindings
+        or isolation.broker_source_inventory_sha256 != source_inventory_sha256
+        or source_inventory_sha256 != credential_isolation_policy.broker_source_inventory_sha256
+        or isolation.broker_image_id != broker.image_digest
+        or isolation.docker_client_sha256 != docker_runtime.client_sha256
+        or isolation.docker_runtime_fingerprint_sha256 != docker_runtime.fingerprint_sha256
+        or isolation.agent_environment_names != agent_environment_names(route)
+    ):
+        raise CorpusConstructionError(
+            "machine-review credential isolation is missing, unverified, or mismatched"
+        )
+    return isolation
+
+
 def execute_machine_review_workflow(
     *,
     agent: AgentConfig,
@@ -2534,6 +2697,7 @@ def execute_machine_review_workflow(
         raise CorpusConstructionError(
             "machine-review workflow requires pinned container, provider, and model"
         )
+    _require_review_credential_isolation_configuration(agent)
     if output_directory.exists() or output_directory.is_symlink():
         raise CorpusConstructionError("machine-review output already exists")
     try:
@@ -2575,15 +2739,9 @@ def execute_machine_review_workflow(
         expected_input=review_input_bytes,
     )
     temporary = Path(tempfile.mkdtemp(prefix="stinger-machine-review-execution-"))
-    credential_root = Path(tempfile.mkdtemp(prefix="stinger-machine-review-auth-"))
     staging: Path | None = None
     try:
         _require_control_free_ancestor_chain(temporary)
-        _require_control_free_ancestor_chain(credential_root)
-        projection = _build_review_credential_projection(
-            agent,
-            credential_root=credential_root,
-        )
         package_root = temporary / "publishable-package"
         original_workspace = package_root / "review-workspace"
         snapshot = _snapshot_tree(review_workspace, original_workspace)
@@ -2604,7 +2762,8 @@ def execute_machine_review_workflow(
                 "container_image": observed.image_id,
                 "container_image_digest": observed.image_id,
                 "cli_version": observed.cli_version,
-                "credential_mount": projection.mount,
+                "credential_mount": None,
+                "options": {},
             }
         )
         adapter = build_adapter(immutable_agent)
@@ -2632,13 +2791,14 @@ def execute_machine_review_workflow(
         output = _parse_machine_review_output(run.final_message)
         output_bytes = _canonical_model_bytes(output)
         transcript_bytes = run.transcript.encode("utf-8")
-        _verify_review_credential_projection(projection)
-        _require_no_projected_secret_material(
-            projection,
-            execution_workspace=execution_workspace,
-            transcript=transcript_bytes,
-            output=output_bytes,
+        credential_isolation = _verified_review_credential_isolation(
+            run,
+            agent=immutable_agent,
+            repository=repository,
+            docker_runtime=observed.docker_runtime,
         )
+        credential_isolation_bytes = canonical_json_bytes(credential_isolation)
+        credential_isolation_sha256 = sha256_bytes(credential_isolation_bytes)
         try:
             verify_docker_runtime(observed.docker_runtime)
         except DockerRuntimeError:
@@ -2664,8 +2824,17 @@ def execute_machine_review_workflow(
             docker_runtime_claim_boundary=DOCKER_RUNTIME_CLAIM_BOUNDARY,
             docker_client_sha256=observed.docker_runtime.client_sha256,
             docker_runtime_fingerprint_sha256=(observed.docker_runtime.fingerprint_sha256),
-            credential_projection_policy=projection.policy,
-            credential_projection_inventory_sha256=projection.inventory_sha256,
+            credential_isolation_policy_sha256=credential_isolation.policy_sha256,
+            broker_configuration_sha256=(credential_isolation.broker_configuration_sha256),
+            allowed_destination_inventory_sha256=(
+                credential_isolation.allowed_destination_inventory_sha256
+            ),
+            agent_projection_inventory_sha256=(
+                credential_isolation.agent_projection_inventory_sha256
+            ),
+            broker_source_inventory_sha256=(credential_isolation.broker_source_inventory_sha256),
+            broker_image_id=credential_isolation.broker_image_id,
+            broker_runtime_identity_sha256=(credential_isolation.docker_runtime_fingerprint_sha256),
         )
         configuration_bytes = _canonical_model_bytes(configuration)
         invocation_argv = adapter.resolved_invocation_template()
@@ -2680,6 +2849,7 @@ def execute_machine_review_workflow(
                 "output_sha256": _sha256(output_bytes),
                 "provider_response_id": provider_response_id,
                 "stinger_commit": expected_stinger_commit,
+                "credential_isolation_receipt_sha256": (credential_isolation_sha256),
             }
         )
         runtime = MachineReviewRuntimeReceipt(
@@ -2705,8 +2875,18 @@ def execute_machine_review_workflow(
             docker_runtime_claim_boundary=DOCKER_RUNTIME_CLAIM_BOUNDARY,
             docker_client_sha256=observed.docker_runtime.client_sha256,
             docker_runtime_fingerprint_sha256=(observed.docker_runtime.fingerprint_sha256),
-            credential_projection_policy=projection.policy,
-            credential_projection_inventory_sha256=projection.inventory_sha256,
+            credential_isolation_policy_sha256=credential_isolation.policy_sha256,
+            broker_configuration_sha256=(credential_isolation.broker_configuration_sha256),
+            allowed_destination_inventory_sha256=(
+                credential_isolation.allowed_destination_inventory_sha256
+            ),
+            agent_projection_inventory_sha256=(
+                credential_isolation.agent_projection_inventory_sha256
+            ),
+            broker_source_inventory_sha256=(credential_isolation.broker_source_inventory_sha256),
+            broker_image_id=credential_isolation.broker_image_id,
+            broker_runtime_identity_sha256=(credential_isolation.docker_runtime_fingerprint_sha256),
+            credential_isolation_receipt_sha256=(credential_isolation_sha256),
             provider_response_id=provider_response_id,
             parsed_final_message_sha256=_sha256(run.final_message.encode("utf-8")),
             invocation_id_sha256=invocation_id_sha256,
@@ -2716,12 +2896,14 @@ def execute_machine_review_workflow(
         input_path = package_root / "input.json"
         transcript_path = package_root / "transcript.bin"
         output_path = package_root / "output.json"
+        credential_isolation_path = package_root / CREDENTIAL_ISOLATION_RECEIPT_FILENAME
         runtime_path = package_root / "runtime.json"
         for path, content in (
             (configuration_path, configuration_bytes),
             (input_path, review_input_bytes),
             (transcript_path, transcript_bytes),
             (output_path, output_bytes),
+            (credential_isolation_path, credential_isolation_bytes),
             (runtime_path, _canonical_model_bytes(runtime)),
         ):
             _atomic_create_private_file(path, content)
@@ -2768,6 +2950,7 @@ def execute_machine_review_workflow(
             configuration_receipt=output_directory / configuration_path.name,
             input_receipt=output_directory / input_path.name,
             review_workspace=output_directory / original_workspace.name,
+            credential_isolation_receipt=(output_directory / credential_isolation_path.name),
             runtime_receipt=output_directory / runtime_path.name,
             transcript=output_directory / transcript_path.name,
             output=output_directory / output_path.name,
@@ -2790,8 +2973,6 @@ def execute_machine_review_workflow(
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
-        if credential_root.exists():
-            shutil.rmtree(credential_root)
         if staging is not None and staging.exists():
             shutil.rmtree(staging)
 
@@ -2817,242 +2998,6 @@ def _require_control_free_ancestor_chain(path: Path) -> None:
                 raise CorpusConstructionError(
                     "machine-review execution ancestor contains an agent control file"
                 )
-
-
-def _build_review_credential_projection(
-    agent: AgentConfig,
-    *,
-    credential_root: Path,
-) -> _ReviewCredentialProjection:
-    """Build one private auth-only projection without caller config or instruction state."""
-    if agent.options:
-        raise CorpusConstructionError(
-            "machine-review workflow forbids caller-supplied environment options"
-        )
-    if agent.adapter == "codex":
-        if agent.api_key_env is not None or agent.credential_mount is None:
-            raise CorpusConstructionError(
-                "Codex machine review requires only an auth.json credential mount"
-            )
-        try:
-            source_metadata = agent.credential_mount.lstat()
-            source_root = agent.credential_mount.resolve(strict=True)
-        except OSError:
-            raise CorpusConstructionError("Codex credential source is unavailable") from None
-        if not stat.S_ISDIR(source_metadata.st_mode) or stat.S_ISLNK(source_metadata.st_mode):
-            raise CorpusConstructionError("Codex credential source is not a real directory")
-        try:
-            entries = tuple(sorted(os.scandir(source_root), key=lambda item: item.name))
-        except OSError:
-            raise CorpusConstructionError(
-                "Codex credential source could not be inventoried"
-            ) from None
-        if (
-            len(entries) != 1
-            or entries[0].name != "auth.json"
-            or not entries[0].is_file(follow_symlinks=False)
-            or entries[0].is_symlink()
-        ):
-            raise CorpusConstructionError(
-                "Codex credential source must contain only regular auth.json"
-            )
-        source = source_root / "auth.json"
-        try:
-            mode = stat.S_IMODE(source.lstat().st_mode)
-        except OSError:
-            raise CorpusConstructionError("Codex auth.json is unavailable") from None
-        if mode != 0o600:
-            raise CorpusConstructionError("Codex auth.json must have mode 0600")
-        content = _read_exact_regular_file(source, label="Codex auth.json")
-        secret_values = _validate_codex_auth_json(content)
-        projection = credential_root / "credentials"
-        projection.mkdir(mode=0o700)
-        os.chmod(projection, 0o700)
-        destination = projection / "auth.json"
-        _atomic_create_private_file(destination, content)
-        if _read_exact_regular_file(source, label="Codex auth.json") != content:
-            raise CorpusConstructionError("Codex auth.json changed while it was projected")
-        inventory_sha256 = _canonical_payload_sha256(
-            {
-                "policy": CODEX_CREDENTIAL_PROJECTION_POLICY,
-                "files": [
-                    {
-                        "path": "auth.json",
-                        "node_type": "regular",
-                        "mode": "0600",
-                    }
-                ],
-                "environment_names": [],
-                "global_control_state": "verified-empty-in-immutable-image",
-            }
-        )
-        return _ReviewCredentialProjection(
-            mount=projection,
-            policy=CODEX_CREDENTIAL_PROJECTION_POLICY,
-            inventory_sha256=inventory_sha256,
-            secret_values=(content, *secret_values),
-            environment_name=None,
-            credential_bytes=content,
-        )
-    if agent.adapter == "claude-code":
-        allowed_environment_names = {
-            "ANTHROPIC_API_KEY",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-        }
-        if agent.credential_mount is not None or agent.api_key_env not in allowed_environment_names:
-            raise CorpusConstructionError(
-                "Claude machine review requires one explicit supported auth environment"
-            )
-        environment_name = agent.api_key_env
-        value = os.environ.get(environment_name)
-        if value is None or not value or value != value.strip() or "\x00" in value:
-            raise CorpusConstructionError("Claude machine-review auth environment is unavailable")
-        encoded = value.encode("utf-8")
-        inventory_sha256 = _canonical_payload_sha256(
-            {
-                "policy": CLAUDE_CREDENTIAL_PROJECTION_POLICY,
-                "files": [],
-                "environment_names": [environment_name],
-                "global_control_state": "verified-empty-in-immutable-image",
-            }
-        )
-        return _ReviewCredentialProjection(
-            mount=None,
-            policy=CLAUDE_CREDENTIAL_PROJECTION_POLICY,
-            inventory_sha256=inventory_sha256,
-            secret_values=(encoded,),
-            environment_name=environment_name,
-            credential_bytes=None,
-        )
-    raise CorpusConstructionError(
-        "machine-review credential projection lacks a canonical adapter policy"
-    )
-
-
-def _validate_codex_auth_json(content: bytes) -> tuple[bytes, ...]:
-    """Validate the closed pinned-Codex auth structure and retain only private secrets."""
-    try:
-        raw = json.loads(
-            content.decode("utf-8"),
-            object_pairs_hook=_reject_duplicate_pairs,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        raise CorpusConstructionError("Codex auth.json is malformed") from None
-    if not isinstance(raw, dict):
-        raise CorpusConstructionError("Codex auth.json must be a JSON object")
-    allowed_top = {"auth_mode", "last_refresh", "tokens", "OPENAI_API_KEY"}
-    if "auth_mode" not in raw or not set(raw).issubset(allowed_top):
-        raise CorpusConstructionError("Codex auth.json has unsupported top-level keys")
-    if not isinstance(raw["auth_mode"], str) or not raw["auth_mode"]:
-        raise CorpusConstructionError("Codex auth.json auth_mode is invalid")
-    secrets: list[bytes] = []
-    tokens = raw.get("tokens")
-    api_key = raw.get("OPENAI_API_KEY")
-    if tokens is not None:
-        allowed_tokens = {
-            "access_token",
-            "account_id",
-            "id_token",
-            "refresh_token",
-        }
-        required_tokens = {"access_token", "id_token", "refresh_token"}
-        if (
-            not isinstance(tokens, dict)
-            or not required_tokens.issubset(tokens)
-            or not set(tokens).issubset(allowed_tokens)
-            or any(not isinstance(value, str) or not value for value in tokens.values())
-        ):
-            raise CorpusConstructionError("Codex auth.json token structure is unsupported")
-        secrets.extend(value.encode("utf-8") for value in tokens.values())
-    if api_key is not None:
-        if not isinstance(api_key, str) or not api_key:
-            raise CorpusConstructionError("Codex auth.json API key is invalid")
-        secrets.append(api_key.encode("utf-8"))
-    if not secrets or (tokens is not None and api_key is not None):
-        raise CorpusConstructionError(
-            "Codex auth.json must contain exactly one supported credential mode"
-        )
-    return tuple(secrets)
-
-
-def _verify_review_credential_projection(
-    projection: _ReviewCredentialProjection,
-) -> None:
-    """Recheck private projected auth immediately after the model invocation."""
-    if projection.mount is not None:
-        try:
-            entries = tuple(sorted(os.scandir(projection.mount), key=lambda item: item.name))
-        except OSError:
-            raise CorpusConstructionError(
-                "machine-review credential projection is unavailable"
-            ) from None
-        if (
-            len(entries) != 1
-            or entries[0].name != "auth.json"
-            or not entries[0].is_file(follow_symlinks=False)
-            or entries[0].is_symlink()
-            or projection.credential_bytes is None
-            or _read_exact_regular_file(
-                projection.mount / "auth.json",
-                label="projected Codex auth.json",
-            )
-            != projection.credential_bytes
-        ):
-            raise CorpusConstructionError(
-                "machine-review credential projection changed during execution"
-            )
-    elif (
-        projection.environment_name is None
-        or os.environ.get(projection.environment_name, "").encode("utf-8")
-        not in projection.secret_values
-    ):
-        raise CorpusConstructionError(
-            "machine-review credential environment changed during execution"
-        )
-
-
-def _require_no_projected_secret_material(
-    projection: _ReviewCredentialProjection,
-    *,
-    execution_workspace: Path,
-    transcript: bytes,
-    output: bytes,
-) -> None:
-    """Refuse publication if projected credential material entered review artifacts."""
-    secrets = tuple(value for value in projection.secret_values if value)
-    if any(secret in transcript or secret in output for secret in secrets):
-        raise CorpusConstructionError(
-            "machine-review output contains projected credential material"
-        )
-    try:
-        for root, directories, files in os.walk(
-            execution_workspace,
-            topdown=True,
-            followlinks=False,
-        ):
-            directories.sort()
-            files.sort()
-            root_path = Path(root)
-            for name in (*directories, *files):
-                metadata = (root_path / name).lstat()
-                if stat.S_ISLNK(metadata.st_mode):
-                    raise CorpusConstructionError(
-                        "machine-review execution workspace contains a symlink"
-                    )
-            for name in files:
-                path = root_path / name
-                content = _read_exact_regular_file(
-                    path,
-                    label="machine-review execution artifact",
-                )
-                if any(secret in content for secret in secrets):
-                    raise CorpusConstructionError(
-                        "machine-review workspace contains projected credential material"
-                    )
-    except OSError:
-        raise CorpusConstructionError(
-            "machine-review execution workspace could not be scanned"
-        ) from None
 
 
 def _require_clean_review_image_state(
@@ -3464,6 +3409,7 @@ def _build_base_scenario_record(
     scenario: Scenario,
     item: ScenarioConstructionInput,
     *,
+    repository: Path,
     corpus_version: str,
     corpus_hash_value: str,
     promotion: CandidatePromotionStatement,
@@ -3475,6 +3421,7 @@ def _build_base_scenario_record(
     dict[str, Any],
     tuple[_RunExecutionIdentity, ...],
     tuple[VerifiedMachineWorkflowAttestation, ...],
+    tuple[_CredentialIsolationExecutionIdentity, ...],
 ]:
     """Derive one scenario record excluding review and blind-solve evidence."""
     if (
@@ -3651,9 +3598,10 @@ def _build_base_scenario_record(
             ),
             forbidden_trust_policy_sha256s=(lifecycle_role_constraints.trust_policy_sha256s),
         )
-        reviews = _build_machine_reviews(
+        review_build = _build_machine_reviews(
             base_record,
             item.machine_reviews,
+            repository=repository,
             expected_review_workspace=expected_review_workspace,
             forbidden_signer_identities=(
                 lifecycle_role_constraints.signer_identities | qa_signer_identities
@@ -3666,6 +3614,7 @@ def _build_base_scenario_record(
             ),
             expected_stinger_commit=promotion.stinger_commit,
         )
+    reviews = review_build.records
     record = base_record.model_copy(update={"machine_reviews": reviews})
     return (
         record,
@@ -3686,6 +3635,7 @@ def _build_base_scenario_record(
         },
         qa_execution_identities,
         qa_workflow_authorizations,
+        review_build.credential_isolation_identities,
     )
 
 
@@ -4528,19 +4478,50 @@ def _require_unique_run_executions(
         seen_provider_responses.update(identity.provider_response_id_sha256s)
         seen_execution_evidence.update(identity.execution_evidence_sha256s)
         seen_signatures.add(identity.workflow_signature_sha256)
+    _require_unique_credential_isolation_identities(
+        tuple(identity.credential_isolation for identity in identities)
+    )
+
+
+def _require_unique_construction_execution_identities(
+    run_identities: tuple[_RunExecutionIdentity, ...],
+    review_identities: tuple[_CredentialIsolationExecutionIdentity, ...],
+) -> None:
+    """Reject identity reuse across QA, blind, review, and scenario boundaries."""
+    _require_unique_run_executions(run_identities)
+    _require_unique_credential_isolation_identities(
+        (
+            *(identity.credential_isolation for identity in run_identities),
+            *review_identities,
+        )
+    )
 
 
 def _build_machine_reviews(
     scenario: CorpusScenarioRecord,
     packages: tuple[MachineReviewPackageInput, ...],
     *,
+    repository: Path,
     expected_review_workspace: Path,
     forbidden_signer_identities: frozenset[str],
     forbidden_signing_key_fingerprints: frozenset[str],
     forbidden_trust_policy_sha256s: frozenset[str],
     expected_stinger_commit: str,
-) -> tuple[MachineReviewRecord, ...]:
+) -> _MachineReviewBuild:
     """Derive reviews only from signed, transcript-bearing runner invocations."""
+    try:
+        observed_broker_source_inventory_sha256 = broker_source_inventory_sha256(repository)
+    except (OSError, ValueError):
+        raise CorpusConstructionError(
+            "machine-review credential-broker source cannot be verified"
+        ) from None
+    if (
+        observed_broker_source_inventory_sha256
+        != compiled_credential_isolation_policy().broker_source_inventory_sha256
+    ):
+        raise CorpusConstructionError(
+            "machine-review credential-broker source differs from Protocol 2"
+        )
     expected_input_sha256 = machine_review_input_manifest_sha256(scenario)
     expected_qa_ids = tuple(sorted(attempt.attempt_id for attempt in scenario.agent_qa_attempts))
     expected_workspace_snapshot = _verify_machine_review_workspace(
@@ -4559,6 +4540,8 @@ def _build_machine_reviews(
     runtime_signature_hashes: list[str] = []
     invocation_ids: list[str] = []
     provider_response_ids: list[str] = []
+    credential_isolation_receipt_hashes: list[str] = []
+    credential_isolation_identities: list[_CredentialIsolationExecutionIdentity] = []
     for package in packages:
         configuration, configuration_bytes = _load_canonical_model(
             package.configuration_receipt,
@@ -4575,6 +4558,12 @@ def _build_machine_reviews(
             MachineReviewOutput,
             label="machine review output",
         )
+        credential_isolation, credential_isolation_bytes = _load_canonical_model(
+            package.credential_isolation_receipt,
+            CredentialIsolationInvocationReceipt,
+            label="machine review credential isolation",
+        )
+        credential_isolation_sha256 = sha256_bytes(credential_isolation_bytes)
         transcript_bytes = _read_exact_regular_file(
             package.transcript,
             label="machine review transcript",
@@ -4598,6 +4587,24 @@ def _build_machine_reviews(
         exact_output_sha256 = _sha256(output_bytes)
         output_sha256 = _canonical_model_sha256(output)
         semantic_identity = _normalized_configuration_identity(configuration)
+        try:
+            credential_route = provider_route(
+                configuration.agent_adapter,
+                configuration.provider,
+            )
+            expected_credential_bindings = credential_identity_payloads(
+                route=credential_route,
+                broker=CredentialBrokerConfiguration(
+                    image=configuration.broker_image_id,
+                    image_digest=configuration.broker_image_id,
+                ),
+                api_key_env=credential_route.agent_credential_environment_name,
+                source_inventory_sha256=(configuration.broker_source_inventory_sha256),
+            )
+        except ValueError:
+            raise CorpusConstructionError(
+                "machine-review credential-isolation configuration is not reproducible"
+            ) from None
         review_agent = AgentConfig(
             adapter=configuration.agent_adapter,
             model=configuration.model_id,
@@ -4641,7 +4648,11 @@ def _build_machine_reviews(
                 "output_sha256": exact_output_sha256,
                 "provider_response_id": provider_response_id,
                 "stinger_commit": expected_stinger_commit,
+                "credential_isolation_receipt_sha256": (credential_isolation_sha256),
             }
+        )
+        expected_credential_isolation_policy_sha256 = canonical_credential_isolation_policy_sha256(
+            compiled_credential_isolation_policy()
         )
         if (
             review_input.scenario_id != scenario.scenario_id
@@ -4673,15 +4684,52 @@ def _build_machine_reviews(
             or runtime.docker_client_sha256 != configuration.docker_client_sha256
             or runtime.docker_runtime_fingerprint_sha256
             != configuration.docker_runtime_fingerprint_sha256
-            or runtime.credential_projection_policy != configuration.credential_projection_policy
-            or runtime.credential_projection_inventory_sha256
-            != configuration.credential_projection_inventory_sha256
+            or credential_isolation.policy_sha256 != expected_credential_isolation_policy_sha256
+            or (
+                configuration.credential_isolation_policy_sha256,
+                configuration.broker_configuration_sha256,
+                configuration.allowed_destination_inventory_sha256,
+                configuration.agent_projection_inventory_sha256,
+            )
+            != expected_credential_bindings
+            or credential_isolation.docker_client_sha256 != configuration.docker_client_sha256
+            or configuration.broker_source_inventory_sha256
+            != observed_broker_source_inventory_sha256
+            or credential_isolation.agent_environment_names
+            != agent_environment_names(credential_route)
+            or runtime.credential_isolation_policy_sha256
+            != configuration.credential_isolation_policy_sha256
+            or runtime.credential_isolation_policy_sha256 != credential_isolation.policy_sha256
+            or runtime.broker_configuration_sha256 != configuration.broker_configuration_sha256
+            or runtime.broker_configuration_sha256
+            != credential_isolation.broker_configuration_sha256
+            or runtime.allowed_destination_inventory_sha256
+            != configuration.allowed_destination_inventory_sha256
+            or runtime.allowed_destination_inventory_sha256
+            != credential_isolation.allowed_destination_inventory_sha256
+            or runtime.agent_projection_inventory_sha256
+            != configuration.agent_projection_inventory_sha256
+            or runtime.agent_projection_inventory_sha256
+            != credential_isolation.agent_projection_inventory_sha256
+            or runtime.broker_source_inventory_sha256
+            != configuration.broker_source_inventory_sha256
+            or runtime.broker_source_inventory_sha256
+            != credential_isolation.broker_source_inventory_sha256
+            or runtime.broker_image_id != configuration.broker_image_id
+            or runtime.broker_image_id != credential_isolation.broker_image_id
+            or runtime.broker_runtime_identity_sha256
+            != configuration.broker_runtime_identity_sha256
+            or runtime.broker_runtime_identity_sha256
+            != credential_isolation.docker_runtime_fingerprint_sha256
+            or runtime.credential_isolation_receipt_sha256 != credential_isolation_sha256
             or observed.image_id.removeprefix("sha256:") != configuration.agent_container_digest
             or observed.cli_binary_sha256 != configuration.agent_cli_binary_sha256
             or observed.cli_version != configuration.agent_build
             or observed.docker_runtime.client_sha256 != configuration.docker_client_sha256
             or observed.docker_runtime.fingerprint_sha256
             != configuration.docker_runtime_fingerprint_sha256
+            or observed.docker_runtime.fingerprint_sha256
+            != credential_isolation.docker_runtime_fingerprint_sha256
             or runtime.invocation_argv != adapter.resolved_invocation_template()
             or runtime.version_invocation_argv != tuple(adapter.version_argv())
             or runtime.provider_response_id != provider_response_id
@@ -4704,6 +4752,12 @@ def _build_machine_reviews(
         runtime_signature_hashes.append(authorization.signature_sha256)
         invocation_ids.append(runtime.invocation_id_sha256)
         provider_response_ids.append(runtime.provider_response_id)
+        credential_isolation_receipt_hashes.append(credential_isolation_sha256)
+        credential_isolation_identities.append(
+            _credential_isolation_execution_identity(
+                ((credential_isolation_sha256, credential_isolation),)
+            )
+        )
         records.append(
             MachineReviewRecord(
                 review_id=configuration.review_id,
@@ -4722,6 +4776,7 @@ def _build_machine_reviews(
                 output=output,
             )
         )
+    _require_unique_credential_isolation_identities(tuple(credential_isolation_identities))
     if (
         len(semantic_reviewer_identities) != len(set(semantic_reviewer_identities))
         or len(runner_identities) != len(set(runner_identities))
@@ -4730,11 +4785,80 @@ def _build_machine_reviews(
         or len(runtime_signature_hashes) != len(set(runtime_signature_hashes))
         or len(invocation_ids) != len(set(invocation_ids))
         or len(provider_response_ids) != len(set(provider_response_ids))
+        or len(credential_isolation_receipt_hashes) != len(set(credential_isolation_receipt_hashes))
     ):
         raise CorpusConstructionError(
             "machine reviews reuse one semantic configuration or runner authority"
         )
-    return tuple(sorted(records, key=lambda value: value.review_id))
+    return _MachineReviewBuild(
+        records=tuple(sorted(records, key=lambda value: value.review_id)),
+        credential_isolation_identities=tuple(credential_isolation_identities),
+    )
+
+
+def _credential_isolation_execution_identity(
+    receipts: tuple[tuple[str, CredentialIsolationInvocationReceipt], ...],
+) -> _CredentialIsolationExecutionIdentity:
+    """Retain exact receipt and runtime identities after typed verification."""
+    return _CredentialIsolationExecutionIdentity(
+        receipt_sha256s=tuple(receipt_sha256 for receipt_sha256, _ in receipts),
+        broker_lease_sha256s=tuple(receipt.broker_lease_sha256 for _, receipt in receipts),
+        container_id_sha256s=tuple(
+            value
+            for _, receipt in receipts
+            for value in (
+                receipt.agent_container_id_sha256,
+                receipt.broker_container_id_sha256,
+            )
+        ),
+        network_id_sha256s=tuple(
+            value
+            for _, receipt in receipts
+            for value in (
+                receipt.internal_network_id_sha256,
+                receipt.outbound_network_id_sha256,
+            )
+        ),
+        network_name_sha256s=tuple(
+            value
+            for _, receipt in receipts
+            for value in (
+                receipt.internal_network_name_sha256,
+                receipt.outbound_network_name_sha256,
+            )
+        ),
+    )
+
+
+def _require_unique_credential_isolation_identities(
+    identities: tuple[_CredentialIsolationExecutionIdentity, ...],
+) -> None:
+    """Reject credential-isolation identity reuse across every execution role."""
+    fields = (
+        (
+            "receipt",
+            tuple(value for identity in identities for value in identity.receipt_sha256s),
+        ),
+        (
+            "broker lease",
+            tuple(value for identity in identities for value in identity.broker_lease_sha256s),
+        ),
+        (
+            "agent or broker container",
+            tuple(value for identity in identities for value in identity.container_id_sha256s),
+        ),
+        (
+            "internal or outbound network id",
+            tuple(value for identity in identities for value in identity.network_id_sha256s),
+        ),
+        (
+            "internal or outbound network name",
+            tuple(value for identity in identities for value in identity.network_name_sha256s),
+        ),
+    )
+    for label, values in fields:
+        if len(set(values)) != len(values):
+            raise CorpusConstructionError(f"credentialed executions reuse one {label} identity")
 
 
 def _build_blind_solves(
@@ -5072,6 +5196,16 @@ def _verify_run_bundle(
                 run.escrow_bundle,
                 Path(temporary_name) / "rerunnable-evidence",
             )
+            isolation_snapshots = tuple(
+                load_credential_isolation_receipt_snapshot(
+                    package
+                    / "runs"
+                    / result.scenario_id
+                    / str(result.repetition)
+                    / CREDENTIAL_ISOLATION_RECEIPT_NAME
+                )
+                for result in report.results
+            )
             verified_aggregate = verify_invocation_aggregate_snapshot(
                 package,
                 config=receipt.config,
@@ -5166,6 +5300,8 @@ def _verify_run_bundle(
         or aggregate.runtime_provenance_sha256 != _canonical_model_sha256(runtime)
         or aggregate.report_sha256 != _canonical_model_sha256(report)
         or aggregate.receipt_count != len(report.results)
+        or tuple(snapshot.sha256 for snapshot in isolation_snapshots)
+        != aggregate.credential_isolation_receipt_sha256s
         or len(aggregate.invocation_ids) != len(set(aggregate.invocation_ids))
         or len(aggregate.invocation_challenge_nonce_sha256s)
         != len(set(aggregate.invocation_challenge_nonce_sha256s))
@@ -5206,6 +5342,11 @@ def _verify_run_bundle(
             provider_response_id_sha256s=frozenset(aggregate.provider_response_id_sha256s),
             execution_evidence_sha256s=frozenset(aggregate.execution_evidence_sha256s),
             workflow_signature_sha256=workflow_authorization.signature_sha256,
+            credential_isolation=_credential_isolation_execution_identity(
+                tuple(
+                    (snapshot.sha256, snapshot.receipt.evidence) for snapshot in isolation_snapshots
+                )
+            ),
         ),
         workflow_authorization=workflow_authorization,
     )
@@ -5757,6 +5898,10 @@ def _resolve_scenario_manifest(
             ),
             input_receipt=_manifest_regular_file(base, review.input_receipt),
             review_workspace=_manifest_directory(base, review.review_workspace),
+            credential_isolation_receipt=_manifest_regular_file(
+                base,
+                review.credential_isolation_receipt,
+            ),
             runtime_receipt=_manifest_regular_file(
                 base,
                 review.runtime_receipt,
@@ -5847,6 +5992,7 @@ def _all_sensitive_paths(
                 (
                     review.configuration_receipt,
                     review.input_receipt,
+                    review.credential_isolation_receipt,
                     review.runtime_receipt,
                     review.transcript,
                     review.output,

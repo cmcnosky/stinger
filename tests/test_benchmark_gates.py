@@ -111,8 +111,11 @@ from stinger.benchmark.protocol import (
     BenchmarkRunMetadata,
     BenchmarkRuntimeProvenance,
     BenchmarkSplit,
+    CredentialIsolationRuntimeProvenance,
     ProviderId,
     canonical_agent_configuration_fingerprint,
+    canonical_credential_isolation_policy_sha256,
+    compiled_credential_isolation_policy,
 )
 from stinger.benchmark.release_evidence import (
     ReleaseEvidenceStatement,
@@ -353,6 +356,10 @@ def _report(
         ProviderId.ANTHROPIC: ("claude-code", f"claude-model-{configuration_index}"),
         ProviderId.GOOGLE: ("aider", f"google/gemini-model-{configuration_index}"),
     }[provider]
+    credential_policy = compiled_credential_isolation_policy()
+    broker_configuration_sha256 = _digest("credential-broker-config", configuration_index)
+    destination_inventory_sha256 = _digest("credential-destinations", provider.value)
+    projection_inventory_sha256 = _digest("credential-projection", provider.value)
     agent_fingerprint = canonical_agent_configuration_fingerprint(
         provider=provider,
         model_id=model_id,
@@ -361,6 +368,7 @@ def _report(
         reasoning_effort="high",
         inference_settings={"temperature": 0.0},
         agent_container_digest=AGENT_DIGEST,
+        credential_broker_configuration_sha256=broker_configuration_sha256,
     )
     return build_report(
         results,
@@ -379,6 +387,16 @@ def _report(
             verification_image_digest=VERIFY_DIGEST,
             run_seed=protocol.baseline_run_seed,
             agent_configuration_fingerprint=agent_fingerprint,
+            credential_isolation_policy_sha256=(
+                canonical_credential_isolation_policy_sha256(credential_policy)
+            ),
+            credential_broker_configuration_sha256=broker_configuration_sha256,
+            credential_allowed_destination_inventory_sha256=(destination_inventory_sha256),
+            credential_agent_projection_inventory_sha256=projection_inventory_sha256,
+            credential_broker_source_inventory_sha256=(
+                credential_policy.broker_source_inventory_sha256
+            ),
+            credential_broker_image_digest=VERIFY_DIGEST,
         ),
         bootstrap_samples=50,
     )
@@ -467,6 +485,22 @@ def _publication_ready_report(report: Report) -> Report:
         docker_client_sha256="e" * 64,
         docker_runtime_fingerprint_sha256="f" * 64,
         docker_runtime_claim_boundary=DOCKER_RUNTIME_CLAIM_BOUNDARY,
+        credential_isolation=CredentialIsolationRuntimeProvenance(
+            policy_sha256=metadata.credential_isolation_policy_sha256 or "",
+            broker_configuration_sha256=(metadata.credential_broker_configuration_sha256 or ""),
+            allowed_destination_inventory_sha256=(
+                metadata.credential_allowed_destination_inventory_sha256 or ""
+            ),
+            agent_projection_inventory_sha256=(
+                metadata.credential_agent_projection_inventory_sha256 or ""
+            ),
+            broker_source_inventory_sha256=(
+                metadata.credential_broker_source_inventory_sha256 or ""
+            ),
+            broker_image_id=metadata.credential_broker_image_digest or "",
+            docker_runtime_fingerprint_sha256="f" * 64,
+            verified=True,
+        ),
         verified=True,
     )
     return report.model_copy(
@@ -2683,6 +2717,40 @@ def test_machine_review_runtime_authorities_must_be_distinct(
     result = evaluate_benchmark_release(complete_submission.model_copy(update={"corpus": corpus}))
 
     assert PublicationIssueCode.CORPUS_MACHINE_REVIEW_DIVERSITY_INVALID in _codes(result)
+
+
+def test_run_gate_emits_a_specific_credential_isolation_failure(
+    complete_submission: BenchmarkReleaseSubmission,
+) -> None:
+    submission = _publication_ready_submission(complete_submission)
+    baseline = submission.baselines[0]
+    runtime = baseline.report.benchmark_runtime_provenance
+    assert runtime is not None
+    changed_report = baseline.report.model_copy(
+        update={
+            "benchmark_runtime_provenance": runtime.model_copy(
+                update={"credential_isolation": None}
+            )
+        }
+    )
+    changed_baseline = baseline.model_copy(
+        update={
+            "report": changed_report,
+            "report_sha256": canonical_report_sha256(changed_report),
+        }
+    )
+    changed_submission = submission.model_copy(
+        update={"baselines": (changed_baseline, *submission.baselines[1:])}
+    )
+
+    result = evaluate_benchmark_release(changed_submission)
+    configuration = next(
+        item for item in result.configuration_results if item.configuration_id == "cfg-0"
+    )
+
+    assert PublicationIssueCode.RUN_CREDENTIAL_ISOLATION_FAILED in {
+        issue.code for issue in configuration.issues
+    }
 
 
 def test_run_gate_enforces_pins_sealed_metadata_repetitions_and_error_limit(

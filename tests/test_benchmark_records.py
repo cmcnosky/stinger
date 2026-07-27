@@ -23,6 +23,10 @@ import stinger.benchmark.reproduction as reproduction_module
 import stinger.cli as cli_module
 from stinger import BENCHMARK_PROTOCOL_VERSION
 from stinger.adapters.base import AgentRun
+from stinger.benchmark.credential_broker import (
+    CredentialBrokerConfiguration,
+    CredentialIsolationInvocationReceipt,
+)
 from stinger.benchmark.evidence import (
     BUNDLE_MANIFEST,
     EvidenceBundleError,
@@ -62,6 +66,7 @@ from stinger.benchmark.ordering import ScenarioOrderItem, deterministic_blocked_
 from stinger.benchmark.protocol import (
     BenchmarkRuntimeProvenance,
     BenchmarkSplit,
+    CredentialIsolationRuntimeProvenance,
     ProviderId,
     canonical_agent_configuration_fingerprint,
 )
@@ -114,7 +119,7 @@ AGENT_DIGEST = f"sha256:{'a' * 64}"
 VERIFICATION_DIGEST = APPROVED_LINUX_ARM64_VERIFICATION_IMAGE_ID
 CANARY = "STINGER-SYNTHETIC-SEALED-CANARY-41f703"
 DUMMY_SECRET = "sk-dummy-stinger-synthetic-only-91b4c8"
-RELEASE_SCHEMA_SHA256 = "199592e986ce57708c4045f3520a84492a0fa3ac63aae9d143c8f2f1fd54684d"
+RELEASE_SCHEMA_SHA256 = "49c2b325be1ef62c915355c42b033a657fae70ba47c3a38dfa20d1901923ff55"
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +173,11 @@ def _repository_size(index: int) -> RepositorySize:
     if index < 16:
         return RepositorySize.MEDIUM
     return RepositorySize.LARGER_MULTI_MODULE
+
+
+def _invocation_identity(invocation_id: str, label: str) -> str:
+    """Derive one deterministic synthetic per-invocation evidence identity."""
+    return hashlib.sha256(f"{invocation_id}:{label}".encode()).hexdigest()
 
 
 def _write_synthetic_corpus(root: Path) -> tuple[CorpusScenarioRecord, ...]:
@@ -290,6 +300,16 @@ def _publication_report(
     ]
     metadata = config.benchmark_metadata()
     assert metadata is not None
+    credential_identities = config._credential_isolation_identities()
+    assert credential_identities is not None
+    (
+        credential_policy_sha256,
+        broker_configuration_sha256,
+        allowed_destination_inventory_sha256,
+        agent_projection_inventory_sha256,
+        broker_source_inventory_sha256,
+    ) = credential_identities
+    assert metadata.credential_broker_image_digest is not None
     runtime = BenchmarkRuntimeProvenance(
         requested_provider=metadata.provider,
         requested_model_id=metadata.model_id,
@@ -307,6 +327,17 @@ def _publication_report(
         docker_client_sha256="d" * 64,
         docker_runtime_fingerprint_sha256="e" * 64,
         docker_runtime_claim_boundary=DOCKER_RUNTIME_CLAIM_BOUNDARY,
+        resolved_environment_names=("OPENAI_API_KEY",),
+        credential_isolation=CredentialIsolationRuntimeProvenance(
+            policy_sha256=credential_policy_sha256,
+            broker_configuration_sha256=broker_configuration_sha256,
+            allowed_destination_inventory_sha256=allowed_destination_inventory_sha256,
+            agent_projection_inventory_sha256=agent_projection_inventory_sha256,
+            broker_source_inventory_sha256=broker_source_inventory_sha256,
+            broker_image_id=metadata.credential_broker_image_digest,
+            docker_runtime_fingerprint_sha256="e" * 64,
+            verified=True,
+        ),
         verified=True,
     )
     return build_report(
@@ -342,6 +373,20 @@ def _write_synthetic_invocation_evidence(
         ordered_scenario_ids=ordered_scenario_ids,
     )
     contexts_by_row = {(context.scenario_id, context.repetition): context for context in contexts}
+    credential_identities = config._credential_isolation_identities()
+    assert credential_identities is not None
+    (
+        credential_policy_sha256,
+        broker_configuration_sha256,
+        allowed_destination_inventory_sha256,
+        agent_projection_inventory_sha256,
+        broker_source_inventory_sha256,
+    ) = credential_identities
+    metadata = report.benchmark_metadata
+    assert metadata is not None
+    assert metadata.credential_broker_image_digest is not None
+    assert runtime.docker_client_sha256 is not None
+    assert runtime.docker_runtime_fingerprint_sha256 is not None
     for result in report.results:
         context = contexts_by_row[(result.scenario_id, result.repetition)]
         run_dir = evidence / "runs" / result.scenario_id / str(result.repetition)
@@ -387,6 +432,78 @@ def _write_synthetic_invocation_evidence(
                 stderr="",
             ),
             suite_rerun=None,
+        )
+        replay_module.write_credential_isolation_receipt(
+            run_dir,
+            context=context,
+            evidence=CredentialIsolationInvocationReceipt(
+                policy_sha256=credential_policy_sha256,
+                broker_configuration_sha256=broker_configuration_sha256,
+                allowed_destination_inventory_sha256=(allowed_destination_inventory_sha256),
+                resolved_upstream_address_inventory_sha256=_invocation_identity(
+                    context.invocation_id, "resolved-upstream-addresses"
+                ),
+                agent_projection_inventory_sha256=agent_projection_inventory_sha256,
+                broker_source_inventory_sha256=broker_source_inventory_sha256,
+                broker_image_id=metadata.credential_broker_image_digest,
+                docker_client_sha256=runtime.docker_client_sha256,
+                docker_runtime_fingerprint_sha256=runtime.docker_runtime_fingerprint_sha256,
+                agent_container_id_sha256=_invocation_identity(
+                    context.invocation_id, "agent-container"
+                ),
+                broker_container_id_sha256=_invocation_identity(
+                    context.invocation_id, "broker-container"
+                ),
+                internal_network_id_sha256=_invocation_identity(
+                    context.invocation_id, "network-id"
+                ),
+                internal_network_name_sha256=_invocation_identity(
+                    context.invocation_id, "network-name"
+                ),
+                outbound_network_id_sha256=_invocation_identity(
+                    context.invocation_id, "outbound-network-id"
+                ),
+                outbound_network_name_sha256=_invocation_identity(
+                    context.invocation_id, "outbound-network-name"
+                ),
+                broker_lease_sha256=_invocation_identity(context.invocation_id, "broker-lease"),
+                agent_command_inventory_sha256=_invocation_identity(
+                    context.invocation_id, "agent-command"
+                ),
+                agent_environment_inventory_sha256=_invocation_identity(
+                    context.invocation_id, "agent-environment"
+                ),
+                agent_mount_inventory_sha256=_invocation_identity(
+                    context.invocation_id, "agent-mount"
+                ),
+                agent_image_credential_scan_sha256=_invocation_identity(
+                    context.invocation_id, "agent-image-scan"
+                ),
+                agent_container_runtime_inventory_sha256=_invocation_identity(
+                    context.invocation_id, "agent-runtime"
+                ),
+                broker_container_runtime_inventory_sha256=_invocation_identity(
+                    context.invocation_id, "broker-runtime"
+                ),
+                network_attachment_inventory_sha256=_invocation_identity(
+                    context.invocation_id, "network-attachment"
+                ),
+                broker_audit_sha256=_invocation_identity(context.invocation_id, "broker-audit"),
+                request_count=1,
+                rejection_count=0,
+                agent_environment_names=("OPENAI_API_KEY",),
+                agent_network_mode="fresh-docker-internal-network-only",
+                agent_bridge_gateway="isolated-no-host-interface",
+                agent_dns="embedded-broker-alias-with-loopback-only-upstream",
+                broker_alias="stinger-credential-broker",
+                raw_provider_credential_exposed=False,
+                broker_bypass_path_present=False,
+                unapproved_egress_path_present=False,
+                agent_container_cleanup_verified=True,
+                broker_container_cleanup_verified=True,
+                internal_network_cleanup_verified=True,
+                outbound_network_cleanup_verified=True,
+            ),
         )
         replay_module.write_invocation_receipt(
             run_dir,
@@ -478,8 +595,13 @@ def baseline_artifacts(
             cli_version="1.0.0",
             reasoning_effort="high",
             inference_settings={"temperature": 0.0},
+            api_key_env="OPENAI_API_KEY",
             container_image="synthetic-agent:1",
             container_image_digest=AGENT_DIGEST,
+            credential_broker=CredentialBrokerConfiguration(
+                image="synthetic-runner:1",
+                image_digest=VERIFICATION_DIGEST,
+            ),
         ),
         corpus=corpus_path,
         output_dir=root / "run-output",

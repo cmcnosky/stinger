@@ -19,7 +19,7 @@ verifiable artifact. A count of candidate directories is not a benchmark release
 | Blind agent solves | Six deterministic scenarios per family, two reference-isolated solvers across two providers/configurations | No accepted solve records exist | not met |
 | Verification-image supply chain | Signed exact Dockerfile/hashed-lock inventory plus ordered OCI manifest/config identities keyed by target platform, enforced before verifier execution | Protocol 2 policy names both Docker-store identity representations from byte-identical clean exports for linux/amd64 and linux/arm64; claim remains bounded to Docker daemon/admin observations | mechanism met |
 | Agent-image supply chain | Signed exact source/attestation policy for every networked agent image that executes sealed prompts | Agent image IDs are recorded, but no signed source or attestation allowlist approves their executable bytes | **HOLD; not implemented** |
-| Credential isolation for sealed execution | Raw provider credentials remain outside the agent container; provider-allowlisted egress broker and exact projection/config receipt are mechanically bound | Current agent containers receive raw Codex/Claude credentials and ordinary `credential_mount` directories are not content-bound | **HOLD; not implemented** |
+| Credential isolation for sealed execution | Raw provider credentials remain outside the agent container; provider-allowlisted egress broker and exact projection/config receipt are mechanically bound | Closed Codex/OpenAI and Claude Code/Anthropic routes now use an external raw-credential broker, opaque lease plus signed routing projection, an isolated IPv4 agent bridge with no host gateway or IPv6, and a separate fresh broker-only IPv4 NAT bridge instead of Docker's shared default bridge. Loaded config bytes, effective destination/test-mode readiness, bounded connections, exact source/image/config/destination/projection/runtime receipts, direct hashes and cleanup proofs for both networks, globally fresh cross-role lease/container/network identities, and raw plus encoded credential scans across final argv, workdir, image metadata, and final rootfs are bound; signed prohibited path suffixes, nonempty config homes, or cleanup drift fail closed. Adversarial tests use synthetic credentials and local fake providers; no sealed/live run is claimed | mechanism met for two routes; evidence not run; third route requires a newly signed policy for baseline |
 | Exact-snapshot anonymous pilot | Promote the complete candidate snapshot without content changes, require at least 20% outcome variation, then freeze that same set | No accepted artifact-derived pilot record exists | not met |
 | Fully pinned baseline configs | Six across three providers | Existing evidence does not meet benchmark pins | not met |
 | Contained five-family baselines | Five repetitions per configuration | No complete sealed baseline exists | not met |
@@ -38,16 +38,31 @@ pre-benchmark evidence and are not promoted by this document. No human scenario 
 manual transcript review, beta-operator record, editable error disposition, or free-text
 reproduction reconciliation is a Protocol 2 release gate.
 
-No live sealed review, QA, blind solve, pilot, baseline, or reproduction is authorized with
-the current credential or agent-image paths. The signed verification-image policy approves
-only the network-disabled verifier; it says nothing about the networked agent container. A
-read-only mount and post-run secret scan do not isolate a
-credential from an untrusted, networked agent process. The ordinary run path also records
-only that a credential directory was mounted; it does not bind every copied file, so hidden
-CLI configuration or session state could change a run without changing its published
-identity. The HOLD remains until an external, provider-allowlisted credential-injecting
-broker (or equivalent design that keeps raw credentials outside the agent container) and an
-exact minimal projection/config receipt are implemented, tested, and bound into evidence.
+No live sealed review, QA, blind solve, pilot, baseline, or reproduction is authorized while
+the agent-image supply-chain gate remains open. The signed verification-image policy and the
+credential broker's immutable image/source checks do not approve the executable bytes in the
+networked agent image. Those bytes still need their own signed, mechanically verified source
+or attestation allowlist.
+
+The ordinary direct `api_key_env` and copied `credential_mount` paths remain development
+features only and Protocol 2 rejects them. The sealed path now keeps the raw provider
+credential in a separate broker container; the agent receives only a fixed broker base URL
+projection and opaque per-invocation lease on a fresh internal network. Its isolated IPv4
+bridge has no host gateway or IPv6. The broker's second attachment is a fresh broker-only
+IPv4 NAT bridge, never the shared default bridge. Docker's embedded DNS can resolve the broker alias, while
+upstream DNS is loopback-only with root search and bounded retries; inherited image
+healthchecks are disabled. Codex receives the route only through the signed
+`openai_base_url` CLI override, never `OPENAI_BASE_URL`; Claude Code uses
+`ANTHROPIC_BASE_URL`. Exact policy, broker configuration/source/image, destinations,
+projection, Docker runtime, and command/environment/mount/network inventories are bound into
+non-secret evidence. Prelaunch rejects raw, hex, standard or URL-safe Base64, and
+percent-encoded credentials in final argv, workdir paths/links/files, image metadata, or the
+exported final rootfs, as well as signed prohibited credential-path suffixes and a nonempty
+declared or default agent config home. Runtime identities, audit, and cleanup are also bound.
+Unsupported provider routes fail before the agent starts. Because the publication baseline
+requires three providers and only OpenAI and Anthropic routes are currently defined, a third
+route remains required even after the agent-image HOLD is closed. No sealed or live execution
+is claimed by this mechanism-only status.
 
 Run `stinger benchmark release-check benchmark/candidate-submission.yaml` for the
 machine-readable current blocker list. A non-zero exit is the expected truthful result.

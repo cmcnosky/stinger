@@ -12,6 +12,12 @@ import pytest
 
 import stinger.benchmark.pilot as pilot_module
 from stinger import BENCHMARK_PROTOCOL_VERSION
+from stinger.benchmark.credential_broker import (
+    CredentialBrokerConfiguration,
+    agent_base_url_config_argv,
+    agent_environment_names,
+    provider_route,
+)
 from stinger.benchmark.evidence import (
     BundleKind,
     EvidenceBundleError,
@@ -44,6 +50,7 @@ from stinger.benchmark.pilot import (
 from stinger.benchmark.protocol import (
     BenchmarkRuntimeProvenance,
     BenchmarkSplit,
+    CredentialIsolationRuntimeProvenance,
     ProviderId,
 )
 from stinger.benchmark.signing import ProtocolSignatureVerification, sign_pilot_evidence_statement
@@ -554,15 +561,18 @@ def _artifact_receipt(
 ) -> VerifiedArtifactReceipt:
     """Create one internally consistent verified-receipt stand-in."""
     protocol = compiled_benchmark_protocol()
+    assert provider in {ProviderId.OPENAI, ProviderId.ANTHROPIC}
     adapter = {
         ProviderId.OPENAI: "codex",
         ProviderId.ANTHROPIC: "claude-code",
-        ProviderId.GOOGLE: "aider",
     }[provider]
     executable = {
         ProviderId.OPENAI: "codex",
         ProviderId.ANTHROPIC: "claude",
-        ProviderId.GOOGLE: "aider",
+    }[provider]
+    api_key_env = {
+        ProviderId.OPENAI: "OPENAI_API_KEY",
+        ProviderId.ANTHROPIC: "ANTHROPIC_API_KEY",
     }[provider]
     config = RunConfig(
         agent=AgentConfig(
@@ -572,8 +582,13 @@ def _artifact_receipt(
             cli_version="2.0.0",
             reasoning_effort="high",
             inference_settings={"temperature": 0.0},
+            api_key_env=api_key_env,
             container_image=f"private/{provider.value}-agent:2",
             container_image_digest=AGENT_DIGEST,
+            credential_broker=CredentialBrokerConfiguration(
+                image="private/verification-runner:2",
+                image_digest=VERIFICATION_DIGEST,
+            ),
         ),
         corpus=Path(f"/private/{provider.value}/candidate-corpus"),
         output_dir=Path(f"/private/{provider.value}/pilot-output"),
@@ -587,6 +602,16 @@ def _artifact_receipt(
     )
     metadata = config.benchmark_metadata()
     assert metadata is not None
+    credential_identities = config._credential_isolation_identities()
+    assert credential_identities is not None
+    (
+        credential_policy_sha256,
+        broker_configuration_sha256,
+        allowed_destination_inventory_sha256,
+        agent_projection_inventory_sha256,
+        broker_source_inventory_sha256,
+    ) = credential_identities
+    route = provider_route(adapter, provider)
     runtime = BenchmarkRuntimeProvenance(
         requested_provider=provider,
         requested_model_id=model,
@@ -597,13 +622,29 @@ def _artifact_receipt(
         verification_image_policy_sha256=(
             canonical_verification_image_policy_sha256(compiled_verification_image_policy())
         ),
-        resolved_agent_invocation=(executable, "--model", model),
+        resolved_agent_invocation=(
+            executable,
+            "--model",
+            model,
+            *agent_base_url_config_argv(route),
+        ),
         resolved_version_invocation=(executable, "--version"),
+        resolved_environment_names=agent_environment_names(route),
         reasoning_effort="high",
         inference_settings={"temperature": 0.0},
         docker_client_sha256="e" * 64,
         docker_runtime_fingerprint_sha256="f" * 64,
         docker_runtime_claim_boundary=DOCKER_RUNTIME_CLAIM_BOUNDARY,
+        credential_isolation=CredentialIsolationRuntimeProvenance(
+            policy_sha256=credential_policy_sha256,
+            broker_configuration_sha256=broker_configuration_sha256,
+            allowed_destination_inventory_sha256=(allowed_destination_inventory_sha256),
+            agent_projection_inventory_sha256=agent_projection_inventory_sha256,
+            broker_source_inventory_sha256=broker_source_inventory_sha256,
+            broker_image_id=VERIFICATION_DIGEST,
+            docker_runtime_fingerprint_sha256="f" * 64,
+            verified=True,
+        ),
         verified=True,
     )
     results = [

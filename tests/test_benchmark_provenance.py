@@ -14,12 +14,13 @@ from stinger import BENCHMARK_PROTOCOL_VERSION
 from stinger.adapters.claude_code import ClaudeCodeAdapter
 from stinger.adapters.cli_base import AdapterSettingsError
 from stinger.adapters.codex import CodexAdapter
+from stinger.benchmark.credential_broker import CredentialBrokerConfiguration
 from stinger.benchmark.git_checkout import (
     DirtyGitCheckoutError,
     GitCheckoutError,
     VerifiedTrackedImplementation,
 )
-from stinger.benchmark.protocol import ProviderId
+from stinger.benchmark.protocol import ProviderId, compiled_credential_isolation_policy
 from stinger.benchmark.provenance import RuntimePreflightError, verify_runtime_provenance
 from stinger.benchmark.verification_image import (
     APPROVED_LINUX_ARM64_VERIFICATION_IMAGE_ID,
@@ -67,6 +68,11 @@ def _approved_verification_image_policy(monkeypatch: pytest.MonkeyPatch) -> None
         )
 
     monkeypatch.setattr(provenance_module, "verify_approved_verification_image", approve)
+    monkeypatch.setattr(
+        provenance_module,
+        "broker_source_inventory_sha256",
+        lambda repository: compiled_credential_isolation_policy().broker_source_inventory_sha256,
+    )
 
 
 def _create_clean_unrelated_checkout(root: Path) -> str:
@@ -136,8 +142,13 @@ def benchmark_config(*, commit: str = COMMIT) -> RunConfig:
             cli_version="codex-cli 1.2.3",
             reasoning_effort="high",
             inference_settings={"model_verbosity": "low"},
+            api_key_env="OPENAI_API_KEY",
             container_image="agent:1",
             container_image_digest=DIGEST_A,
+            credential_broker=CredentialBrokerConfiguration(
+                image="verification:1",
+                image_digest=DIGEST_B,
+            ),
         ),
         image="verification:1",
         verification_image_digest=DIGEST_B,
@@ -264,17 +275,81 @@ def test_preflight_records_observed_images_cli_commit_and_resolved_settings(
     assert observed.agent_container_image_id == DIGEST_A
     assert observed.verification_image_id == DIGEST_B
     assert observed.agent_cli_version == "codex-cli 1.2.3"
+    assert observed.credential_isolation is not None
+    assert observed.credential_isolation.verified is True
     assert observed.resolved_version_invocation == ("codex", "--version")
     assert str(tmp_path) not in observed.model_dump_json()
     assert "gpt-test" in observed.resolved_agent_invocation
     assert 'model_reasoning_effort="high"' in observed.resolved_agent_invocation
     assert 'model_verbosity="low"' in observed.resolved_agent_invocation
     assert adapter.config.container_image == DIGEST_A
+    assert adapter.config.credential_broker is not None
+    assert adapter.config.credential_broker.image == DIGEST_B
     fixed_docker = str(resolve_docker_client())
     docker_calls = [argv for argv in calls if argv and argv[0] == fixed_docker]
     assert docker_calls
     assert all(argv[0] != str(shim) for argv in docker_calls)
     assert not any(argv and argv[0] == "git" for argv in calls)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_issue"),
+    [
+        ("missing", "credential_broker_configuration_missing"),
+        ("image", "credential_broker_image_identity_mismatch"),
+        ("source", "credential_broker_source_not_protocol_approved"),
+    ],
+)
+def test_preflight_fails_closed_on_missing_or_mismatched_broker_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_issue: str,
+) -> None:
+    config = benchmark_config()
+    if mutation == "missing":
+        config = config.model_copy(
+            update={
+                "agent": config.agent.model_copy(update={"credential_broker": None}),
+            }
+        )
+    elif mutation == "image":
+        assert config.agent.credential_broker is not None
+        config = config.model_copy(
+            update={
+                "agent": config.agent.model_copy(
+                    update={
+                        "credential_broker": config.agent.credential_broker.model_copy(
+                            update={"image": "agent:1"}
+                        )
+                    }
+                )
+            }
+        )
+    else:
+        monkeypatch.setattr(
+            provenance_module,
+            "broker_source_inventory_sha256",
+            lambda repository: "9" * 64,
+        )
+    monkeypatch.setattr(
+        provenance_module,
+        "verify_loaded_stinger_implementation",
+        lambda repository, *, expected_commit, timeout: VerifiedTrackedImplementation(
+            commit=expected_commit,
+            files=(),
+            inventory_sha256="d" * 64,
+        ),
+    )
+    monkeypatch.setattr(subprocess, "run", fake_runtime())
+
+    with pytest.raises(RuntimePreflightError, match=expected_issue):
+        verify_runtime_provenance(
+            config,
+            CodexAdapter(config.agent),
+            workdir=tmp_path,
+            repository=tmp_path,
+        )
 
 
 def test_containerized_version_probe_uses_only_an_empty_temporary_workspace(

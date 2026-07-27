@@ -39,6 +39,12 @@ from pathlib import Path
 from uuid import uuid4
 
 from stinger.adapters.base import AgentRun, Budget
+from stinger.adapters.credential_broker import (
+    CredentialBrokerContainmentError,
+    CredentialBrokerError,
+    CredentialBrokerSession,
+)
+from stinger.benchmark.credential_broker import agent_environment_names, provider_route
 from stinger.config import AgentConfig
 from stinger.docker_runtime import (
     DockerRuntimeError,
@@ -150,6 +156,9 @@ class CliAgentAdapter:
 
     def resolved_environment_names(self) -> tuple[str, ...]:
         """Return environment names forwarded to the agent, never their secret values."""
+        if self.config.credential_broker is not None:
+            route = provider_route(self.config.adapter, self.config.provider)
+            return agent_environment_names(route)
         return tuple(self._container_env_names())
 
     #: Whether this adapter needs a pseudo-terminal. CLIs that offer a machine-readable,
@@ -171,15 +180,22 @@ class CliAgentAdapter:
             What was observed. Any failure to drive the agent is reported in `error` rather
             than raised, so the runner can resolve it to a non-scoring outcome with evidence.
         """
-        try:
-            env = self.environment()
-        except KeyError as exc:
-            return self._failed(f"required environment variable {exc.args[0]!r} is not set")
+        broker_session: CredentialBrokerSession | None = None
+        if self.config.credential_broker is None:
+            try:
+                env = self.environment()
+            except KeyError as exc:
+                return self._failed(f"required environment variable {exc.args[0]!r} is not set")
+        else:
+            # The raw value named by api_key_env belongs to the external broker only. It must
+            # never be placed in the agent subprocess environment, even transiently.
+            env = {}
 
         try:
             argv = self.argv(prompt)
         except AdapterSettingsError as exc:
             return self._failed(str(exc))
+        inner_argv = tuple(argv)
         container_name: str | None = None
         container_runtime: DockerRuntimeIdentity | None = None
         if self.config.container_image is not None:
@@ -187,55 +203,125 @@ class CliAgentAdapter:
             if container_runtime is None:
                 return self._failed("contained agent runtime has not passed fixed Docker preflight")
             container_name = f"stinger-agent-{uuid4().hex[:12]}"
-            forwarded_names = self._container_env_names()
-            # The agent needs the network to reach its model API. Verification commands never
-            # do, and never get it (see harness.sandbox.run_command).
-            #
-            # `forward_env` is what makes contained mode usable at all. `environment()` builds
-            # the child environment, but a container does NOT inherit it: without naming them
-            # here, the agent's credential and its configured options stop at the `docker`
-            # process, and every contained run fails to authenticate — a failure that looks
-            # like the agent misbehaving rather than the harness never handing it a key. Names
-            # only; the values travel in the docker process's own environment so they never
-            # enter the recorded argv (see docker_argv).
-            argv = docker_argv(
-                self.config.container_image,
-                workdir,
-                argv,
-                network=True,
-                forward_env=forwarded_names,
-                read_only_mounts=self._credential_mounts(),
-                name=container_name,
-                runtime=container_runtime,
-            )
+            network_name: str | None = None
+            agent_image = self.config.container_image
+            if self.config.credential_broker is not None:
+                try:
+                    broker_session = CredentialBrokerSession(
+                        self.config,
+                        runtime=container_runtime,
+                    )
+                    broker_session.verify_agent_inputs(
+                        workdir=workdir,
+                        expected_command=inner_argv,
+                    )
+                    broker_session.start()
+                    env = broker_session.agent_environment()
+                    forwarded_names = list(broker_session.agent_environment_names)
+                    network_name = broker_session.network_name
+                    agent_image = broker_session.agent_image_id
+                except CredentialBrokerContainmentError as exc:
+                    raise AgentContainmentError(str(exc)) from exc
+                except CredentialBrokerError as exc:
+                    return self._failed(f"credential isolation failed closed: {exc}")
+            else:
+                forwarded_names = self._container_env_names()
+            # A legacy contained run reaches its provider directly. A Protocol 2 run instead
+            # joins only the fresh Docker-internal network owned by its broker session.
             try:
+                argv = docker_argv(
+                    agent_image,
+                    workdir,
+                    argv,
+                    network=broker_session is None,
+                    network_name=network_name,
+                    auto_remove=broker_session is None,
+                    hardened_network_client=broker_session is not None,
+                    forward_env=forwarded_names,
+                    read_only_mounts=(
+                        {} if broker_session is not None else self._credential_mounts()
+                    ),
+                    name=container_name,
+                    runtime=container_runtime,
+                )
                 env = docker_environment(env, forwarded_names=forwarded_names)
-            except DockerRuntimeError as exc:
-                return self._failed(f"fixed Docker runtime is unavailable: {exc}")
+            except BaseException as exc:
+                self._cleanup_failed_launch(
+                    broker_session,
+                    container_name,
+                    container_runtime,
+                    context="agent Docker environment construction failed",
+                )
+                if isinstance(exc, DockerRuntimeError):
+                    return self._failed(f"fixed Docker runtime is unavailable: {exc}")
+                raise
 
         try:
             capture = self._capture(argv, workdir, env, budget.max_seconds)
         except FileNotFoundError:
-            _require_agent_container_absent(
+            self._cleanup_failed_launch(
+                broker_session,
                 container_name,
                 container_runtime,
                 context="agent launch failed",
             )
             return self._failed(f"agent executable not found: {argv[0]!r}")
         except OSError as exc:
-            _require_agent_container_absent(
+            self._cleanup_failed_launch(
+                broker_session,
                 container_name,
                 container_runtime,
                 context="agent launch failed",
             )
             return self._failed(f"could not launch {argv[0]!r}: {exc}")
         except BaseException:
-            _require_agent_container_absent(
+            self._cleanup_failed_launch(
+                broker_session,
                 container_name,
                 container_runtime,
                 context="agent execution was interrupted",
             )
             raise
+
+        if broker_session is not None:
+            if capture.timed_out:
+                try:
+                    broker_session.abort(agent_container_name=container_name)
+                except CredentialBrokerContainmentError as exc:
+                    raise AgentContainmentError(str(exc)) from exc
+                run = self.parse(capture)
+                return run.model_copy(
+                    update={
+                        "exit_ok": False,
+                        "error": (
+                            f"the agent exceeded its budget of {budget.max_seconds}s and its "
+                            "container and external credential broker were stopped; the partial "
+                            "transcript is kept as evidence"
+                        ),
+                    }
+                )
+            try:
+                if container_name is None:
+                    raise CredentialBrokerError("agent container name is missing")
+                evidence = broker_session.finish(
+                    agent_container_name=container_name,
+                    agent_image=broker_session.agent_image_id,
+                    workdir=workdir,
+                    transcript=capture.transcript,
+                    exit_code=capture.exit_code,
+                    expected_command=inner_argv,
+                )
+            except CredentialBrokerContainmentError as exc:
+                raise AgentContainmentError(str(exc)) from exc
+            except CredentialBrokerError as exc:
+                run = self.parse(capture)
+                return run.model_copy(
+                    update={
+                        "exit_ok": False,
+                        "error": f"credential isolation failed closed: {exc}",
+                    }
+                )
+            return self.parse(capture).model_copy(update={"credential_isolation": evidence})
 
         if capture.timed_out or capture.exit_code != 0:
             # A timeout kills only the local Docker client, while a nonzero or negative
@@ -265,6 +351,23 @@ class CliAgentAdapter:
                 }
             )
         return self.parse(capture)
+
+    def _cleanup_failed_launch(
+        self,
+        broker_session: CredentialBrokerSession | None,
+        container_name: str | None,
+        runtime: DockerRuntimeIdentity | None,
+        *,
+        context: str,
+    ) -> None:
+        """Prove either the broker topology or a legacy agent container absent."""
+        if broker_session is not None:
+            try:
+                broker_session.abort(agent_container_name=container_name)
+            except CredentialBrokerContainmentError as exc:
+                raise AgentContainmentError(str(exc)) from exc
+            return
+        _require_agent_container_absent(container_name, runtime, context=context)
 
     def replay(self, transcript: str, *, exit_code: int = 0) -> AgentRun:
         """Recorded-fixture mode: parse a saved transcript with no subprocess (SPEC.md §5).
@@ -296,6 +399,10 @@ class CliAgentAdapter:
                 without its credentials produces a confusing authentication failure that
                 looks like agent misbehaviour; refusing up front does not.
         """
+        if self.config.credential_broker is not None:
+            raise CredentialBrokerError(
+                "raw provider credentials may be loaded only by the external broker"
+            )
         # USER is here because a live run needs it: an agent CLI that stores its credential
         # in the macOS Keychain (claude-code does) looks the item up by the OS account name,
         # which it reads from USER — strip it and the CLI reports "Not logged in" despite a
@@ -320,6 +427,8 @@ class CliAgentAdapter:
         config declares in `options` — the two things that are about the agent rather than
         about the machine it happens to run on.
         """
+        if self.config.credential_broker is not None:
+            return list(self.resolved_environment_names())
         names = [] if self.config.api_key_env is None else [self.config.api_key_env]
         return names + sorted(self.config.options)
 

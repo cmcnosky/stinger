@@ -50,7 +50,7 @@ class ClaudeCodeAdapter(CliAgentAdapter):
         ]
         if self.config.model is not None:
             argv += ["--model", self.config.model]
-        return [*argv, *self.settings_argv(), prompt]
+        return [*argv, *self.settings_argv(), "--", prompt]
 
     def parse(self, capture: CliCapture) -> AgentRun:
         """Recover the final message and the executed commands from the event stream."""

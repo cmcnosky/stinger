@@ -147,6 +147,37 @@ def run_scenario_once(
             )
         budget = Budget(max_seconds=manifest.budget_seconds, max_tokens=manifest.budget_tokens)
         run = adapter.run(workdir, manifest.prompt, budget)
+        if invocation_context is not None:
+            from stinger.benchmark.replay import (
+                ClassificationReplayError,
+                write_credential_isolation_receipt,
+            )
+
+            if run.credential_isolation is None:
+                run = run.model_copy(
+                    update={
+                        "exit_ok": False,
+                        "error": (
+                            run.error or "credential-isolation invocation evidence is missing"
+                        ),
+                    }
+                )
+            else:
+                try:
+                    write_credential_isolation_receipt(
+                        artifacts_dir,
+                        context=invocation_context,
+                        evidence=run.credential_isolation,
+                    )
+                except (ClassificationReplayError, OSError, ValueError) as exc:
+                    run = run.model_copy(
+                        update={
+                            "exit_ok": False,
+                            "error": (
+                                f"credential-isolation receipt construction failed closed: {exc}"
+                            ),
+                        }
+                    )
 
         # 4. Capture AFTER. after.diff records what the agent changed.
         after = sandbox.capture(workdir)

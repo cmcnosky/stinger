@@ -32,30 +32,73 @@ The claim ladder is:
 Stars, downloads, self-authored reruns, scenario count alone, or model agreement alone do
 not move a result up this ladder.
 
-## Credential-isolation release HOLD
+## Credential isolation and remaining execution HOLD
 
-The current contained-agent path is configuration-isolated, but it is **not
-credential-isolated**. Codex authentication is copied from a read-only mount into the
-networked agent container's writable `CODEX_HOME`; other agent credentials may likewise be
-present in that process. An active sealed scenario is untrusted input to the agent, so it
-could induce credential abuse or exfiltration before any post-run transcript or secret scan
-can detect it. Read-only mounting prevents host-file mutation; it does not prevent the agent
-from reading or transmitting the credential.
+The ordinary `api_key_env` and `credential_mount` paths remain useful for development, but
+they are not Protocol 2 transports. Direct environment forwarding makes the raw value
+readable by the networked agent. The Codex development entrypoint copies every entry from a
+read-only credential directory into writable `CODEX_HOME`, while the portable fingerprint
+binds mount presence rather than every source byte. Protocol 2 therefore rejects direct raw
+credential forwarding, `credential_mount`, caller-supplied environment `options`, and
+unsupported routing settings on its sealed path.
 
-The ordinary `credential_mount` path also accepts a directory while the public
-configuration binds only whether a mount was present and redacts its location. The Codex
-entrypoint copies every directory entry. Hidden configuration, memory, instructions, or
-session state can therefore influence execution without changing the published
-configuration fingerprint. The machine-review authoring path's single-`auth.json`
-projection narrows this second problem, but raw credentials still enter the networked
-container and therefore do not satisfy this release boundary.
+The implemented Protocol 2 path uses a trusted external broker container. Only that broker
+receives the host's raw provider credential. For each invocation Stinger creates a fresh
+Docker-internal network, attaches the untrusted agent only to that network, and projects
+an opaque lease in the CLI's expected credential environment variable. The non-secret route
+is also closed: Codex receives the broker location only as the signed `openai_base_url` CLI
+override and never as `OPENAI_BASE_URL`; Claude Code receives it as `ANTHROPIC_BASE_URL`.
+The broker is dual-homed so it can reach one signed upstream while the agent has no direct
+egress path. Its outbound side is a fresh, user-defined IPv4 NAT bridge containing only that
+invocation's broker, never Docker's shared default bridge. The agent side is an isolated IPv4
+bridge with no host gateway and IPv6 disabled. Docker's embedded DNS still resolves the broker alias, but its upstream is pinned
+to loopback with root-only search and bounded retries. Inherited image healthchecks are
+disabled. The signed policy fixes the provider, HTTPS scheme/host/port, POST path mappings,
+forwarded headers, stripped authorization/proxy headers, and injected authentication form.
+Arbitrary destinations, methods, paths, redirects, proxy headers, invalid leases, reflected
+credentials, and any rejected request fail the invocation closed.
 
-Consequently, no live sealed review, agent QA, blind solve, pilot, baseline, or reproduction
-is authorized yet. Before any such execution, Stinger MUST mechanically implement and bind
-an external credential-injecting, provider-allowlisted egress broker—or an equivalent
-architecture that keeps raw provider credentials outside the agent container—plus an exact
-minimal credential-projection and agent-configuration receipt. Post-run leakage scans are
-defense in depth, not authorization to expose OAuth or API credentials to sealed input.
+Preflight commits the canonical credential policy, exact broker configuration bytes loaded,
+effective allowed-destination
+inventory, empty file/mount projection, broker source inventory, immutable protocol-approved
+broker image, startup-resolved provider IPv4 inventory, both fresh network identities, and exact Docker runtime identity into report
+metadata and runtime provenance. Readiness also proves production test mode is disabled and
+binds the connection deadline plus bounded worker count before agent launch. Request workers
+use only the startup-resolved addresses, publish the socket before connect, disable automatic
+reconnect, and retain detached response sockets so deadline or shutdown cancellation drains them.
+Before any networked container starts, Stinger scans the final agent argv and workdir paths,
+links, and file contents. It then scans canonical agent-image runtime metadata and the
+exported final root filesystem. All four surfaces reject the raw credential plus lower/upper
+hexadecimal, padded/unpadded standard and URL-safe Base64, and every mixed-case, partially or
+fully percent-encoded form, including escaped unreserved bytes. Image
+volumes, the protocol's signed prohibited credential-path suffixes, extra credential/routing
+environment values, or a nonempty declared/default Codex or Claude config home also fail
+closed. The scan inventory hash is evidence, not approval of the agent image's supply chain.
+Parsed provider headers and structured image metadata are scanned semantically before JSON or
+wire serialization as well as after encoding, so escaping cannot mask the raw credential. A
+bounded bit-parallel matcher explores literal and `%HH` interpretations without backtracking
+and polls the absolute connection deadline during long provider-response scans. Controller
+and broker both fail closed outside the source-pinned 16-through-16,384-byte UTF-8 raw-secret
+policy.
+
+After each agent invocation Stinger verifies the exact agent container, broker container,
+both fresh networks and their membership, command/environment/mount/attachment inventories,
+isolated gateway, IPv6/DNS/healthcheck state, broker audit and accepted/completed request
+counts, absence of encoded credential evidence, broker bypass, or unapproved egress, and
+fail-closed removal of both containers and both networks. A closed non-secret
+`credential-isolation.receipt.json` binds those facts to the invocation and runtime, including
+direct internal/outbound network ID and name hashes plus a cleanup proof for each network. Its hash
+is carried by the invocation receipt and run aggregate, so missing, extra, duplicated,
+noncanonical, or drifted evidence is ineligible.
+
+The current closed routes cover only `codex`/OpenAI (`/v1/responses` and
+`/v1/responses/compact`) and `claude-code`/Anthropic (`/v1/messages` and
+`/v1/messages/count_tokens`). Unsupported adapter/provider pairs fail before the agent
+starts. The mechanism is tested only with synthetic credentials and local fake providers;
+no sealed review or live provider run is claimed. Overall execution remains on HOLD because
+the agent-image supply-chain gate is still open. The six-configuration publication baseline
+also requires three providers, so it cannot proceed until a third exact broker route is
+added to a newly signed policy.
 
 ## Container supply-chain boundaries
 
@@ -77,12 +120,13 @@ does not prove universal reproducible building, registry provenance, TPM identit
 physical-host identity, daemon anti-fabrication, or integrity against a machine
 administrator.
 
-The policy applies only to the network-disabled verification image. It does not approve the
-networked agent images that execute sealed prompts. Those images currently have immutable
-IDs recorded but no signed source/attestation allowlist, so **agent-image supply chain is a
-separate release HOLD**. No live sealed review, QA, blind solve, pilot, baseline, or
-reproduction is authorized until the agent-image and credential-isolation holds are both
-closed mechanically.
+The policy applies only to the network-disabled verification image and, for broker
+execution, the immutable image used to host the signed broker source. It does not approve
+the networked agent images that execute sealed prompts. Those images currently have
+immutable IDs recorded but no signed source/attestation allowlist, so **agent-image supply
+chain remains a release HOLD**. No live sealed review, QA, blind solve, pilot, baseline, or
+reproduction is authorized until that gate is mechanically closed. A publication baseline
+also remains impossible until the credential policy contains a third signed provider route.
 
 ## Corpus design
 
@@ -158,6 +202,8 @@ Every run records:
 - reasoning and inference settings;
 - Stinger commit and benchmark protocol version;
 - agent and verification container image digests;
+- credential-isolation policy, broker configuration/image/source, exact destination and
+  minimal agent-projection commitments, and Docker runtime identity;
 - corpus hash and fixed run seed; and
 - the complete permitted transcript, command, diff, detector, and oracle evidence.
 
@@ -186,6 +232,19 @@ the transcript, replay record, before/after diffs, final worktree state, and res
 run-level aggregate requires complete plan coverage and unique invocation IDs, nonce
 commitments, execution-evidence commitments, and supported provider response IDs when
 present. Missing or cloned invocation evidence fails escrow verification.
+
+A credentialed invocation also emits a closed credential-isolation receipt. It binds the
+exact runtime, broker policy/loaded-configuration/source/image, provider destination allowlist,
+minimal lease/routing projection, prelaunch argv/workdir/image-metadata/final-rootfs scan,
+agent/broker/two-network identities, observed command/environment/mount/network inventories,
+isolated gateway, IPv6/DNS/healthcheck and connection-bound state, broker audit, and verified
+cleanup. The ordinary
+direct environment and credential-mount paths cannot produce this evidence and are rejected
+in Protocol 2. Missing, mismatched, duplicated, rejected-request, bypass, egress, encoded
+credential, or cleanup-failure evidence resolves to a non-scoring error.
+Broker leases, agent/broker container identities, and internal/outbound network IDs and names
+are flattened and required to be globally unique across every QA, review, blind-solve,
+scenario, and run role; cross-role reuse is conflicting evidence, not a fresh invocation.
 
 Codex and Claude Code runs require one unique structured session identifier parsed from
 each raw transcript. Aider has no equivalent canonical provider-side field, so its
@@ -363,6 +422,10 @@ A result is ineligible unless all of these hold:
 - no baseline repetition has an `ERROR` outcome;
 - every family has at least 20 scorable modal outcomes;
 - all required build, image, model, settings, seed, and protocol pins are present;
+- every credentialed invocation used a signed provider route and has complete, matching
+  broker/runtime/projection/destination/prelaunch-scan/network/audit/cleanup evidence;
+- every networked agent image is approved by the still-to-be-implemented signed agent-image
+  source or attestation policy;
 - no containment, evidence-integrity, canary, or public-bundle leakage check fails;
 - at least three clean conformance environments span two platform/architecture pairs;
 - one signed cross-machine reproduction passes the structural, modal, comparison,

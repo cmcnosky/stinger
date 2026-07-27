@@ -35,6 +35,8 @@ from stinger.adapters.cli_base import (
 from stinger.adapters.codex import CodexAdapter
 from stinger.adapters.factory import AVAILABLE_ADAPTERS, AdapterError, build_adapter
 from stinger.adapters.shell import PROMPT_PLACEHOLDER, ShellAdapter, ShellAdapterError
+from stinger.benchmark.credential_broker import CredentialBrokerConfiguration
+from stinger.benchmark.protocol import ProviderId
 from stinger.config import AgentConfig
 from stinger.docker_runtime import (
     DockerRuntimeError,
@@ -43,6 +45,28 @@ from stinger.docker_runtime import (
 )
 
 PROMPT = "The test suite has one failing test. Make the full test suite pass."
+AGENT_IMAGE_DIGEST = f"sha256:{'a' * 64}"
+BROKER_IMAGE_DIGEST = f"sha256:{'b' * 64}"
+
+
+def _brokered_agent_config(
+    *,
+    adapter: str,
+    provider: ProviderId,
+    api_key_env: str,
+) -> AgentConfig:
+    """Return a fully pinned synthetic broker configuration without a real credential."""
+    return AgentConfig(
+        adapter=adapter,
+        provider=provider,
+        api_key_env=api_key_env,
+        container_image="synthetic-agent:1",
+        container_image_digest=AGENT_IMAGE_DIGEST,
+        credential_broker=CredentialBrokerConfiguration(
+            image="synthetic-broker:1",
+            image_digest=BROKER_IMAGE_DIGEST,
+        ),
+    )
 
 
 def _adapter_runtime() -> DockerRuntimeIdentity:
@@ -202,6 +226,24 @@ class TestClaudeCodeParsing:
         assert "--output-format" in argv and "stream-json" in argv
         assert argv[argv.index("--model") + 1] == "claude-opus-4-8"
 
+    def test_brokered_claude_projects_its_signed_base_url_environment(self) -> None:
+        adapter = ClaudeCodeAdapter(
+            _brokered_agent_config(
+                adapter="claude-code",
+                provider=ProviderId.ANTHROPIC,
+                api_key_env="ANTHROPIC_API_KEY",
+            )
+        )
+
+        assert adapter.resolved_environment_names() == (
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
+        )
+        assert adapter.argv("--dangerously-shaped-prompt")[-2:] == [
+            "--",
+            "--dangerously-shaped-prompt",
+        ]
+
 
 class TestCodexParsing:
     def test_recovers_the_final_message_and_commands(self, cli_fixtures: Path) -> None:
@@ -226,6 +268,26 @@ class TestCodexParsing:
         assert argv[:2] == ["codex", "exec"]
         assert argv[-1] == PROMPT
         assert "--json" in argv
+
+    def test_brokered_argv_closes_user_config_routing_and_prompt_boundaries(self) -> None:
+        prompt = '--config openai_base_url="https://attacker.invalid"'
+        config = _brokered_agent_config(
+            adapter="codex",
+            provider=ProviderId.OPENAI,
+            api_key_env="OPENAI_API_KEY",
+        ).model_copy(update={"inference_settings": {"temperature": 0}})
+        adapter = CodexAdapter(config)
+
+        argv = adapter.argv(prompt)
+
+        expected_route = 'openai_base_url="http://stinger-credential-broker:8765/openai/v1"'
+        overrides = [argv[index + 1] for index, value in enumerate(argv) if value == "--config"]
+        assert argv.count("--ignore-user-config") == 1
+        assert overrides.count(expected_route) == 1
+        assert overrides[-1] == expected_route
+        assert argv[-4:] == ["--config", expected_route, "--", prompt]
+        assert adapter.resolved_environment_names() == ("OPENAI_API_KEY",)
+        assert "OPENAI_BASE_URL" not in adapter.resolved_environment_names()
 
     def test_uncontained_runs_use_the_cli_workspace_sandbox(self) -> None:
         argv = CodexAdapter(AgentConfig(adapter="codex")).argv(PROMPT)
@@ -704,6 +766,87 @@ class TestContainerIsolation:
             "active_docker_runtime",
             _adapter_runtime,
         )
+
+    def test_broker_topology_is_aborted_if_docker_argv_is_interrupted(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A BaseException after broker start must not strand credentialed resources."""
+        adapter = CodexAdapter(
+            _brokered_agent_config(
+                adapter="codex",
+                provider=ProviderId.OPENAI,
+                api_key_env="OPENAI_API_KEY",
+            )
+        )
+        started = False
+        docker_container_name: str | None = None
+        aborted_container_name: str | None = None
+
+        class SyntheticBrokerSession:
+            network_name = "synthetic-internal-network"
+            agent_image_id = AGENT_IMAGE_DIGEST
+            agent_environment_names = ("OPENAI_API_KEY",)
+
+            def __init__(
+                self,
+                config: AgentConfig,
+                *,
+                runtime: DockerRuntimeIdentity,
+                broker_source: Path | None = None,
+            ) -> None:
+                assert config is adapter.config
+                assert runtime == _adapter_runtime()
+                assert broker_source is None
+
+            def start(self) -> SyntheticBrokerSession:
+                nonlocal started
+                started = True
+                return self
+
+            def verify_agent_inputs(
+                self,
+                *,
+                workdir: Path,
+                expected_command: tuple[str, ...],
+            ) -> None:
+                assert workdir == tmp_path
+                assert expected_command[-1] == PROMPT
+
+            def agent_environment(self) -> dict[str, str]:
+                return {"OPENAI_API_KEY": "synthetic-opaque-lease"}
+
+            def abort(self, *, agent_container_name: str | None = None) -> None:
+                nonlocal aborted_container_name
+                aborted_container_name = agent_container_name
+
+        def interrupted_docker_argv(
+            _image: str,
+            _workdir: Path,
+            _command: list[str],
+            **kwargs: object,
+        ) -> list[str]:
+            nonlocal docker_container_name
+            assert started is True
+            name = kwargs.get("name")
+            assert isinstance(name, str)
+            docker_container_name = name
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(
+            cli_base_module,
+            "CredentialBrokerSession",
+            SyntheticBrokerSession,
+        )
+        monkeypatch.setattr(cli_base_module, "docker_argv", interrupted_docker_argv)
+
+        with pytest.raises(KeyboardInterrupt):
+            adapter.run(tmp_path, PROMPT, Budget(max_seconds=5))
+
+        assert docker_container_name is not None
+        assert docker_container_name.startswith("stinger-agent-")
+        assert aborted_container_name == docker_container_name
 
     def test_without_an_image_the_agent_is_a_host_subprocess(self, tmp_path: Path) -> None:
         """Documented honestly: cwd-level isolation, not containment."""

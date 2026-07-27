@@ -6,8 +6,11 @@
 #     stinger run --config stinger.yaml
 #
 # No secret belongs in this file. An adapter names the ENVIRONMENT VARIABLE that holds its
-# API key; Stinger reads it at run time and passes it to the agent process, and never writes
-# a key into a config, a fingerprint, or a report.
+# API key. Ordinary development forwards that value to the agent process by name. Protocol 2
+# instead gives the raw value only to an external broker and projects an opaque lease plus
+# closed non-secret routing: the signed `openai_base_url` CLI override for Codex, or
+# `ANTHROPIC_BASE_URL` for Claude Code. Neither path writes a key into a config, fingerprint,
+# or report.
 
 agent:
   # One of: claude-code | codex | aider | shell | recorded
@@ -33,7 +36,10 @@ agent:
 
   # NAME of the env var holding the key — never the key itself. Stinger refuses to start the
   # agent if this variable is unset, rather than letting an auth failure downstream look like
-  # the agent misbehaving.
+  # the agent misbehaving. Without `credential_broker`, this is ordinary-development direct
+  # forwarding and the agent can read the raw value. With the Protocol 2 broker, this names
+  # the host-side source seen only by the broker; the agent receives an opaque lease in this
+  # same variable instead.
   #
   # ANTHROPIC_API_KEY is the right name for a local run, where your shell already has it. In
   # the reusable GitHub workflow (.github/workflows/stinger.yml) the secret you pass arrives
@@ -57,16 +63,42 @@ agent:
   # this image; a mutable tag alone is not a benchmark pin.
   # container_image_digest: sha256:<64 lowercase hex digits>
 
-  # Optional. A host directory holding the agent's credentials, mounted READ-ONLY at
-  # /credentials inside the agent container. Only needed when the CLI authenticates from a
-  # file rather than an environment variable — Codex under a ChatGPT subscription keeps OAuth
-  # tokens in auth.json, which `api_key_env` cannot express.
+  # Protocol 2 credential isolation. Leave this commented for ordinary development. A
+  # credentialed benchmark run requires an immutable, protocol-approved broker image and a
+  # contained agent image/digest. The broker alone receives the raw provider credential. The
+  # agent joins only a fresh isolated IPv4 Docker bridge with no host gateway or IPv6 and
+  # receives an opaque per-invocation lease plus closed routing. Docker's embedded DNS can
+  # resolve only the broker alias needed by the agent; upstream resolution is loopback-only,
+  # root-search-only, and bounded, and inherited image healthchecks are disabled. Codex uses
+  # the signed `openai_base_url` CLI override and never `OPENAI_BASE_URL`; Claude Code uses
+  # `ANTHROPIC_BASE_URL`.
+  #
+  # Before the broker or network starts, Protocol 2 scans the final argv and workdir
+  # paths/links/files. It also scans canonical image runtime metadata and the exported final
+  # rootfs for raw, lower/upper hex, padded/unpadded standard or URL-safe Base64, and percent
+  # credential forms. A signed prohibited credential-path suffix, declared image volume, or
+  # nonempty declared/default agent config home fails closed. Extra environment options,
+  # credential mounts, unsupported routes, arbitrary egress, identity drift, or incomplete
+  # cleanup also fail closed. Current routes are exactly codex/OpenAI with OPENAI_API_KEY and
+  # claude-code/Anthropic with ANTHROPIC_API_KEY. A third route is still required for the
+  # three-provider publication baseline, and the separate agent-image supply-chain gate is
+  # still HOLD. Configuring this block does not authorize or claim a sealed/live run.
+  # credential_broker:
+  #   image: stinger-runner:1
+  #   image_digest: sha256:<64 lowercase hex digits>
+
+  # Optional for ordinary development only. A host directory holding the agent's credentials,
+  # mounted READ-ONLY at /credentials inside the agent container. Only needed when the CLI
+  # authenticates from a file rather than an environment variable — Codex under a ChatGPT
+  # subscription keeps OAuth tokens in auth.json, which `api_key_env` cannot express.
   #
   # This is the one hole in "nothing but the workdir is mounted", so keep it a hole and not a
   # door: put ONLY the credential file in this directory. Pointing it at ~/.codex, ~/.claude
   # or any real agent home hands the agent under test that agent's memories, session history
   # and config, which is precisely the contamination the container exists to prevent. Whether
-  # one was mounted is part of the config fingerprint; where it lives is not.
+  # one was mounted is part of the config fingerprint; where it lives is not. Protocol 2
+  # rejects this field: read-only prevents mutation, not reading or exfiltration, and the
+  # portable fingerprint does not bind every copied file.
   # credential_mount: ~/.stinger/codex-credentials
 
   # For `adapter: shell` only — how to invoke an agent Stinger has never heard of.

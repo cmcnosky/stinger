@@ -20,6 +20,10 @@ import stinger.docker_runtime as docker_runtime
 from stinger import BENCHMARK_PROTOCOL_VERSION
 from stinger.adapters.base import AgentRun, Budget
 from stinger.adapters.codex import CodexAdapter
+from stinger.benchmark.credential_broker import (
+    CredentialBrokerConfiguration,
+    CredentialIsolationInvocationReceipt,
+)
 from stinger.benchmark.evidence import (
     BUNDLE_MANIFEST,
     BUNDLE_MANIFEST_HASH,
@@ -37,7 +41,11 @@ from stinger.benchmark.git_checkout import (
     GitCheckoutError,
     VerifiedTrackedImplementation,
 )
-from stinger.benchmark.protocol import BenchmarkRuntimeProvenance, ProviderId
+from stinger.benchmark.protocol import (
+    BenchmarkRuntimeProvenance,
+    CredentialIsolationRuntimeProvenance,
+    ProviderId,
+)
 from stinger.benchmark.signing import (
     ProtocolSignatureVerification,
     sign_protocol,
@@ -170,9 +178,13 @@ def evidence_inputs(
             cli_version="1.2.3",
             reasoning_effort="fixed",
             inference_settings={"temperature": 0},
+            api_key_env="OPENAI_API_KEY",
             container_image="fixture-agent:1",
             container_image_digest="sha256:" + "1" * 64,
-            credential_mount=root / "private" / "credentials",
+            credential_broker=CredentialBrokerConfiguration(
+                image="stinger-runner:1",
+                image_digest=APPROVED_LINUX_ARM64_VERIFICATION_IMAGE_ID,
+            ),
         ),
         corpus=corpus,
         output_dir=root / "private" / "repro-output",
@@ -186,6 +198,15 @@ def evidence_inputs(
 
     evidence = root / "repro"
     scenario = scenarios[0]
+    credential_identities = run_config._credential_isolation_identities()
+    assert credential_identities is not None
+    (
+        credential_policy_sha256,
+        broker_configuration_sha256,
+        allowed_destination_inventory_sha256,
+        agent_projection_inventory_sha256,
+        broker_source_inventory_sha256,
+    ) = credential_identities
     runtime = BenchmarkRuntimeProvenance(
         requested_provider=ProviderId.OPENAI,
         requested_model_id="fixture-model",
@@ -203,6 +224,16 @@ def evidence_inputs(
         docker_client_sha256=FIXTURE_DOCKER_RUNTIME.client_sha256,
         docker_runtime_fingerprint_sha256=FIXTURE_DOCKER_RUNTIME.fingerprint_sha256,
         docker_runtime_claim_boundary=DOCKER_RUNTIME_CLAIM_BOUNDARY,
+        credential_isolation=CredentialIsolationRuntimeProvenance(
+            policy_sha256=credential_policy_sha256,
+            broker_configuration_sha256=broker_configuration_sha256,
+            allowed_destination_inventory_sha256=(allowed_destination_inventory_sha256),
+            agent_projection_inventory_sha256=agent_projection_inventory_sha256,
+            broker_source_inventory_sha256=broker_source_inventory_sha256,
+            broker_image_id=APPROVED_LINUX_ARM64_VERIFICATION_IMAGE_ID,
+            docker_runtime_fingerprint_sha256=(FIXTURE_DOCKER_RUNTIME.fingerprint_sha256),
+            verified=True,
+        ),
         verified=True,
     )
     (invocation_context,) = replay_module.build_invocation_plan(
@@ -214,7 +245,54 @@ def evidence_inputs(
     transcript = (ROOT / "tests" / "fixtures" / "cli" / "codex-honest.jsonl").read_text(
         encoding="utf-8"
     )
-    parsed_run = CodexAdapter(run_config.agent).replay(transcript)
+    parsed_run = (
+        CodexAdapter(run_config.agent)
+        .replay(transcript)
+        .model_copy(
+            update={
+                "credential_isolation": CredentialIsolationInvocationReceipt(
+                    policy_sha256=credential_policy_sha256,
+                    broker_configuration_sha256=broker_configuration_sha256,
+                    allowed_destination_inventory_sha256=(allowed_destination_inventory_sha256),
+                    resolved_upstream_address_inventory_sha256="e" * 64,
+                    agent_projection_inventory_sha256=agent_projection_inventory_sha256,
+                    broker_source_inventory_sha256=broker_source_inventory_sha256,
+                    broker_image_id=APPROVED_LINUX_ARM64_VERIFICATION_IMAGE_ID,
+                    docker_client_sha256=FIXTURE_DOCKER_RUNTIME.client_sha256,
+                    docker_runtime_fingerprint_sha256=(FIXTURE_DOCKER_RUNTIME.fingerprint_sha256),
+                    agent_container_id_sha256="9" * 64,
+                    broker_container_id_sha256="a" * 64,
+                    internal_network_id_sha256="6" * 64,
+                    internal_network_name_sha256="7" * 64,
+                    outbound_network_id_sha256="8" * 64,
+                    outbound_network_name_sha256="9" * 64,
+                    broker_lease_sha256="b" * 64,
+                    agent_command_inventory_sha256="0" * 64,
+                    agent_environment_inventory_sha256="c" * 64,
+                    agent_mount_inventory_sha256="d" * 64,
+                    agent_image_credential_scan_sha256="f" * 64,
+                    agent_container_runtime_inventory_sha256="7" * 64,
+                    broker_container_runtime_inventory_sha256="6" * 64,
+                    network_attachment_inventory_sha256="e" * 64,
+                    broker_audit_sha256="8" * 64,
+                    request_count=1,
+                    rejection_count=0,
+                    agent_environment_names=("OPENAI_API_KEY",),
+                    agent_network_mode="fresh-docker-internal-network-only",
+                    agent_bridge_gateway="isolated-no-host-interface",
+                    agent_dns="embedded-broker-alias-with-loopback-only-upstream",
+                    broker_alias="stinger-credential-broker",
+                    raw_provider_credential_exposed=False,
+                    broker_bypass_path_present=False,
+                    unapproved_egress_path_present=False,
+                    agent_container_cleanup_verified=True,
+                    broker_container_cleanup_verified=True,
+                    internal_network_cleanup_verified=True,
+                    outbound_network_cleanup_verified=True,
+                )
+            }
+        )
+    )
     result = run_scenario_once(
         scenario.directory,
         scenario.manifest,
@@ -451,6 +529,14 @@ def rewrite_invocation_bindings_for_test(
     by_row = {(item.scenario_id, item.repetition): item for item in contexts}
     for result in report.results:
         run_dir = evidence / "runs" / result.scenario_id / str(result.repetition)
+        isolation_path = run_dir / replay_module.CREDENTIAL_ISOLATION_RECEIPT_NAME
+        isolation = replay_module.load_credential_isolation_receipt(isolation_path)
+        isolation_path.unlink()
+        replay_module.write_credential_isolation_receipt(
+            run_dir,
+            context=by_row[(result.scenario_id, result.repetition)],
+            evidence=isolation.evidence,
+        )
         (run_dir / replay_module.INVOCATION_RECEIPT_NAME).unlink()
         replay_module.write_invocation_receipt(
             run_dir,
@@ -484,6 +570,9 @@ class TestClassificationReplayEvidence:
         receipt = replay_module.load_invocation_receipt(
             run_dir / replay_module.INVOCATION_RECEIPT_NAME
         )
+        isolation_receipt = replay_module.load_credential_isolation_receipt(
+            run_dir / replay_module.CREDENTIAL_ISOLATION_RECEIPT_NAME
+        )
         aggregate = replay_module.load_invocation_aggregate(
             evidence_inputs["evidence"] / replay_module.INVOCATION_AGGREGATE_NAME
         )
@@ -493,6 +582,10 @@ class TestClassificationReplayEvidence:
             aggregate.invocation_challenge_nonce_sha256s
         )
         assert receipt.provider_response_id_sha256 is not None
+        assert isolation_receipt.invocation_id == receipt.invocation_id
+        assert receipt.credential_isolation_receipt_sha256 in (
+            aggregate.credential_isolation_receipt_sha256s
+        )
         assert aggregate.receipt_count == 1
         assert (
             replay_module.verify_invocation_aggregate(
@@ -504,6 +597,62 @@ class TestClassificationReplayEvidence:
                 (evidence_inputs["evidence"] / replay_module.INVOCATION_AGGREGATE_NAME).read_bytes()
             ).hexdigest()
         )
+
+    @pytest.mark.parametrize(
+        ("mutation", "expected_error"),
+        [
+            ("missing", "credential-isolation invocation receipt must be a real regular file"),
+            ("configuration", "exact broker runtime identity"),
+            ("invocation", "disagrees with invocation identity"),
+        ],
+    )
+    def test_invocation_isolation_receipt_missing_or_mismatched_fails_closed(
+        self,
+        evidence_inputs: dict[str, Path],
+        mutation: str,
+        expected_error: str,
+    ) -> None:
+        report = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
+        config = RunConfig.from_yaml(evidence_inputs["config"])
+        (result,) = report.results
+        isolation_path = (
+            evidence_inputs["evidence"]
+            / "runs"
+            / result.scenario_id
+            / str(result.repetition)
+            / replay_module.CREDENTIAL_ISOLATION_RECEIPT_NAME
+        )
+        original = isolation_path.read_bytes()
+        receipt = replay_module.load_credential_isolation_receipt(isolation_path)
+        if mutation == "missing":
+            isolation_path.unlink()
+        elif mutation == "configuration":
+            isolation_path.write_bytes(
+                replay_module._canonical_model_bytes(
+                    receipt.model_copy(
+                        update={
+                            "evidence": receipt.evidence.model_copy(
+                                update={"broker_configuration_sha256": "9" * 64}
+                            )
+                        }
+                    )
+                )
+            )
+        else:
+            isolation_path.write_bytes(
+                replay_module._canonical_model_bytes(
+                    receipt.model_copy(update={"invocation_id": "9" * 64})
+                )
+            )
+        try:
+            with pytest.raises(replay_module.ClassificationReplayError, match=expected_error):
+                replay_module.build_invocation_aggregate(
+                    evidence_inputs["evidence"],
+                    config=config,
+                    report=report,
+                )
+        finally:
+            isolation_path.write_bytes(original)
 
     def test_aggregate_rebuild_uses_one_invocation_receipt_snapshot(
         self,
@@ -659,6 +808,75 @@ class TestClassificationReplayEvidence:
                 agent_adapter="aider",
             )
 
+    @pytest.mark.parametrize("reuse_kind", ("network", "container"))
+    def test_invocation_uniqueness_rejects_cross_role_runtime_identity_reuse(
+        self,
+        evidence_inputs: dict[str, Path],
+        reuse_kind: str,
+    ) -> None:
+        """One invocation cannot relabel another agent's network or container."""
+        report = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
+        (result,) = report.results
+        run_dir = evidence_inputs["evidence"] / "runs" / result.scenario_id / str(result.repetition)
+        receipt = replay_module.load_invocation_receipt(
+            run_dir / replay_module.INVOCATION_RECEIPT_NAME
+        )
+        isolation = replay_module.load_credential_isolation_receipt(
+            run_dir / replay_module.CREDENTIAL_ISOLATION_RECEIPT_NAME
+        )
+
+        def digest(label: str) -> str:
+            return hashlib.sha256(label.encode("ascii")).hexdigest()
+
+        second_receipt = receipt.model_copy(
+            update={
+                "invocation_id": digest("second-invocation"),
+                "invocation_challenge_nonce_sha256": digest("second-challenge"),
+                "provider_response_id_sha256": digest("second-provider-response"),
+            }
+        )
+        second_evidence_update = {
+            "broker_lease_sha256": digest("second-lease"),
+            "agent_container_id_sha256": digest("second-agent-container"),
+            "broker_container_id_sha256": digest("second-broker-container"),
+            "internal_network_id_sha256": digest("second-internal-id"),
+            "internal_network_name_sha256": digest("second-internal-name"),
+            "outbound_network_id_sha256": digest("second-outbound-id"),
+            "outbound_network_name_sha256": digest("second-outbound-name"),
+        }
+        if reuse_kind == "network":
+            second_evidence_update.update(
+                {
+                    "outbound_network_id_sha256": (isolation.evidence.internal_network_id_sha256),
+                    "outbound_network_name_sha256": (
+                        isolation.evidence.internal_network_name_sha256
+                    ),
+                }
+            )
+            expected_error = "network identities are not globally unique"
+        else:
+            second_evidence_update["broker_container_id_sha256"] = (
+                isolation.evidence.agent_container_id_sha256
+            )
+            expected_error = "container identities are not globally unique"
+        second_evidence = isolation.evidence.model_copy(update=second_evidence_update)
+        second_isolation = isolation.model_copy(
+            update={
+                "invocation_id": second_receipt.invocation_id,
+                "evidence": second_evidence,
+            }
+        )
+
+        with pytest.raises(
+            replay_module.ClassificationReplayError,
+            match=expected_error,
+        ):
+            replay_module._require_unique_invocations(
+                (receipt, second_receipt),
+                isolation_receipts=(isolation, second_isolation),
+                agent_adapter="codex",
+            )
+
     def test_replay_runtime_enforces_canonical_provider_mapping(
         self,
         evidence_inputs: dict[str, Path],
@@ -783,6 +1001,12 @@ class TestClassificationReplayEvidence:
         identity = docker_runtime.observe_docker_runtime()
         report = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
         assert report.benchmark_runtime_provenance is not None
+        assert report.benchmark_runtime_provenance.credential_isolation is not None
+        changed_isolation = report.benchmark_runtime_provenance.credential_isolation.model_copy(
+            update={
+                "docker_runtime_fingerprint_sha256": identity.fingerprint_sha256,
+            }
+        )
         report = report.model_copy(
             update={
                 "benchmark_runtime_provenance": (
@@ -790,6 +1014,7 @@ class TestClassificationReplayEvidence:
                         update={
                             "docker_client_sha256": identity.client_sha256,
                             "docker_runtime_fingerprint_sha256": (identity.fingerprint_sha256),
+                            "credential_isolation": changed_isolation,
                         }
                     )
                 )
