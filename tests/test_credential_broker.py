@@ -17,7 +17,7 @@ import tarfile
 import threading
 import time
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -39,7 +39,7 @@ from stinger.benchmark.credential_broker import (
     CredentialBrokerConfiguration,
     canonical_json_bytes,
 )
-from stinger.benchmark.protocol import ProviderId
+from stinger.benchmark.protocol import ProviderId, compiled_credential_isolation_policy
 from stinger.config import AgentConfig
 from stinger.docker_runtime import DockerRuntimeIdentity, observe_docker_runtime
 
@@ -191,6 +191,7 @@ class _LocalBroker:
     raw_credential: str
     lease: str
     server: broker_server.CredentialBrokerHTTPServer
+    handler_type: type[broker_server.CredentialBrokerHandler]
     agent_path: str
     lease_header: str
     lease_scheme: str
@@ -280,6 +281,11 @@ def _running_local_broker(
                 "listen": "127.0.0.1:test",
                 "max_concurrent_connections": broker_server.MAX_CONCURRENT_CONNECTIONS,
                 "provider": loaded["provider"],
+                "resolved_upstream_address_inventory_sha256": (
+                    broker_server._resolved_upstream_address_inventory_sha256(
+                        broker_server._resolve_upstream_ipv4_addresses(loaded)
+                    )
+                ),
                 "test_only_allow_http": True,
                 "upstream_https_origin": loaded["upstream_https_origin"],
                 "upstream_socket_timeout_seconds": (broker_server.UPSTREAM_SOCKET_TIMEOUT_SECONDS),
@@ -301,7 +307,9 @@ def _running_local_broker(
     BrokerHandler.audit_path = audit_path
     BrokerHandler.audit_lock = threading.Lock()
     BrokerHandler.request_sequence = 0
-    BrokerHandler.upstream_connections = set()
+    BrokerHandler.upstream_handles = set()
+    BrokerHandler.upstream_cancellation_started = threading.Event()
+    BrokerHandler.upstream_addresses = broker_server._resolve_upstream_ipv4_addresses(loaded)
     BrokerHandler.upstream_lock = threading.Lock()
     broker = broker_server.CredentialBrokerHTTPServer(("127.0.0.1", 0), BrokerHandler)
     broker_thread = threading.Thread(target=broker.serve_forever, daemon=True)
@@ -314,6 +322,7 @@ def _running_local_broker(
             raw_credential=raw_credential,
             lease=BROKER_LEASE,
             server=broker,
+            handler_type=BrokerHandler,
             agent_path=str(loaded["path_mappings"][0]["agent_path"]),
             lease_header=str(loaded["injected_auth_header"]),
             lease_scheme=str(loaded["injected_auth_scheme"]),
@@ -816,10 +825,11 @@ def test_absolute_deadline_stops_slow_drip_body(tmp_path: Path) -> None:
 
 def test_absolute_deadline_stops_slow_drip_upstream(tmp_path: Path) -> None:
     """An approved streaming provider cannot keep a credentialed worker alive forever."""
+    context_started = time.monotonic()
     with _running_local_broker(
         tmp_path,
-        response_body=b"x" * 20,
-        response_chunk_delay_seconds=0.03,
+        response_body=b"x" * 1000,
+        response_chunk_delay_seconds=0.01,
         client_timeout_seconds=1,
         absolute_timeout_seconds=0.15,
     ) as broker:
@@ -851,6 +861,182 @@ def test_absolute_deadline_stops_slow_drip_upstream(tmp_path: Path) -> None:
             and event["reason"] == "absolute connection deadline exceeded"
             for event in events
         )
+        drain_deadline = time.monotonic() + 0.75
+        while broker.server.connection_counts() != (1, 0, 0):
+            assert time.monotonic() < drain_deadline
+            time.sleep(0.01)
+        assert not any(event["decision"] == "allowed" for event in events)
+    assert time.monotonic() - context_started < 3
+
+
+def test_shutdown_cancels_detached_slow_upstream_and_drains_worker(tmp_path: Path) -> None:
+    """SIGTERM-equivalent cancellation closes an HTTP/1.0 detached response socket."""
+    context_started = time.monotonic()
+    with _running_local_broker(
+        tmp_path,
+        response_body=b"x" * 1000,
+        response_chunk_delay_seconds=0.01,
+        client_timeout_seconds=1,
+        absolute_timeout_seconds=5,
+    ) as broker:
+        client_done = threading.Event()
+
+        def request() -> None:
+            connection = http.client.HTTPConnection("127.0.0.1", broker.port, timeout=2)
+            try:
+                connection.request(
+                    "POST",
+                    APPROVED_AGENT_PATH,
+                    body=b"{}",
+                    headers={
+                        "Authorization": f"Bearer {broker.lease}",
+                        "Content-Type": "application/json",
+                        "Host": f"{BROKER_ALIAS}:8765",
+                    },
+                )
+                try:
+                    response = connection.getresponse()
+                    response.read()
+                except (http.client.HTTPException, OSError):
+                    pass
+            finally:
+                connection.close()
+                client_done.set()
+
+        client = threading.Thread(target=request)
+        client.start()
+        observation_deadline = time.monotonic() + 1
+        while not broker.observations:
+            assert time.monotonic() < observation_deadline
+            time.sleep(0.01)
+        time.sleep(0.05)
+
+        broker.handler_type.cancel_active_upstreams()
+
+        drain_deadline = time.monotonic() + 0.75
+        while broker.server.connection_counts() != (1, 0, 0):
+            assert time.monotonic() < drain_deadline
+            time.sleep(0.01)
+        client.join(timeout=1)
+        assert client_done.is_set()
+        assert not client.is_alive()
+    assert time.monotonic() - context_started < 3
+
+
+def test_deadline_before_connect_completion_never_sends_the_credentialed_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The watchdog interrupts the preregistered socket while TCP connect is blocked."""
+
+    class BlockingSocket:
+        closed = threading.Event()
+
+        def settimeout(self, timeout: float) -> None:
+            pass
+
+        def connect(self, address: tuple[str, int]) -> None:
+            BlockingSocket.closed.wait(timeout=1)
+            raise OSError("synthetic cancelled connect")
+
+        def shutdown(self, how: int) -> None:
+            BlockingSocket.closed.set()
+
+        def close(self) -> None:
+            BlockingSocket.closed.set()
+
+    real_socket = socket.socket
+
+    def socket_factory(
+        family: int = socket.AF_INET,
+        type: int = socket.SOCK_STREAM,
+        proto: int = 0,
+        fileno: int | None = None,
+    ) -> socket.socket | BlockingSocket:
+        if fileno is not None:
+            return real_socket(family, type, proto, fileno=fileno)
+        return BlockingSocket()
+
+    with _running_local_broker(
+        tmp_path,
+        client_timeout_seconds=1,
+        absolute_timeout_seconds=0.05,
+    ) as broker:
+        agent = real_socket(socket.AF_INET, socket.SOCK_STREAM)
+        agent.settimeout(2)
+        agent.connect(("127.0.0.1", broker.port))
+        monkeypatch.setattr(broker_server.socket, "socket", socket_factory)
+        try:
+            try:
+                agent.sendall(_request_bytes())
+                with suppress(OSError):
+                    agent.recv(1)
+            finally:
+                agent.close()
+            drain_deadline = time.monotonic() + 0.75
+            while broker.server.connection_counts() != (1, 0, 0):
+                assert time.monotonic() < drain_deadline
+                time.sleep(0.01)
+        finally:
+            monkeypatch.setattr(broker_server.socket, "socket", real_socket)
+        assert BlockingSocket.closed.is_set()
+        assert not broker.observations
+        events = _audit_events(broker.audit_path)
+        assert any(
+            event["decision"] == "rejected"
+            and event["reason"] == "absolute connection deadline exceeded"
+            for event in events
+        )
+
+
+def test_cancellation_after_connect_cannot_auto_reopen_and_send_credential(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation in the final dispatch race cannot make HTTPConnection reconnect."""
+    broker_holder: list[_LocalBroker] = []
+
+    class ReopeningConnection:
+        sent_authorization: str | None = None
+
+        def __init__(self, host: str, port: int, *, timeout: float) -> None:
+            self.sock: socket.socket | None = None
+            self.auto_open = True
+
+        def request(
+            self,
+            method: str,
+            path: str,
+            *,
+            body: bytes,
+            headers: Mapping[str, str],
+        ) -> None:
+            broker_holder[0].handler_type.cancel_active_upstreams()
+            if self.sock is None and self.auto_open:
+                ReopeningConnection.sent_authorization = headers.get("Authorization")
+                return
+            raise http.client.NotConnected()
+
+        def close(self) -> None:
+            if self.sock is not None:
+                self.sock.close()
+                self.sock = None
+
+    with _running_local_broker(tmp_path, absolute_timeout_seconds=5) as broker:
+        broker_holder.append(broker)
+        monkeypatch.setattr(
+            broker_server.http.client,
+            "HTTPConnection",
+            ReopeningConnection,
+        )
+        status, _response = _raw_request(broker.port, _request_bytes())
+        assert status == 502
+        drain_deadline = time.monotonic() + 0.75
+        while broker.server.connection_counts() != (1, 0, 0):
+            assert time.monotonic() < drain_deadline
+            time.sleep(0.01)
+        assert ReopeningConnection.sent_authorization is None
+        assert not broker.observations
 
 
 def test_connection_worker_limit_rejects_before_spawning_an_extra_thread(
@@ -938,11 +1124,56 @@ def _controller_session(
     session = broker_controller.CredentialBrokerSession(
         config,
         runtime=_runtime_identity(),
-        repository=REPOSITORY,
+        broker_source=REPOSITORY / "src/stinger/credential_broker_server.py",
     )
     session._image_environment = {}
     session._broker_image_environment = {}
+    session._resolved_upstream_address_inventory_sha256 = "f" * 64
     return session
+
+
+def test_controller_resolves_pinned_source_from_installed_package_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wheel uses its installed broker file without assuming a source checkout."""
+    installed_source = tmp_path / "lib/python3.12/site-packages/stinger/credential_broker_server.py"
+    installed_source.parent.mkdir(parents=True)
+    installed_source.write_bytes(
+        (REPOSITORY / "src/stinger/credential_broker_server.py").read_bytes()
+    )
+    elsewhere = tmp_path / "outside-checkout"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setattr(
+        broker_controller.credential_broker_server_module,
+        "__file__",
+        str(installed_source),
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", RAW_CREDENTIAL)
+    digest = "sha256:" + "9" * 64
+    config = AgentConfig(
+        adapter="codex",
+        model="synthetic-model",
+        provider=ProviderId.OPENAI,
+        api_key_env="OPENAI_API_KEY",
+        container_image=digest,
+        container_image_digest=digest,
+        credential_broker=CredentialBrokerConfiguration(
+            image=digest,
+            image_digest=digest,
+        ),
+    )
+
+    session = broker_controller.CredentialBrokerSession(
+        config,
+        runtime=_runtime_identity(),
+    )
+
+    assert session._resolved_broker_source() == installed_source.resolve()
+    assert session._observed_broker_source_inventory_sha256() == (
+        compiled_credential_isolation_policy().broker_source_inventory_sha256
+    )
 
 
 @pytest.mark.parametrize(
@@ -1689,6 +1920,7 @@ def _valid_controller_audit_events(
         "method": "POST",
         "path_sha256": path_sha256,
         "request_id": 1,
+        "resolved_upstream_address_inventory_sha256": "f" * 64,
         "upstream_https_origin": session._route.upstream_https_origin,
     }
     return [
@@ -1714,6 +1946,7 @@ def _valid_controller_audit_events(
             "decision": "quiesced",
             "provider": "openai",
             "request_count": 1,
+            "resolved_upstream_address_inventory_sha256": "f" * 64,
             "max_concurrent_connections": 32,
             "test_only_allow_http": False,
             "upstream_https_origin": session._route.upstream_https_origin,
@@ -1807,6 +2040,11 @@ def test_controller_rejects_tampered_then_restored_config_from_loaded_byte_ident
                 "listen": "0.0.0.0:8765",
                 "max_concurrent_connections": broker_server.MAX_CONCURRENT_CONNECTIONS,
                 "provider": "openai",
+                "resolved_upstream_address_inventory_sha256": (
+                    broker_server._resolved_upstream_address_inventory_sha256(
+                        broker_server._resolve_upstream_ipv4_addresses(loaded)
+                    )
+                ),
                 "test_only_allow_http": True,
                 "upstream_https_origin": "http://127.0.0.1:9",
                 "upstream_socket_timeout_seconds": (broker_server.UPSTREAM_SOCKET_TIMEOUT_SECONDS),
@@ -2891,7 +3129,7 @@ def test_real_controller_start_and_abort_use_dedicated_broker_network(
     session = broker_controller.CredentialBrokerSession(
         config,
         runtime=runtime,
-        repository=REPOSITORY,
+        broker_source=REPOSITORY / "src/stinger/credential_broker_server.py",
     )
 
     session.start()

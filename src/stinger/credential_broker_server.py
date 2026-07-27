@@ -20,6 +20,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 from base64 import b64encode, urlsafe_b64encode
 from contextlib import suppress
 from http import HTTPStatus
@@ -132,6 +133,97 @@ PRODUCTION_ROUTE_CONFIGS: dict[str, dict[str, object]] = {
 
 class BrokerConfigurationError(Exception):
     """Raised before listening when the exact broker configuration is invalid."""
+
+
+class _CancelableUpstream:
+    """Own every object that can keep one credentialed upstream request alive."""
+
+    def __init__(self, connection: http.client.HTTPConnection) -> None:
+        self.connection = connection
+        self._lock = threading.Lock()
+        self._socket: socket.socket | None = None
+        self._response: http.client.HTTPResponse | None = None
+        self._cancelled = False
+
+    def publish_socket(self, upstream_socket: socket.socket | None) -> None:
+        """Retain the live socket before ``getresponse`` can detach it."""
+        if upstream_socket is None:
+            self.cancel()
+            raise _RequestRejected("upstream socket identity is unavailable")
+        with self._lock:
+            if self._cancelled:
+                close_now = True
+            elif self._socket is None:
+                self._socket = upstream_socket
+                close_now = False
+            elif self._socket is upstream_socket:
+                close_now = False
+            else:
+                close_now = True
+        if close_now:
+            self._shutdown_socket(upstream_socket)
+            raise _RequestRejected("upstream socket identity changed")
+
+    def publish_response(self, response: http.client.HTTPResponse) -> None:
+        """Retain a detached HTTP response so cancellation can close its reader."""
+        with self._lock:
+            if self._cancelled:
+                close_now = True
+            elif self._response is None:
+                self._response = response
+                close_now = False
+            elif self._response is response:
+                close_now = False
+            else:
+                close_now = True
+        if close_now:
+            with suppress(OSError, ValueError, http.client.HTTPException):
+                response.close()
+            raise _RequestRejected("upstream response identity changed")
+
+    def wrap_tls(self, context: ssl.SSLContext, server_hostname: str) -> ssl.SSLSocket:
+        """Atomically replace the tracked raw socket before starting a TLS handshake."""
+        with self._lock:
+            if self._cancelled or self._socket is None:
+                raise _RequestRejected("upstream TLS setup was cancelled")
+            wrapped = context.wrap_socket(
+                self._socket,
+                server_hostname=server_hostname,
+                do_handshake_on_connect=False,
+            )
+            self._socket = wrapped
+            return wrapped
+
+    def cancel(self) -> None:
+        """Idempotently interrupt connect, response, and detached-socket states."""
+        with self._lock:
+            self._cancelled = True
+            upstream_socket = self._socket
+            response = self._response
+            connection = self.connection
+        if upstream_socket is not None:
+            with suppress(OSError):
+                upstream_socket.shutdown(socket.SHUT_RDWR)
+        if response is not None:
+            with suppress(OSError, ValueError, http.client.HTTPException):
+                response.close()
+        with suppress(OSError, ValueError, http.client.HTTPException):
+            connection.close()
+        if upstream_socket is not None:
+            with suppress(OSError):
+                upstream_socket.close()
+
+    def is_cancelled(self) -> bool:
+        """Return whether a deadline, shutdown, or normal close won the lifecycle."""
+        with self._lock:
+            return self._cancelled
+
+    @staticmethod
+    def _shutdown_socket(upstream_socket: socket.socket) -> None:
+        with suppress(OSError):
+            upstream_socket.shutdown(socket.SHUT_RDWR)
+        with suppress(OSError):
+            upstream_socket.close()
 
 
 class CredentialBrokerHTTPServer(ThreadingHTTPServer):
@@ -271,6 +363,51 @@ def _allowed_destination_inventory_sha256(config: dict[str, Any]) -> str:
     )
 
 
+def _resolve_upstream_ipv4_addresses(config: dict[str, Any]) -> tuple[tuple[str, int], ...]:
+    """Resolve the fixed provider once before readiness so request workers never run DNS."""
+    parsed = urlsplit(config["upstream_https_origin"])
+    if parsed.hostname is None or parsed.port is None:
+        raise BrokerConfigurationError("broker upstream origin is incomplete")
+    try:
+        records = socket.getaddrinfo(
+            parsed.hostname,
+            parsed.port,
+            family=socket.AF_INET,
+            type=socket.SOCK_STREAM,
+            proto=socket.IPPROTO_TCP,
+        )
+    except OSError as exc:
+        raise BrokerConfigurationError("broker upstream address resolution failed") from exc
+    addresses = sorted(
+        {
+            (address[0], address[1])
+            for family, socktype, protocol, _canonical_name, address in records
+            if family == socket.AF_INET
+            and socktype == socket.SOCK_STREAM
+            and protocol == socket.IPPROTO_TCP
+            and isinstance(address, tuple)
+            and len(address) == 2
+            and isinstance(address[0], str)
+            and isinstance(address[1], int)
+            and address[1] == parsed.port
+        }
+    )
+    if not addresses:
+        raise BrokerConfigurationError("broker upstream address inventory is empty")
+    return tuple(addresses)
+
+
+def _resolved_upstream_address_inventory_sha256(
+    addresses: tuple[tuple[str, int], ...],
+) -> str:
+    """Commit the startup-resolved provider addresses used by every request worker."""
+    return _sha256(
+        _canonical_bytes(
+            {"ipv4_addresses": [{"address": address, "port": port} for address, port in addresses]}
+        )
+    )
+
+
 def _validate_origin(config: dict[str, Any]) -> None:
     origin = config["upstream_https_origin"]
     if not isinstance(origin, str):
@@ -372,7 +509,9 @@ class CredentialBrokerHandler(BaseHTTPRequestHandler):
     audit_path: ClassVar[Path]
     audit_lock: ClassVar[threading.Lock]
     request_sequence: ClassVar[int]
-    upstream_connections: ClassVar[set[http.client.HTTPConnection]]
+    upstream_handles: ClassVar[set[_CancelableUpstream]]
+    upstream_cancellation_started: ClassVar[threading.Event]
+    upstream_addresses: ClassVar[tuple[tuple[str, int], ...]]
     upstream_lock: ClassVar[threading.Lock]
 
     def setup(self) -> None:
@@ -382,7 +521,8 @@ class CredentialBrokerHandler(BaseHTTPRequestHandler):
         self._request_state_lock = threading.Lock()
         self._request_finished = False
         self._deadline_expired = False
-        self._active_upstream: http.client.HTTPConnection | None = None
+        self._deadline_at = time.monotonic() + self.absolute_timeout_seconds
+        self._active_upstream: _CancelableUpstream | None = None
         self._deadline_timer = threading.Timer(
             self.absolute_timeout_seconds,
             self._expire_connection,
@@ -644,17 +784,14 @@ class CredentialBrokerHandler(BaseHTTPRequestHandler):
     ) -> tuple[int, list[tuple[str, str]], bytes]:
         parsed = urlsplit(self.config["upstream_https_origin"])
         assert parsed.hostname is not None and parsed.port is not None
-        connection_type: type[http.client.HTTPConnection]
-        if parsed.scheme == "https":
-            connection_type = http.client.HTTPSConnection
-        else:
-            connection_type = http.client.HTTPConnection
-        connection = connection_type(
+        connection = http.client.HTTPConnection(
             parsed.hostname,
             parsed.port,
-            timeout=UPSTREAM_SOCKET_TIMEOUT_SECONDS,
+            timeout=self._remaining_upstream_timeout(),
         )
-        self._register_upstream(connection)
+        connection.auto_open = False
+        handle = _CancelableUpstream(connection)
+        self._register_upstream(handle)
         forwarded = set(self.config["forwarded_agent_headers"])
         headers = {name: value for name, value in self.headers.items() if name.lower() in forwarded}
         injected = self.raw_credential
@@ -663,8 +800,28 @@ class CredentialBrokerHandler(BaseHTTPRequestHandler):
         headers[self.config["injected_auth_header"]] = injected
         headers["Content-Length"] = str(len(body))
         try:
+            upstream_socket = self._connect_upstream_socket(handle)
+            if parsed.scheme == "https":
+                context = ssl.create_default_context()
+                context.set_alpn_protocols(["http/1.1"])
+                upstream_socket = handle.wrap_tls(context, parsed.hostname)
+                connection.sock = upstream_socket
+                upstream_socket.settimeout(self._remaining_upstream_timeout())
+                upstream_socket.do_handshake()
+            else:
+                connection.sock = upstream_socket
+            if handle.is_cancelled() or self._deadline_has_expired():
+                raise _RequestRejected("absolute connection deadline exceeded")
+            upstream_socket.settimeout(self._remaining_upstream_timeout())
             connection.request("POST", route["upstream_path"], body=body, headers=headers)
+            if handle.is_cancelled() or self._deadline_has_expired():
+                raise _RequestRejected("absolute connection deadline exceeded")
+            upstream_socket = connection.sock
+            if upstream_socket is None:
+                raise _RequestRejected("upstream socket identity is unavailable")
+            upstream_socket.settimeout(self._remaining_upstream_timeout())
             upstream = connection.getresponse()
+            handle.publish_response(upstream)
             response = upstream.read(MAX_RESPONSE_BYTES + 1)
             if len(response) > MAX_RESPONSE_BYTES:
                 raise _RequestRejected("upstream response exceeds the broker limit")
@@ -674,41 +831,69 @@ class CredentialBrokerHandler(BaseHTTPRequestHandler):
                 for name, value in response_headers
             ):
                 raise _RequestRejected("encoded upstream responses are prohibited")
+            if handle.is_cancelled() or self._deadline_has_expired():
+                raise _RequestRejected("absolute connection deadline exceeded")
             return upstream.status, response_headers, response
         finally:
-            connection.close()
-            self._clear_upstream(connection)
+            handle.cancel()
+            self._clear_upstream(handle)
 
-    def _register_upstream(self, connection: http.client.HTTPConnection) -> None:
+    def _connect_upstream_socket(self, handle: _CancelableUpstream) -> socket.socket:
+        """Connect one preregistered socket to the startup-resolved provider address."""
+        if not self.upstream_addresses:
+            raise _RequestRejected("upstream address inventory is empty")
+        upstream_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+        handle.publish_socket(upstream_socket)
+        upstream_socket.settimeout(self._remaining_upstream_timeout())
+        upstream_socket.connect(self.upstream_addresses[0])
+        return upstream_socket
+
+    def _remaining_upstream_timeout(self) -> float:
+        """Cap each upstream phase by both inactivity and connection lifetime."""
+        remaining = self._deadline_at - time.monotonic()
+        if remaining <= 0:
+            raise _RequestRejected("absolute connection deadline exceeded")
+        return min(float(UPSTREAM_SOCKET_TIMEOUT_SECONDS), remaining)
+
+    def _register_upstream(self, handle: _CancelableUpstream) -> None:
         """Expose the active upstream to the absolute-deadline and shutdown paths."""
         with self._request_state_lock:
             if self._deadline_expired:
-                connection.close()
-                raise _RequestRejected("absolute connection deadline exceeded")
-            if self._active_upstream is not None:
-                raise _RequestRejected("more than one upstream connection was attempted")
-            self._active_upstream = connection
+                rejection = "absolute connection deadline exceeded"
+            elif self._active_upstream is not None:
+                rejection = "more than one upstream connection was attempted"
+            else:
+                rejection = None
+                self._active_upstream = handle
+        if rejection is not None:
+            handle.cancel()
+            raise _RequestRejected(rejection)
         with self.upstream_lock:
-            self.upstream_connections.add(connection)
+            cancelled = self.upstream_cancellation_started.is_set()
+            if not cancelled:
+                self.upstream_handles.add(handle)
+        if cancelled:
+            handle.cancel()
+            with self._request_state_lock:
+                if self._active_upstream is handle:
+                    self._active_upstream = None
+            raise _RequestRejected("broker shutdown interrupted the upstream request")
 
-    def _clear_upstream(self, connection: http.client.HTTPConnection) -> None:
+    def _clear_upstream(self, handle: _CancelableUpstream) -> None:
         with self._request_state_lock:
-            if self._active_upstream is connection:
+            if self._active_upstream is handle:
                 self._active_upstream = None
         with self.upstream_lock:
-            self.upstream_connections.discard(connection)
+            self.upstream_handles.discard(handle)
 
     @classmethod
     def cancel_active_upstreams(cls) -> None:
         """Interrupt every credentialed upstream during fail-closed quiescence."""
         with cls.upstream_lock:
-            connections = tuple(cls.upstream_connections)
-        for connection in connections:
-            upstream_socket = connection.sock
-            if upstream_socket is not None:
-                with suppress(OSError):
-                    upstream_socket.shutdown(socket.SHUT_RDWR)
-            connection.close()
+            cls.upstream_cancellation_started.set()
+            handles = tuple(cls.upstream_handles)
+        for handle in handles:
+            handle.cancel()
 
     def _deadline_has_expired(self) -> bool:
         with self._request_state_lock:
@@ -732,7 +917,7 @@ class CredentialBrokerHandler(BaseHTTPRequestHandler):
             request_id=self._request_id,
         )
         if upstream is not None:
-            upstream.close()
+            upstream.cancel()
         with suppress(OSError):
             self.connection.shutdown(socket.SHUT_RDWR)
         self.connection.close()
@@ -771,6 +956,9 @@ class CredentialBrokerHandler(BaseHTTPRequestHandler):
             "path_sha256": _sha256(path.encode("utf-8", errors="replace")),
             "reason": reason,
             "request_id": request_id,
+            "resolved_upstream_address_inventory_sha256": (
+                _resolved_upstream_address_inventory_sha256(self.upstream_addresses)
+            ),
             "upstream_https_origin": self.config["upstream_https_origin"],
         }
         with self.audit_lock, self.audit_path.open("ab") as stream:
@@ -811,6 +999,7 @@ def main() -> int:
             config_path,
             test_only_authorized=test_only_authorized,
         )
+        upstream_addresses = _resolve_upstream_ipv4_addresses(config)
         raw = os.environ["STINGER_BROKER_RAW_CREDENTIAL"]
         lease = os.environ["STINGER_BROKER_LEASE"]
     except (BrokerConfigurationError, KeyError) as exc:
@@ -839,7 +1028,9 @@ def main() -> int:
     CredentialBrokerHandler.audit_path = audit_path
     CredentialBrokerHandler.audit_lock = threading.Lock()
     CredentialBrokerHandler.request_sequence = 0
-    CredentialBrokerHandler.upstream_connections = set()
+    CredentialBrokerHandler.upstream_handles = set()
+    CredentialBrokerHandler.upstream_cancellation_started = threading.Event()
+    CredentialBrokerHandler.upstream_addresses = upstream_addresses
     CredentialBrokerHandler.upstream_lock = threading.Lock()
     server = CredentialBrokerHTTPServer(("0.0.0.0", 8765), CredentialBrokerHandler)
     shutdown_started = threading.Event()
@@ -869,6 +1060,9 @@ def main() -> int:
                     "listen": "0.0.0.0:8765",
                     "max_concurrent_connections": MAX_CONCURRENT_CONNECTIONS,
                     "provider": config["provider"],
+                    "resolved_upstream_address_inventory_sha256": (
+                        _resolved_upstream_address_inventory_sha256(upstream_addresses)
+                    ),
                     "test_only_allow_http": config["test_only_allow_http"],
                     "upstream_https_origin": config["upstream_https_origin"],
                     "upstream_socket_timeout_seconds": UPSTREAM_SOCKET_TIMEOUT_SECONDS,
@@ -899,6 +1093,9 @@ def main() -> int:
                     "decision": "quiesced",
                     "provider": config["provider"],
                     "request_count": CredentialBrokerHandler.request_sequence,
+                    "resolved_upstream_address_inventory_sha256": (
+                        _resolved_upstream_address_inventory_sha256(upstream_addresses)
+                    ),
                     "max_concurrent_connections": MAX_CONCURRENT_CONNECTIONS,
                     "test_only_allow_http": config["test_only_allow_http"],
                     "upstream_https_origin": config["upstream_https_origin"],

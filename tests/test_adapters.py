@@ -794,11 +794,11 @@ class TestContainerIsolation:
                 config: AgentConfig,
                 *,
                 runtime: DockerRuntimeIdentity,
-                repository: Path,
+                broker_source: Path | None = None,
             ) -> None:
                 assert config is adapter.config
                 assert runtime == _adapter_runtime()
-                assert repository == Path(__file__).parents[1]
+                assert broker_source is None
 
             def start(self) -> SyntheticBrokerSession:
                 nonlocal started

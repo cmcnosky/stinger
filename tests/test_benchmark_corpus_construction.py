@@ -235,6 +235,7 @@ def _credential_isolation_receipt(
         policy_sha256=policy_sha256,
         broker_configuration_sha256=broker_configuration_sha256,
         allowed_destination_inventory_sha256=allowed_destination_inventory_sha256,
+        resolved_upstream_address_inventory_sha256="e" * 64,
         agent_projection_inventory_sha256=agent_projection_inventory_sha256,
         broker_source_inventory_sha256=source_inventory_sha256,
         broker_image_id=broker_image_id,
@@ -244,6 +245,12 @@ def _credential_isolation_receipt(
         broker_container_id_sha256="4" * 64,
         internal_network_id_sha256=seed * 64,
         internal_network_name_sha256="1" * 64,
+        outbound_network_id_sha256=hashlib.sha256(
+            f"{seed}:outbound-id".encode("ascii")
+        ).hexdigest(),
+        outbound_network_name_sha256=hashlib.sha256(
+            f"{seed}:outbound-name".encode("ascii")
+        ).hexdigest(),
         broker_lease_sha256="5" * 64,
         agent_command_inventory_sha256="0" * 64,
         agent_environment_inventory_sha256="6" * 64,
@@ -266,6 +273,7 @@ def _credential_isolation_receipt(
         agent_container_cleanup_verified=True,
         broker_container_cleanup_verified=True,
         internal_network_cleanup_verified=True,
+        outbound_network_cleanup_verified=True,
     )
 
 
@@ -1942,6 +1950,7 @@ def test_machine_review_accepts_only_matching_per_invocation_broker_evidence() -
         {"agent_container_cleanup_verified": False},
         {"broker_container_cleanup_verified": False},
         {"internal_network_cleanup_verified": False},
+        {"outbound_network_cleanup_verified": False},
     ),
 )
 def test_credential_isolation_receipt_rejects_bypass_evidence(
@@ -1964,6 +1973,38 @@ def test_credential_isolation_receipt_rejects_bypass_evidence(
     payload = _credential_isolation_receipt(runtime).model_dump(mode="json")
     payload.update(update)
     with pytest.raises(ValidationError):
+        CredentialIsolationInvocationReceipt.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("outbound_field", "internal_field"),
+    (
+        ("outbound_network_id_sha256", "internal_network_id_sha256"),
+        ("outbound_network_name_sha256", "internal_network_name_sha256"),
+    ),
+)
+def test_credential_isolation_receipt_requires_distinct_network_identities(
+    outbound_field: str,
+    internal_field: str,
+) -> None:
+    """A receipt cannot relabel the agent network as the broker egress network."""
+    runtime = DockerRuntimeIdentity(
+        client_path="/usr/bin/docker",
+        client_sha256="1" * 64,
+        client_version="1.0",
+        context_name="default",
+        context_endpoint="unix:///synthetic/docker.sock",
+        context_endpoint_sha256="2" * 64,
+        server_platform="linux",
+        server_version="1.0",
+        server_api_version="1.0",
+        server_os="linux",
+        server_arch="amd64",
+    )
+    payload = _credential_isolation_receipt(runtime).model_dump(mode="json")
+    payload[outbound_field] = payload[internal_field]
+
+    with pytest.raises(ValidationError, match="network identities must be distinct"):
         CredentialIsolationInvocationReceipt.model_validate(payload)
 
 

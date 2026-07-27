@@ -1663,12 +1663,38 @@ def _require_unique_invocations(
         "isolated network name": [
             item.evidence.internal_network_name_sha256 for item in isolation_receipts
         ],
+        "broker outbound network id": [
+            item.evidence.outbound_network_id_sha256 for item in isolation_receipts
+        ],
+        "broker outbound network name": [
+            item.evidence.outbound_network_name_sha256 for item in isolation_receipts
+        ],
     }
     for label, values in unique_isolation_fields.items():
         if len(set(values)) != len(values):
             raise ClassificationReplayError(
                 f"benchmark invocation {label} identities are not unique"
             )
+    network_ids = [
+        value
+        for item in isolation_receipts
+        for value in (
+            item.evidence.internal_network_id_sha256,
+            item.evidence.outbound_network_id_sha256,
+        )
+    ]
+    network_names = [
+        value
+        for item in isolation_receipts
+        for value in (
+            item.evidence.internal_network_name_sha256,
+            item.evidence.outbound_network_name_sha256,
+        )
+    ]
+    if len(set(network_ids)) != len(network_ids) or len(set(network_names)) != len(network_names):
+        raise ClassificationReplayError(
+            "agent and broker network identities are not globally unique"
+        )
 
 
 def _require_challenge_context(

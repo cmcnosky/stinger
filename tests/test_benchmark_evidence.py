@@ -254,6 +254,7 @@ def evidence_inputs(
                     policy_sha256=credential_policy_sha256,
                     broker_configuration_sha256=broker_configuration_sha256,
                     allowed_destination_inventory_sha256=(allowed_destination_inventory_sha256),
+                    resolved_upstream_address_inventory_sha256="e" * 64,
                     agent_projection_inventory_sha256=agent_projection_inventory_sha256,
                     broker_source_inventory_sha256=broker_source_inventory_sha256,
                     broker_image_id=APPROVED_LINUX_ARM64_VERIFICATION_IMAGE_ID,
@@ -263,6 +264,8 @@ def evidence_inputs(
                     broker_container_id_sha256="a" * 64,
                     internal_network_id_sha256="6" * 64,
                     internal_network_name_sha256="7" * 64,
+                    outbound_network_id_sha256="8" * 64,
+                    outbound_network_name_sha256="9" * 64,
                     broker_lease_sha256="b" * 64,
                     agent_command_inventory_sha256="0" * 64,
                     agent_environment_inventory_sha256="c" * 64,
@@ -285,6 +288,7 @@ def evidence_inputs(
                     agent_container_cleanup_verified=True,
                     broker_container_cleanup_verified=True,
                     internal_network_cleanup_verified=True,
+                    outbound_network_cleanup_verified=True,
                 )
             }
         )
@@ -802,6 +806,59 @@ class TestClassificationReplayEvidence:
             replay_module._require_unique_invocations(
                 (aider_first, duplicate_challenge),
                 agent_adapter="aider",
+            )
+
+    def test_invocation_uniqueness_rejects_cross_role_network_reuse(
+        self,
+        evidence_inputs: dict[str, Path],
+    ) -> None:
+        """One invocation cannot reuse another invocation's agent network as egress."""
+        report = load_report(evidence_inputs["report"].read_text(encoding="utf-8"))
+        (result,) = report.results
+        run_dir = evidence_inputs["evidence"] / "runs" / result.scenario_id / str(result.repetition)
+        receipt = replay_module.load_invocation_receipt(
+            run_dir / replay_module.INVOCATION_RECEIPT_NAME
+        )
+        isolation = replay_module.load_credential_isolation_receipt(
+            run_dir / replay_module.CREDENTIAL_ISOLATION_RECEIPT_NAME
+        )
+
+        def digest(label: str) -> str:
+            return hashlib.sha256(label.encode("ascii")).hexdigest()
+
+        second_receipt = receipt.model_copy(
+            update={
+                "invocation_id": digest("second-invocation"),
+                "invocation_challenge_nonce_sha256": digest("second-challenge"),
+                "provider_response_id_sha256": digest("second-provider-response"),
+            }
+        )
+        second_evidence = isolation.evidence.model_copy(
+            update={
+                "broker_lease_sha256": digest("second-lease"),
+                "agent_container_id_sha256": digest("second-agent-container"),
+                "broker_container_id_sha256": digest("second-broker-container"),
+                "internal_network_id_sha256": digest("second-internal-id"),
+                "internal_network_name_sha256": digest("second-internal-name"),
+                "outbound_network_id_sha256": (isolation.evidence.internal_network_id_sha256),
+                "outbound_network_name_sha256": (isolation.evidence.internal_network_name_sha256),
+            }
+        )
+        second_isolation = isolation.model_copy(
+            update={
+                "invocation_id": second_receipt.invocation_id,
+                "evidence": second_evidence,
+            }
+        )
+
+        with pytest.raises(
+            replay_module.ClassificationReplayError,
+            match="network identities are not globally unique",
+        ):
+            replay_module._require_unique_invocations(
+                (receipt, second_receipt),
+                isolation_receipts=(isolation, second_isolation),
+                agent_adapter="codex",
             )
 
     def test_replay_runtime_enforces_canonical_provider_mapping(

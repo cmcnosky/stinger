@@ -210,7 +210,6 @@ class CliAgentAdapter:
                     broker_session = CredentialBrokerSession(
                         self.config,
                         runtime=container_runtime,
-                        repository=Path(__file__).resolve().parents[3],
                     )
                     broker_session.verify_agent_inputs(
                         workdir=workdir,

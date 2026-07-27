@@ -14,6 +14,7 @@ import json
 import os
 import re
 import stat
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
 
@@ -72,6 +73,7 @@ class CredentialIsolationInvocationReceipt(BaseModel):
     policy_sha256: str
     broker_configuration_sha256: str
     allowed_destination_inventory_sha256: str
+    resolved_upstream_address_inventory_sha256: str
     agent_projection_inventory_sha256: str
     broker_source_inventory_sha256: str
     broker_image_id: str
@@ -82,6 +84,8 @@ class CredentialIsolationInvocationReceipt(BaseModel):
     broker_container_id_sha256: str
     internal_network_id_sha256: str
     internal_network_name_sha256: str
+    outbound_network_id_sha256: str
+    outbound_network_name_sha256: str
     broker_lease_sha256: str
     agent_command_inventory_sha256: str
     agent_environment_inventory_sha256: str
@@ -105,11 +109,13 @@ class CredentialIsolationInvocationReceipt(BaseModel):
     agent_container_cleanup_verified: Literal[True]
     broker_container_cleanup_verified: Literal[True]
     internal_network_cleanup_verified: Literal[True]
+    outbound_network_cleanup_verified: Literal[True]
 
     @field_validator(
         "policy_sha256",
         "broker_configuration_sha256",
         "allowed_destination_inventory_sha256",
+        "resolved_upstream_address_inventory_sha256",
         "agent_projection_inventory_sha256",
         "broker_source_inventory_sha256",
         "docker_client_sha256",
@@ -118,6 +124,8 @@ class CredentialIsolationInvocationReceipt(BaseModel):
         "broker_container_id_sha256",
         "internal_network_id_sha256",
         "internal_network_name_sha256",
+        "outbound_network_id_sha256",
+        "outbound_network_name_sha256",
         "broker_lease_sha256",
         "agent_command_inventory_sha256",
         "agent_environment_inventory_sha256",
@@ -164,6 +172,11 @@ class CredentialIsolationInvocationReceipt(BaseModel):
     def _closed_projection(self) -> CredentialIsolationInvocationReceipt:
         if self.agent_read_only_mounts:
             raise ValueError("credential-isolated agents cannot receive extra read-only mounts")
+        if (
+            self.internal_network_id_sha256 == self.outbound_network_id_sha256
+            or self.internal_network_name_sha256 == self.outbound_network_name_sha256
+        ):
+            raise ValueError("agent and broker outbound network identities must be distinct")
         if self.rejection_count:
             raise ValueError("a rejected broker request fails the invocation closed")
         if self.request_count < 1:
@@ -213,14 +226,29 @@ def agent_base_url_config_argv(route: CredentialBrokerProviderRoute) -> tuple[st
 def broker_source_inventory_sha256(repository: Path) -> str:
     """Hash every policy-listed broker source without following a symlink."""
     root = repository.resolve(strict=True)
-    files: list[dict[str, object]] = []
-    for relative_path in compiled_credential_isolation_policy().broker_source_paths:
+    sources: dict[str, Path] = {}
+    for relative_path in _broker_source_paths():
         source = root / relative_path
+        try:
+            source.resolve(strict=True).relative_to(root)
+        except (OSError, ValueError) as exc:
+            raise ValueError("credential-broker source is unavailable") from exc
+        sources[relative_path] = source
+    return broker_source_file_inventory_sha256(sources)
+
+
+def broker_source_file_inventory_sha256(sources: Mapping[str, Path]) -> str:
+    """Hash policy-listed broker files at source-tree or installed-package locations."""
+    expected_paths = _broker_source_paths()
+    if set(sources) != set(expected_paths):
+        raise ValueError("credential-broker source inventory paths are not exact")
+    files: list[dict[str, object]] = []
+    for relative_path in expected_paths:
+        source = sources[relative_path]
         try:
             metadata = source.lstat()
             resolved = source.resolve(strict=True)
-            resolved.relative_to(root)
-        except (OSError, ValueError) as exc:
+        except OSError as exc:
             raise ValueError("credential-broker source is unavailable") from exc
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise ValueError("credential-broker source must be a regular nonsymlink file")
@@ -251,6 +279,13 @@ def broker_source_inventory_sha256(repository: Path) -> str:
             }
         )
     return sha256_bytes(canonical_json_bytes({"files": files}))
+
+
+def _broker_source_paths() -> tuple[str, ...]:
+    paths = compiled_credential_isolation_policy().broker_source_paths
+    if paths != (BROKER_SERVER_SOURCE,):
+        raise ValueError("credential-broker source policy is not supported")
+    return paths
 
 
 def credential_identity_payloads(

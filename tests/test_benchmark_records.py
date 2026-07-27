@@ -440,6 +440,9 @@ def _write_synthetic_invocation_evidence(
                 policy_sha256=credential_policy_sha256,
                 broker_configuration_sha256=broker_configuration_sha256,
                 allowed_destination_inventory_sha256=(allowed_destination_inventory_sha256),
+                resolved_upstream_address_inventory_sha256=_invocation_identity(
+                    context.invocation_id, "resolved-upstream-addresses"
+                ),
                 agent_projection_inventory_sha256=agent_projection_inventory_sha256,
                 broker_source_inventory_sha256=broker_source_inventory_sha256,
                 broker_image_id=metadata.credential_broker_image_digest,
@@ -456,6 +459,12 @@ def _write_synthetic_invocation_evidence(
                 ),
                 internal_network_name_sha256=_invocation_identity(
                     context.invocation_id, "network-name"
+                ),
+                outbound_network_id_sha256=_invocation_identity(
+                    context.invocation_id, "outbound-network-id"
+                ),
+                outbound_network_name_sha256=_invocation_identity(
+                    context.invocation_id, "outbound-network-name"
                 ),
                 broker_lease_sha256=_invocation_identity(context.invocation_id, "broker-lease"),
                 agent_command_inventory_sha256=_invocation_identity(
@@ -493,6 +502,7 @@ def _write_synthetic_invocation_evidence(
                 agent_container_cleanup_verified=True,
                 broker_container_cleanup_verified=True,
                 internal_network_cleanup_verified=True,
+                outbound_network_cleanup_verified=True,
             ),
         )
         replay_module.write_invocation_receipt(

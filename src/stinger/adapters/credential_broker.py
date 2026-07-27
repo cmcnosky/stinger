@@ -28,6 +28,7 @@ from typing import Any, BinaryIO
 from urllib.parse import quote_from_bytes
 from uuid import uuid4
 
+import stinger.credential_broker_server as credential_broker_server_module
 from stinger.benchmark.credential_broker import (
     BROKER_ALIAS,
     BROKER_AUDIT_PATH,
@@ -38,7 +39,7 @@ from stinger.benchmark.credential_broker import (
     BROKER_SERVER_SOURCE,
     CredentialIsolationInvocationReceipt,
     agent_environment_names,
-    broker_source_inventory_sha256,
+    broker_source_file_inventory_sha256,
     canonical_json_bytes,
     credential_identity_payloads,
     provider_route,
@@ -96,7 +97,7 @@ class CredentialBrokerSession:
         config: AgentConfig,
         *,
         runtime: DockerRuntimeIdentity,
-        repository: Path,
+        broker_source: Path | None = None,
     ) -> None:
         """Validate static inputs and allocate non-secret per-invocation identities."""
         broker = config.credential_broker
@@ -126,7 +127,12 @@ class CredentialBrokerSession:
         self._broker = broker
         self._route = route
         self._runtime = runtime
-        self._repository = repository.resolve(strict=True)
+        if broker_source is None:
+            module_source = credential_broker_server_module.__file__
+            if not isinstance(module_source, str):
+                raise CredentialBrokerError("installed credential-broker source is unavailable")
+            broker_source = Path(module_source)
+        self._broker_source = broker_source.absolute()
         self._raw_credential = raw_credential
         self._lease = secrets.token_urlsafe(32)
         if self._lease == raw_credential:
@@ -151,6 +157,7 @@ class CredentialBrokerSession:
         self._audit_path: Path | None = None
         self._configuration_bytes: bytes | None = None
         self._source_inventory_sha256: str | None = None
+        self._resolved_upstream_address_inventory_sha256: str | None = None
         self._identity_hashes: tuple[str, str, str, str] | None = None
         self._image_environment: dict[str, str] | None = None
         self._started = False
@@ -295,6 +302,9 @@ class CredentialBrokerSession:
             policy_sha256=policy_sha256,
             broker_configuration_sha256=configuration_sha256,
             allowed_destination_inventory_sha256=destinations_sha256,
+            resolved_upstream_address_inventory_sha256=(
+                self._require_resolved_upstream_address_inventory_sha256()
+            ),
             agent_projection_inventory_sha256=projection_sha256,
             broker_source_inventory_sha256=self._require_source_inventory(),
             broker_image_id=self._require_broker_image_id(),
@@ -305,6 +315,10 @@ class CredentialBrokerSession:
             broker_container_id_sha256=sha256_bytes(broker_container_id.encode("ascii")),
             internal_network_id_sha256=sha256_bytes(network_id.encode("ascii")),
             internal_network_name_sha256=sha256_bytes(self.network_name.encode("ascii")),
+            outbound_network_id_sha256=sha256_bytes(
+                self._require_outbound_network_id().encode("ascii")
+            ),
+            outbound_network_name_sha256=sha256_bytes(self.outbound_network_name.encode("ascii")),
             broker_lease_sha256=sha256_bytes(self._lease.encode("utf-8")),
             agent_command_inventory_sha256=sha256_bytes(
                 canonical_json_bytes(observed["command_inventory"])
@@ -338,6 +352,7 @@ class CredentialBrokerSession:
             agent_container_cleanup_verified=True,
             broker_container_cleanup_verified=True,
             internal_network_cleanup_verified=True,
+            outbound_network_cleanup_verified=True,
         )
 
     def abort(self, *, agent_container_name: str | None = None) -> None:
@@ -353,7 +368,7 @@ class CredentialBrokerSession:
 
     def _verify_static_identity(self) -> None:
         policy = compiled_credential_isolation_policy()
-        observed_source = broker_source_inventory_sha256(self._repository)
+        observed_source = self._observed_broker_source_inventory_sha256()
         if observed_source != policy.broker_source_inventory_sha256:
             raise CredentialBrokerError(
                 "credential-broker source differs from the signed Protocol 2 inventory"
@@ -532,7 +547,7 @@ class CredentialBrokerSession:
     def _start_broker_container(self) -> None:
         config_path = self._require_config_path()
         audit_dir = self._require_audit_path().parent
-        source = (self._repository / BROKER_SERVER_SOURCE).resolve(strict=True)
+        source = self._resolved_broker_source()
         source_environment = {
             BROKER_RAW_CREDENTIAL_ENV: self._raw_credential,
             BROKER_LEASE_ENV: self._lease,
@@ -626,8 +641,17 @@ class CredentialBrokerSession:
                     event = json.loads(first)
                 except json.JSONDecodeError as exc:
                     raise CredentialBrokerError("broker readiness evidence is invalid") from exc
-                if first != canonical_json_bytes(event):
+                if not isinstance(event, dict) or first != canonical_json_bytes(event):
                     raise CredentialBrokerError("broker readiness evidence is not canonical")
+                resolved_inventory = event.get("resolved_upstream_address_inventory_sha256")
+                if (
+                    not isinstance(resolved_inventory, str)
+                    or _CONTAINER_ID.fullmatch(resolved_inventory) is None
+                ):
+                    raise CredentialBrokerError(
+                        "broker resolved-address readiness evidence is invalid"
+                    )
+                self._resolved_upstream_address_inventory_sha256 = resolved_inventory
                 if event != self._expected_ready_event():
                     raise CredentialBrokerError("broker readiness identity does not match")
                 return
@@ -1017,6 +1041,9 @@ class CredentialBrokerSession:
             "decision": "quiesced",
             "provider": self._route.provider.value,
             "request_count": len({event.get("request_id") for event in request_events}),
+            "resolved_upstream_address_inventory_sha256": (
+                self._require_resolved_upstream_address_inventory_sha256()
+            ),
             "max_concurrent_connections": _BROKER_MAX_CONCURRENT_CONNECTIONS,
             "test_only_allow_http": False,
             "upstream_https_origin": self._route.upstream_https_origin,
@@ -1036,6 +1063,7 @@ class CredentialBrokerSession:
                 "path_sha256",
                 "reason",
                 "request_id",
+                "resolved_upstream_address_inventory_sha256",
                 "upstream_https_origin",
             }:
                 raise CredentialBrokerError("broker audit request schema is not exact")
@@ -1043,6 +1071,8 @@ class CredentialBrokerSession:
             if (
                 event["configuration_bytes_sha256"] != configuration_bytes_sha256
                 or event["configuration_sha256"] != configuration_sha256
+                or event["resolved_upstream_address_inventory_sha256"]
+                != self._require_resolved_upstream_address_inventory_sha256()
                 or event["upstream_https_origin"] != self._route.upstream_https_origin
                 or event["method"] != "POST"
                 or event["path_sha256"] not in allowed_path_hashes
@@ -1073,6 +1103,9 @@ class CredentialBrokerSession:
             "listen": "0.0.0.0:8765",
             "max_concurrent_connections": _BROKER_MAX_CONCURRENT_CONNECTIONS,
             "provider": self._route.provider.value,
+            "resolved_upstream_address_inventory_sha256": (
+                self._require_resolved_upstream_address_inventory_sha256()
+            ),
             "test_only_allow_http": False,
             "upstream_https_origin": self._route.upstream_https_origin,
             "upstream_socket_timeout_seconds": _BROKER_UPSTREAM_SOCKET_TIMEOUT_SECONDS,
@@ -1082,7 +1115,7 @@ class CredentialBrokerSession:
         config_path = self._require_config_path()
         if config_path.read_bytes() != self._require_configuration_bytes():
             raise CredentialBrokerError("credential-broker configuration changed during execution")
-        if broker_source_inventory_sha256(self._repository) != self._require_source_inventory():
+        if self._observed_broker_source_inventory_sha256() != self._require_source_inventory():
             raise CredentialBrokerError("credential-broker source changed during execution")
         image_id, repo_digests = inspect_docker_image(
             self._require_broker_image_id(),
@@ -1508,7 +1541,7 @@ class CredentialBrokerSession:
             for item in mounts
             if isinstance(item, dict)
         }
-        source = str((self._repository / BROKER_SERVER_SOURCE).resolve(strict=True))
+        source = str(self._resolved_broker_source())
         expected = {
             (BROKER_SERVER_PATH, False, source, "bind"),
             (BROKER_CONFIG_PATH, False, str(self._require_config_path()), "bind"),
@@ -1516,6 +1549,26 @@ class CredentialBrokerSession:
         }
         if actual != expected:
             raise CredentialBrokerError("credential broker mount inventory drifted")
+
+    def _observed_broker_source_inventory_sha256(self) -> str:
+        """Hash the executable broker file under its protocol-fixed logical path."""
+        try:
+            return broker_source_file_inventory_sha256({BROKER_SERVER_SOURCE: self._broker_source})
+        except ValueError as exc:
+            raise CredentialBrokerError("credential-broker source is unavailable") from exc
+
+    def _resolved_broker_source(self) -> Path:
+        """Return the exact regular nonsymlink broker file mounted into Docker."""
+        try:
+            metadata = self._broker_source.lstat()
+            resolved = self._broker_source.resolve(strict=True)
+        except OSError as exc:
+            raise CredentialBrokerError("credential-broker source is unavailable") from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise CredentialBrokerError(
+                "credential-broker source must be a regular nonsymlink file"
+            )
+        return resolved
 
     def _cleanup_after_failure(self, cause: BaseException) -> None:
         failure = self._cleanup(agent_container_name=None)
@@ -1595,6 +1648,12 @@ class CredentialBrokerSession:
         if self._source_inventory_sha256 is None:
             raise CredentialBrokerError("credential broker source identity is incomplete")
         return self._source_inventory_sha256
+
+    def _require_resolved_upstream_address_inventory_sha256(self) -> str:
+        value = self._resolved_upstream_address_inventory_sha256
+        if value is None:
+            raise CredentialBrokerError("broker resolved-address identity is incomplete")
+        return value
 
     def _require_broker_image_id(self) -> str:
         if self._broker_image_id is None:

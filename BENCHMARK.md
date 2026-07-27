@@ -61,9 +61,11 @@ credentials, and any rejected request fail the invocation closed.
 Preflight commits the canonical credential policy, exact broker configuration bytes loaded,
 effective allowed-destination
 inventory, empty file/mount projection, broker source inventory, immutable protocol-approved
-broker image, both fresh network identities, and exact Docker runtime identity into report
+broker image, startup-resolved provider IPv4 inventory, both fresh network identities, and exact Docker runtime identity into report
 metadata and runtime provenance. Readiness also proves production test mode is disabled and
-binds the absolute connection deadline plus bounded worker count before agent launch.
+binds the connection deadline plus bounded worker count before agent launch. Request workers
+use only the startup-resolved addresses, publish the socket before connect, disable automatic
+reconnect, and retain detached response sockets so deadline or shutdown cancellation drains them.
 Before any networked container starts, Stinger scans the final agent argv and workdir paths,
 links, and file contents. It then scans canonical agent-image runtime metadata and the
 exported final root filesystem. All four surfaces reject the raw credential plus lower/upper
@@ -77,7 +79,8 @@ both fresh networks and their membership, command/environment/mount/attachment i
 isolated gateway, IPv6/DNS/healthcheck state, broker audit and accepted/completed request
 counts, absence of encoded credential evidence, broker bypass, or unapproved egress, and
 fail-closed removal of both containers and both networks. A closed non-secret
-`credential-isolation.receipt.json` binds those facts to the invocation and runtime. Its hash
+`credential-isolation.receipt.json` binds those facts to the invocation and runtime, including
+direct internal/outbound network ID and name hashes plus a cleanup proof for each network. Its hash
 is carried by the invocation receipt and run aggregate, so missing, extra, duplicated,
 noncanonical, or drifted evidence is ineligible.
 

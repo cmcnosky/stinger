@@ -63,7 +63,7 @@ loopback with a root-only search domain and bounded retries, so external names d
 an egress path. The agent runs with inherited image healthchecks disabled.
 
 Preflight binds the exact credential-isolation policy, loaded broker configuration bytes,
-effective destinations and test-mode state, empty file/mount projection, broker source
+effective destinations, startup-resolved provider IPv4 inventory, and test-mode state, empty file/mount projection, broker source
 inventory, immutable broker image, both fresh network identities, bounded connection policy,
 and Docker runtime identity. Each invocation additionally binds the agent/broker/network
 identities, exact command/environment/mount/network inventories, and broker audit. Before any
@@ -73,7 +73,8 @@ percent-encoded forms. It applies the same encoding policy to the agent image's 
 metadata and exported final root filesystem, rejects the policy's signed credential-path
 suffixes, and requires the declared/default agent config home to be absent or empty. Agent,
 broker, and both-network cleanup must be mechanically observed before a successful non-secret
-receipt is emitted. This mechanism has synthetic, local-fake-provider coverage; it has not
+receipt is emitted; that receipt exposes separate internal/outbound network identities and
+cleanup proofs. This mechanism has synthetic, local-fake-provider coverage; it has not
 been used for a sealed review or live provider run.
 
 The legacy raw `api_key_env` forwarding and `credential_mount` paths remain available for

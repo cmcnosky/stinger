@@ -560,11 +560,13 @@ The random challenge is never placed in the prompt and never affects scoring.
 Every brokered invocation also creates `credential-isolation.receipt.json`. It is bound to
 the same invocation ID and runtime-provenance hash and records only non-secret commitments:
 the signed policy; exact loaded broker configuration, source, immutable image, effective
-allowed destination, and minimal agent projection; Docker runtime; raw/hex/Base64/URL-safe-Base64/percent scan of
+allowed destination, startup-resolved provider IPv4 inventory, and minimal agent projection;
+Docker runtime; raw/hex/Base64/URL-safe-Base64/percent scan of
 the final argv, workdir, image metadata, and exported final rootfs; signed prohibited-path and
 empty-config-home checks; agent/broker/two-network, command, environment, mount, and attachment
 inventories; isolated gateway, IPv6, DNS, disabled-healthcheck, deadline, and concurrency
-state; broker audit/counts; and verified cleanup. `invocation.receipt.json` binds its exact file hash, and the run
+state; broker audit/counts; direct internal/outbound network ID/name hashes; and a distinct
+verified-cleanup field for each network. `invocation.receipt.json` binds its exact file hash, and the run
 aggregate binds the complete ordered set. Missing, extra, duplicated, noncanonical, drifted,
 rejected-request, encoded-credential, bypass, arbitrary-egress, or cleanup-failure evidence
 is fatal. The receipt does not turn the still-unapproved agent image into a supply-chain

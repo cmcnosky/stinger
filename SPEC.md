@@ -222,7 +222,10 @@ arbitrary external name resolution cannot become a route around the broker.
 Before agent launch, the harness MUST bind and verify the canonical policy, exact broker
 configuration bytes actually loaded, effective allowed-destination inventory, minimal
 projection inventory, broker source inventory, immutable protocol-approved broker image,
-dedicated network identities, and Docker runtime identity. Test-only routing MUST require a
+startup-resolved provider IPv4 inventory, dedicated network identities, and Docker runtime
+identity. Provider resolution MUST finish before readiness; request workers MUST use only that
+inventory, preregister the socket before connect, forbid automatic reconnect, and retain any
+detached response socket for deadline and shutdown cancellation. Test-only routing MUST require a
 process argument absent from the exact production broker command. The readiness evidence
 MUST bind the effective destination, test-mode state, absolute connection deadline, and
 bounded concurrency policy. It MUST
@@ -241,7 +244,9 @@ After every invocation the harness MUST verify the exact agent/broker/network id
 attachment, command/environment/mount/network inventories, disabled healthcheck, isolated
 gateway, IPv6 and DNS settings, broker audit, accepted/finished connection counts, absence of
 encoded credential evidence or a bypass path, and removal of the agent container, broker
-container, and both fresh networks. Missing or conflicting evidence, any rejected broker
+container, and both fresh networks. The typed receipt MUST expose separate internal and
+outbound network ID/name commitments and separate successful-cleanup fields rather than rely
+only on opaque aggregate inventory hashes. Missing or conflicting evidence, any rejected broker
 request, capacity rejection, or unverified cleanup resolves to `error`.
 
 The closed Protocol 2 provider route set currently contains only `codex`/OpenAI and
