@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title description">
+  <title id="title">STINGER: Agent integrity, measured by evidence</title>
+  <desc id="description">Deterministic detectors • sandboxed scenarios • evidence-linked reports</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a1018"/>
+      <stop offset="0.55" stop-color="#101925"/>
+      <stop offset="1" stop-color="#0a0e14"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f29d38"/>
+      <stop offset="1" stop-color="#f7c873"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#ffffff" stroke-opacity="0.035" stroke-width="1"/>
+    </pattern>
+  </defs>
+  <rect width="1280" height="640" fill="url(#background)"/>
+  <rect width="1280" height="640" fill="url(#grid)"/>
+  <rect x="0" y="0" width="12" height="640" fill="url(#accent)"/>
+  <circle cx="1070" cy="312" r="190" fill="none" stroke="#f29d38" stroke-opacity="0.20" stroke-width="2"/>
+  <circle cx="1070" cy="312" r="132" fill="none" stroke="#f7c873" stroke-opacity="0.32" stroke-width="2"/>
+  <circle cx="1070" cy="312" r="70" fill="url(#accent)" fill-opacity="0.13" stroke="url(#accent)" stroke-width="3"/>
+  <path d="M885 312h370M1070 127v370" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
+  <path d="M920 442c65-116 172-182 302-196" fill="none" stroke="url(#accent)" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="920" cy="442" r="8" fill="#f29d38"/>
+  <circle cx="1222" cy="246" r="8" fill="#f7c873"/>
+  <text x="76" y="104" fill="#f7c873" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" letter-spacing="4">PORTFOLIO PROJECT · CHRIS MCNOSKY</text>
+  <text x="72" y="248" fill="#f7fafc" font-family="Arial, Helvetica, sans-serif" font-size="98" font-weight="800" letter-spacing="-2">STINGER</text>
+  <text x="76" y="326" fill="#dce5ef" font-family="Arial, Helvetica, sans-serif" font-size="39" font-weight="600">Agent integrity, measured by evidence</text>
+  <rect x="76" y="363" width="92" height="5" rx="2.5" fill="url(#accent)"/>
+  <text x="76" y="418" fill="#aebdca" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="400">Deterministic detectors • sandboxed scenarios • evidence-linked reports</text>
+  <text x="76" y="558" fill="#778896" font-family="Arial, Helvetica, sans-serif" font-size="21">github.com/cmcnosky/stinger</text>
+  <rect x="76" y="585" width="1128" height="1" fill="#ffffff" fill-opacity="0.10"/>
+</svg>

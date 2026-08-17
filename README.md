@@ -22,99 +22,43 @@ Two rules shape everything here:
 See [SPEC.md](SPEC.md) for the authoritative specification and [AGENTS.md](AGENTS.md) for
 the working agreements that bind every contributor, human or agent.
 
-## Benchmark status: candidate, not benchmark
+## Evaluate Stinger in five minutes
 
-Stinger is currently a **benchmark candidate / instrument demonstration**. The 30 public
-scenarios are the development and conformance suite; because their prompts, oracles, and
-reference resolutions are public, they are not used for a headline benchmark claim.
+The offline discrimination demo compares two local shell-script subjects on the same six
+test-integrity scenarios. It needs no model key, network connection, or container.
 
-The separately versioned [Benchmark Protocol 2](BENCHMARK.md) specifies a sealed
-120-scenario scoring corpus, artifact-bound QA, provider-diverse machine vetoes,
-reference-isolated blind agent solves, six pinned configurations across three providers,
-five repetitions, cluster-aware uncertainty, three clean conformance environments, signed
-public/escrow evidence, and one complete cross-machine reproduction. Machine review can
-only veto evidence; it cannot relabel a result or change the frozen score.
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
 
-A private, externally stored authoring checkpoint now contains 120 candidate scenarios:
-24 per family, with eight small, eight medium, and eight large repositories per family.
-Its 480 concrete honest/cheat variants passed their authoring checks. A
-[signed, non-secret Protocol 2 receipt](benchmark/receipts/candidate-validation-v2/)
-mechanically binds the private snapshot's aggregate shape and proves that all 120 primary
-scenarios passed contained Docker validity at the merged Stinger commit. That earns the
-narrow public claim **120 machine-validated benchmark-candidate scenarios**. It does not
-accept the authoring variants as a Protocol 2 construction record, provide a
-machine-review/QA matrix or blind-solve record, freeze or seal a scoring corpus, report a
-baseline result, or establish a benchmark. No cross-machine reproduction is claimed.
+stinger run --config demo/stinger.strict.yaml
+stinger run --config demo/stinger.permissive.yaml
+stinger report demo/example-reports/permissive
+```
 
-Protocol 2 now implements the credential-isolation mechanism required for future sealed
-execution on its closed Codex/OpenAI and Claude Code/Anthropic routes. Only a separate
-external broker container receives the raw provider credential. The untrusted agent joins
-only a fresh Docker-internal network and receives an opaque, per-invocation lease in the
-CLI's expected credential variable. Routing is non-secret and route-specific: Codex gets the
-broker URL only through the signed `openai_base_url` CLI override, while Claude Code gets it
-through `ANTHROPIC_BASE_URL`. The broker permits only the closed provider HTTPS origin, POST
-paths, and header projection; arbitrary egress, proxy headers, redirects, and broker bypass
-fail closed.
+The strict configuration exits `0`. The permissive configuration is expected to exit `1`
+because its observed integrity rate falls below the configured gate. The final command
+recomputes the committed report from its stored results and detector evidence. See
+[the demo guide](demo/README.md) for the expected output and the exact shortcuts each
+detector catches.
 
-That agent network uses an isolated IPv4 bridge with no host-facing gateway and IPv6
-disabled. The broker uses a separate fresh, broker-only IPv4 NAT bridge rather than Docker's
-shared default bridge. Docker's embedded DNS can still resolve the broker alias, but its only upstream is
-loopback with a root-only search domain and bounded retries, so external names do not create
-an egress path. The agent runs with inherited image healthchecks disabled.
+## Protocol and evidence
 
-Preflight binds the exact credential-isolation policy, loaded broker configuration bytes,
-effective destinations, startup-resolved provider IPv4 inventory, and test-mode state, empty file/mount projection, broker source
-inventory, immutable broker image, both fresh network identities, bounded connection policy,
-and Docker runtime identity. Each invocation additionally binds the agent/broker/network
-identities, exact command/environment/mount/network inventories, and broker audit. Before any
-networked container starts, Stinger scans the final agent argv and workdir paths, links, and
-file contents for the raw credential plus hexadecimal, standard Base64, URL-safe Base64, and
-all mixed-case, partially or fully percent-encoded forms. It applies the same encoding policy
-to the agent image's runtime metadata and exported final root filesystem, rejects the policy's
-signed credential-path suffixes, and requires the declared/default agent config home to be
-absent or empty. Broker response scanning uses a bounded bit-parallel matcher and cooperatively
-enforces the absolute connection deadline; controller and broker reject raw credentials outside
-the source-pinned 16-through-16,384-byte UTF-8 policy. Agent, broker, and both-network cleanup
-must be mechanically observed before a successful non-secret receipt is emitted; that receipt
-exposes separate internal/outbound network identities and cleanup proofs. This mechanism has
-synthetic, local-fake-provider coverage; it has not been used for a sealed review or live
-provider run.
+[Benchmark Protocol 2](BENCHMARK.md) holds the complete scoring protocol, evidence
+requirements, threat model, and release gates. The
+[signed Protocol 2 receipt](benchmark/receipts/candidate-validation-v2/) binds its referenced
+authoring checkpoint to the recorded validation inputs and outputs.
 
-The legacy raw `api_key_env` forwarding and `credential_mount` paths remain available for
-ordinary development only. Protocol 2 rejects them unless `api_key_env` names the host-side
-source consumed by the approved broker, and it rejects credential mounts, extra environment
-options, unsupported provider routes, or evidence drift before the agent starts.
-
-Protocol 2 now separately closes the verification-image substitution gap. The signed
-protocol commits to the exact `docker/runner.Dockerfile` and fully hash-locked dependency
-bytes, then approves the OCI manifest and image-config identities derived from the same
-byte-identical clean exports for each Docker target platform. Containerd-backed and classic
-Docker stores report different one of those two immutable identities as `.Id`; the signed
-policy names both explicitly. Every benchmark validation, replay, construction, and run
-checks that policy before starting a verification container. This is an exact-byte
-observation through the fixed Docker client/daemon boundary, not a universal
-reproducible-build, registry-attestation, TPM, or hostile-administrator proof.
-
-That verifier policy does **not** approve agent images. Agent containers execute untrusted
-sealed prompts with network access, so their own image supply chain remains a separate hard
-HOLD. Protocol 2 also requires three providers for the six-configuration publication
-baseline, while the credential broker allowlist currently defines only Codex/OpenAI and
-Claude Code/Anthropic routes. No live sealed review, QA, blind solve, pilot, baseline, or
-reproduction is claimed or authorized while the agent-image gate is open; a three-provider
-baseline additionally requires a third signed broker route.
-
-The current state is executable:
+Run the protocol structure check and the executable release gate with:
 
 ```bash
 stinger benchmark protocol-check benchmark/protocol.yaml
 stinger benchmark release-check benchmark/candidate-submission.yaml
 ```
 
-The first command checks the exact Protocol 2 threshold structure. The second intentionally
-exits non-zero and enumerates every unearned release gate. Only a fully evidenced,
-role-separated, signed submission can produce `machine_reproduced`; “established
-benchmark” additionally requires three accepted cross-machine environment records and a
-documented correction cycle.
+The release check exits non-zero while required evidence is absent and names the unmet gates
+directly.
 
 ## Install
 
