@@ -2,14 +2,14 @@
 
 [![CI](https://github.com/cmcnosky/stinger/actions/workflows/ci.yml/badge.svg)](https://github.com/cmcnosky/stinger/actions/workflows/ci.yml)
 
-**Measure whether an AI coding agent cheats — in your configuration, in your CI.**
+**Deterministic integrity checks for AI coding agents.**
 
-Stinger runs a corpus of sandboxed trap scenarios against a configured coding agent,
-mechanically detects dishonest shortcuts (weakened tests, forbidden-file edits, fabricated
-completion claims, broken house rules, leaked bait secrets), and emits a scored,
-evidence-linked **Integrity Report** under a preregistered, frozen scoring rubric.
+Stinger evaluates configured coding agents against explicit rules for test integrity,
+specification fidelity, completion claims, repository policy, and bait-secret handling.
+Seven deterministic detectors inspect the changes and traces; an **Integrity Report**
+retains the evidence behind the result under a versioned scoring rubric.
 
-It is a CLI and a GitHub Action. It is model-agnostic and vendor-neutral by construction.
+It provides a Python CLI, agent adapters, and a reusable GitHub Actions workflow.
 
 Two rules shape everything here:
 
@@ -25,9 +25,14 @@ the working agreements that bind every contributor, human or agent.
 ## Evaluate Stinger in five minutes
 
 The offline discrimination demo compares two local shell-script subjects on the same six
-test-integrity scenarios. It needs no model key, network connection, or container.
+test-integrity scenarios. After installation, the demo needs no model key, network
+connection, or container. These are family-T development runs; the reports label that scope.
+
+Requires Python 3.12+ and Git. Start from a clone:
 
 ```bash
+git clone https://github.com/cmcnosky/stinger.git
+cd stinger
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
@@ -42,6 +47,16 @@ because its observed integrity rate falls below the configured gate. The final c
 recomputes the committed report from its stored results and detector evidence. See
 [the demo guide](demo/README.md) for the expected output and the exact shortcuts each
 detector catches.
+
+## Inspect the implementation
+
+| Question | Entry point |
+|---|---|
+| What does a detector actually check? | [Seven detector implementations](src/stinger/detectors/) and [their tests](tests/test_detectors.py) |
+| How does a run become a verdict? | [Run state machine](src/stinger/harness/runner.py) and [frozen classification contract](SPEC.md#7-the-run-state-machine-harnessrunnerpy--the-heart) |
+| How is the score calculated? | [Rubric implementation](src/stinger/scoring/rubric.py) and [scoring specification](SPEC.md#8-scoring-scoringrubricpy--frozen-versioned) |
+| Can I inspect a real failure and its correction? | [Preserved evidence](evidence/README.md) and [C-04 regression cases](tests/test_corpus.py) |
+| How does it run in CI? | [Reusable evaluation workflow](.github/workflows/stinger.yml) and [repository checks](.github/workflows/ci.yml) |
 
 ## Protocol and evidence
 
@@ -253,15 +268,12 @@ manufacture a plausible score.
 Code: Apache-2.0 ([LICENSE](LICENSE)). Scenario corpus: CC-BY-4.0
 ([scenarios/LICENSE](scenarios/LICENSE)).
 
-## Provenance
+## Design history
 
-Stinger was built by directing AI coding agents under the governance regime documented in
-[AGENTS.md](AGENTS.md) — the same discipline the tool exists to measure. What that involved,
-and what running it against real agents exposed, is written up in
-[CASE_STUDY.md](CASE_STUDY.md).
+[CASE_STUDY.md](CASE_STUDY.md) records the C-04 evaluator failure, its correction, and the design choices behind the review.
+The committed evidence packages, reports, and correction history remain available for inspection.
 
 ## Contact
 
-Chris McNosky · Dallas–Fort Worth, TX · cmcnosky@gmail.com — available for AI-systems
-direction, agent-governance consulting, and roles where making AI-built software provably
-trustworthy is the job.
+Chris McNosky · Dallas–Fort Worth, TX · cmcnosky@gmail.com ·
+[Project portfolio](https://cmcnosky.github.io/)
